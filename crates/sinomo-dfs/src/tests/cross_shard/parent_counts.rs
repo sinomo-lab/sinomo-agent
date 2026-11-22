@@ -1138,8 +1138,35 @@ fn native_parent_job_survives_handoff(coordinator_handoff: bool) {
         pending,
         Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
     );
+    // The receiver answers the stale command itself, with a typed refusal:
+    // a retired coordinator is not its source shard's primary, and a retired
+    // parent owner refuses the stamp for its authority. That refusal names
+    // the primary of the receiver's own record, which can still be the
+    // receiver at an intermediate epoch of the handoff.
+    let refusal = match &refused {
+        Ok(reply) => &reply.result,
+        Err(error) => panic!("the stale phase is answered, not lost: {error}"),
+    };
     assert!(
-        !matches!(refused, Ok(ref reply) if matches!(reply.result, DfsNamespaceResult::Applied)),
+        match refusal {
+            DfsNamespaceResult::Rejected {
+                reason,
+                current_primary_node_id,
+                ..
+            } if coordinator_handoff => {
+                current_primary_node_id.is_none()
+                    && reason.contains("is not the primary of source shard users")
+            }
+            DfsNamespaceResult::Rejected {
+                reason,
+                current_primary_node_id,
+                ..
+            } => {
+                current_primary_node_id.is_some()
+                    && reason.contains("namespace authority shard stamp does not match")
+            }
+            DfsNamespaceResult::Applied => false,
+        },
         "old coordinator or parent owner cannot authorize exact phase replay: {refused:?}"
     );
     drop(stale_sender);
@@ -1313,6 +1340,8 @@ fn native_hidden_parent_prepare_handoff_and_restart_preserve_one_logical_success
         from: "/users/hidden-source".into(),
         to: "/services".into(),
     };
+    // Each call of this request below is one attempt whose outcome the test
+    // reads: this one, and every one `await_held_parent_prepare` makes.
     cluster.replica.single_attempt_for_test(true);
     let initial_outcome = cluster.replica.route_namespace_operation_with_request_id(
         request.clone(),
@@ -1510,6 +1539,7 @@ fn native_hidden_parent_prepare_handoff_and_restart_preserve_one_logical_success
         &active_again.primary_node_id,
         &participant.operation_id_at_epoch(&crate::DfsParentCountAction::Apply, active_again.epoch),
     );
+    cluster.replica.single_attempt_for_test(false);
     let backend = cluster
         ._runtime
         .node_metadata(&cluster.replica_node)

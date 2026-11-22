@@ -12,6 +12,10 @@
 //! on cancellation. A timer that doubles to the network's liveness interval
 //! re-sends the request to the current primary while the record has not
 //! changed; it never ends the wait.
+//!
+//! A mutation keeps one operation id for its whole call, so every attempt is
+//! the same request to the primary that answers it. A read changes nothing:
+//! each of its attempts has an id of its own.
 
 use crate::{
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataShardConfig,
@@ -68,9 +72,6 @@ pub(crate) struct DfsRecordChangeEvidence {
     pub(crate) dispatched: DfsMetadataShardConfig,
     /// The lowest epoch the evidence says the record reaches.
     pub(crate) floor_epoch: Option<u64>,
-    /// The request did not reach the primary: this node's candidate role is
-    /// asked to have the network verify it.
-    pub(crate) undelivered: bool,
 }
 
 impl DfsRecordChangeEvidence {
@@ -94,8 +95,21 @@ pub(crate) enum DfsRecordFollowed {
     Newer(DfsMetadataShardConfig),
     /// The record has not changed and the re-send timer is due.
     ResendDue(DfsMetadataShardConfig),
+    /// The wait's owner asked to be woken, and a message arrived for it or
+    /// its own timer is due.
+    Woken,
     /// This requester does not wait, or its caller's budget ended.
     Ended,
+}
+
+/// What, besides the record's change, ends one wait on it for its owner.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DfsRecordWaitWake {
+    /// A message that arrives for this requester ends the wait, so its owner
+    /// reads the message before it waits again.
+    pub(crate) on_arrival: bool,
+    /// The owner has work of its own due then.
+    pub(crate) at: Option<Instant>,
 }
 
 /// How a followed namespace request ended.
@@ -113,6 +127,40 @@ pub(crate) enum DfsFollowedNamespaceRoute {
 enum NamespaceAttemptEvidence {
     Rejected(PendingRoutedNamespaceResult),
     Failed(DfsError),
+}
+
+fn post_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
+    crate::write_set_keeping_signals::post_commit_demand(
+        local,
+        &shard.file_system_id,
+        &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+        crate::write_set_keeping_signals::DfsWriteSetCommitDemand::PrimaryUnreachable,
+    );
+}
+
+/// Hear a requester's hint that it could not deliver to a shard's primary.
+/// Only `local`'s own requesters are heard, and only about the record
+/// `local` still projects. The hint leaves one flag for the keeper and
+/// changes no DFS state, so hearing it needs no admission.
+pub(crate) fn hear_primary_verification_hint(
+    local: &NodeId,
+    source_node_id: &NodeId,
+    request: &crate::DfsPrimaryVerificationRequest,
+    projected: Option<&DfsMetadataShardConfig>,
+) -> bool {
+    if source_node_id != local {
+        return false;
+    }
+    let Some(current) = projected.filter(|current| {
+        current.file_system_id == request.file_system_id
+            && current.shard_id == request.shard_id
+            && current.epoch == request.epoch
+            && current.primary_node_id == request.primary_node_id
+    }) else {
+        return false;
+    };
+    post_primary_unreachable(local, current);
+    true
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -172,6 +220,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         evidence: &DfsRecordChangeEvidence,
         resend: &mut DfsRecordFollowResend,
     ) -> Result<DfsRecordFollowed, DfsError> {
+        loop {
+            match self.await_shard_record_change(
+                evidence,
+                Some(&mut *resend),
+                DfsRecordWaitWake::default(),
+            )? {
+                // Nothing asked to be woken.
+                DfsRecordFollowed::Woken => {}
+                followed => return Ok(followed),
+            }
+        }
+    }
+
+    /// One wait on this requester's projection of the shard `evidence` names.
+    ///
+    /// It ends when the projection shows the record the evidence waits for,
+    /// when `resend`'s timer is due, when `wake` asks for it, at the caller's
+    /// operation deadline, or on cancellation. Without `resend` only a newer
+    /// record sends the request again. A requester that does not wait reads
+    /// its projection once.
+    pub(crate) fn await_shard_record_change(
+        &mut self,
+        evidence: &DfsRecordChangeEvidence,
+        resend: Option<&mut DfsRecordFollowResend>,
+        wake: DfsRecordWaitWake,
+    ) -> Result<DfsRecordFollowed, DfsError> {
         let deadline = self.transport.operation_deadline();
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return Ok(DfsRecordFollowed::Ended);
@@ -198,28 +272,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             );
         };
-        let wake = watch.waker();
-        let cancellation_waker: crate::service_state::DfsCancellationWaker =
-            Arc::new(move || wake());
-        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
+        let wake_watch = watch.waker();
+        let waker: crate::service_state::DfsCancellationWaker = Arc::new(move || wake_watch());
+        let _cancellation_wake = self.register_cancellation_waker(&waker);
+        if wake.on_arrival {
+            self.transport
+                .set_incoming_arrival_waker(Some(Arc::clone(&waker)));
+        }
+        let followed =
+            self.await_shard_record_change_on(watch.as_mut(), evidence, resend, wake, deadline);
+        if wake.on_arrival {
+            self.transport.set_incoming_arrival_waker(None);
+        }
+        followed
+    }
+
+    fn await_shard_record_change_on(
+        &mut self,
+        watch: &mut dyn crate::DfsConfigurationChangeWatch,
+        evidence: &DfsRecordChangeEvidence,
+        mut resend: Option<&mut DfsRecordFollowResend>,
+        wake: DfsRecordWaitWake,
+        deadline: Option<Instant>,
+    ) -> Result<DfsRecordFollowed, DfsError> {
         loop {
             self.check_cancelled("shard record wait")?;
             if deadline.is_some_and(|at| Instant::now() >= at) {
                 return Ok(DfsRecordFollowed::Ended);
+            }
+            // An answer that already arrived is read before the record: it
+            // may settle the request that would otherwise be sent again.
+            if wake.on_arrival
+                && self
+                    .transport
+                    .pending_incoming_count()
+                    .map_err(DfsError::from_network)?
+                    .is_some_and(|pending| pending > 0)
+            {
+                return Ok(DfsRecordFollowed::Woken);
             }
             let current = self.current_dispatch_record(evidence);
             if let Some(record) = current
                 .as_ref()
                 .filter(|record| evidence.satisfied_by(record))
             {
-                resend.restart();
+                if let Some(resend) = resend.as_deref_mut() {
+                    resend.restart();
+                }
                 return Ok(DfsRecordFollowed::Newer(record.clone()));
             }
             let now = Instant::now();
             if deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(DfsRecordFollowed::Ended);
             }
-            if now >= resend.due {
+            if let Some(resend) = resend.as_deref_mut()
+                && now >= resend.due
+            {
                 resend.rearm();
                 // A membership change can keep both epoch and primary. Reuse
                 // the operation body, but take the stamp from our current
@@ -229,12 +337,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or_else(|| evidence.dispatched.clone());
                 return Ok(DfsRecordFollowed::ResendDue(record));
             }
-            if evidence.undelivered {
-                self.request_primary_verification(&evidence.dispatched);
+            if wake.at.is_some_and(|at| now >= at) {
+                return Ok(DfsRecordFollowed::Woken);
             }
-            let mut wait = resend.due.saturating_duration_since(now);
-            if let Some(deadline) = deadline {
-                wait = wait.min(deadline.saturating_duration_since(now));
+            // With nothing due, the wait still wakes at the network's liveness
+            // interval and reads the projection again. Nothing is sent then.
+            let mut wait = resend
+                .as_deref()
+                .map_or(DFS_RECORD_FOLLOW_RESEND_MAX, |resend| {
+                    resend.due.saturating_duration_since(now)
+                });
+            for at in [wake.at, deadline].into_iter().flatten() {
+                wait = wait.min(at.saturating_duration_since(now));
             }
             watch.wait_for_change(wait).map_err(DfsError::from)?;
         }
@@ -242,19 +356,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// A request from this node could not be delivered to `shard`'s primary:
     /// ask this node's candidate role to have the network verify it. The
-    /// demand is a hint, kept in memory by the Main that runs the keeper;
-    /// every later attempt posts it again.
+    /// demand is a hint, kept in memory by the Main that runs the keeper.
+    /// Each undelivered attempt posts it once: the first attempt against a
+    /// record, and each attempt the re-send timer makes while that record
+    /// stands. A wait posts nothing.
     pub(crate) fn request_primary_verification(&mut self, shard: &DfsMetadataShardConfig) {
         if shard.primary_node_id == self.node_id {
             return;
         }
         if self.transport.delegates_local_namespace_authority() {
             // The keeper runs in this node's Main, which may be another
-            // process: the hint travels as a DFS message to this node. It
-            // needs no reply, and a lost one is sent again with the next
-            // attempt.
+            // process: the hint travels as a DFS message to this node. It is
+            // posted without waiting for Main's answer, and a lost one is
+            // posted again with the next attempt.
             let node = self.node_id.clone();
-            let _ = self.send_dfs_message_if_routable(
+            let message = self.next_dfs_routed_message(
                 &node,
                 crate::DfsNetworkMessage::PrimaryVerificationRequest(
                     crate::DfsPrimaryVerificationRequest {
@@ -265,40 +381,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                 ),
             );
+            let _ = self.transport.post_hint_to_local_main(message);
             return;
         }
-        Self::post_primary_unreachable(&self.node_id, shard);
+        post_primary_unreachable(&self.node_id, shard);
     }
 
-    fn post_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
-        crate::write_set_keeping_signals::post_commit_demand(
-            local,
-            &shard.file_system_id,
-            &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
-            crate::write_set_keeping_signals::DfsWriteSetCommitDemand::PrimaryUnreachable,
-        );
+    /// A read-only probe could not be delivered to `shard`'s primary. Ask for
+    /// the primary's verification; a requester that follows record changes
+    /// then waits for the record to change or for the re-send timer. Returns
+    /// whether the probe is sent again, to the primary the projection names
+    /// then.
+    pub(crate) fn follow_undelivered_probe(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        resend: &mut DfsRecordFollowResend,
+    ) -> Result<bool, DfsError> {
+        self.request_primary_verification(shard);
+        if !self.follows_record_changes() {
+            return Ok(false);
+        }
+        let evidence = DfsRecordChangeEvidence {
+            dispatched: shard.clone(),
+            floor_epoch: None,
+        };
+        Ok(!matches!(
+            self.await_newer_shard_record(&evidence, resend)?,
+            DfsRecordFollowed::Ended
+        ))
     }
 
     /// Serve a requester's hint that it could not deliver to a shard's
-    /// primary. Only this node's own requesters are heard, and only about the
-    /// record this node still projects.
+    /// primary, for a service that receives one itself. A node's Main hears
+    /// the hint at its ingress, before any admission.
     pub(crate) fn handle_primary_verification_request(
         &mut self,
         source_node_id: &NodeId,
         request: &crate::DfsPrimaryVerificationRequest,
     ) {
-        if source_node_id != &self.node_id {
-            return;
-        }
-        let current = self
+        let projected = self
             .projected_shard_record(&request.file_system_id, &request.shard_id)
             .ok()
             .flatten();
-        if let Some(current) = current.filter(|current| {
-            current.epoch == request.epoch && current.primary_node_id == request.primary_node_id
-        }) {
-            Self::post_primary_unreachable(&self.node_id, &current);
-        }
+        hear_primary_verification_hint(&self.node_id, source_node_id, request, projected.as_ref());
     }
 
     /// The primary this requester's projection names for `operation` now,
@@ -326,17 +451,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         None
     }
 
-    /// Route one namespace request and follow its shard's record until the
+    /// Route one namespace mutation and follow its shard's record until the
     /// primary answers it definitely.
     ///
-    /// With `request_id` the same id and body are sent on every attempt, so
-    /// an attempt that may have applied is sent again. Without one each
-    /// attempt has a new id, and only an attempt that was not delivered, or
-    /// was refused for its authority, is sent again.
+    /// The same `request_id` and body are sent on every attempt, so an
+    /// attempt that may have applied is sent again: the primary answers a
+    /// repeat with what the first one did.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn route_namespace_following_record(
         &mut self,
-        request_id: Option<&str>,
+        request_id: &str,
         file_system_id: &DfsFileSystemId,
         primary_node_id: NodeId,
         operation: &DfsNamespaceOperation,
@@ -345,14 +469,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         apply_synced_path_object: bool,
     ) -> Result<DfsFollowedNamespaceRoute, DfsError> {
         self.route_namespace_following_record_with(
-            request_id,
+            Some(request_id),
             file_system_id,
             primary_node_id,
             operation,
             timeout,
             replay_journal_batches,
             apply_synced_path_object,
-            request_id.is_some(),
         )
     }
 
@@ -374,7 +497,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             timeout,
             false,
             false,
-            true,
         )
     }
 
@@ -388,7 +510,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: Option<Duration>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
-        exact_resend: bool,
     ) -> Result<DfsFollowedNamespaceRoute, DfsError> {
         // One budget covers every attempt and every wait between them.
         let previous_deadline = self.transport.operation_deadline();
@@ -407,13 +528,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             operation,
             replay_journal_batches,
             apply_synced_path_object,
-            exact_resend,
         );
         self.transport.set_operation_deadline(previous_deadline);
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn route_namespace_following_record_within_deadline(
         &mut self,
         request_id: Option<&str>,
@@ -422,7 +541,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
-        exact_resend: bool,
     ) -> Result<DfsFollowedNamespaceRoute, DfsError> {
         if let Some(id) = request_id {
             crate::service_routed_namespace::validate_namespace_operation_id(id)?;
@@ -461,9 +579,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let dispatched = pending.dispatch_authority_shard.clone();
             let deadline = self.transport.operation_deadline();
             let attempt = self.dispatch_prepared_namespace_request(command, pending, deadline);
-            // Each arm is what the attempt left, the lowest epoch it names,
-            // whether it was undelivered, and whether a re-send is exact.
-            let (left, floor_epoch, undelivered, resendable) = match attempt {
+            // Each arm is what the attempt left, the lowest epoch it names
+            // and whether it was undelivered. A typed definite refusal that
+            // is neither an unknown outcome nor a refusal for the request's
+            // authority is the caller's answer: nothing waits on it.
+            let (left, floor_epoch, undelivered) = match attempt {
                 Ok(routed) => match &routed.result {
                     DfsNamespaceResult::Applied => {
                         return Ok(DfsFollowedNamespaceRoute::Settled(routed));
@@ -479,12 +599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             }
                             _ => None,
                         };
-                        (
-                            NamespaceAttemptEvidence::Rejected(routed),
-                            floor,
-                            false,
-                            exact_resend,
-                        )
+                        (NamespaceAttemptEvidence::Rejected(routed), floor, false)
                     }
                     DfsNamespaceResult::Rejected {
                         current_primary_node_id: Some(_),
@@ -492,14 +607,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } => {
                         // A refusal for the request's authority names the
                         // primary of the refuser's record, which may be the
-                        // refuser itself at another epoch. It ran nothing,
-                        // so sending again is exact.
-                        (
-                            NamespaceAttemptEvidence::Rejected(routed),
-                            None,
-                            false,
-                            true,
-                        )
+                        // refuser itself at another epoch. It ran nothing.
+                        (NamespaceAttemptEvidence::Rejected(routed), None, false)
                     }
                     DfsNamespaceResult::Rejected { .. } => {
                         return Ok(DfsFollowedNamespaceRoute::Settled(routed));
@@ -510,9 +619,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         delivery_state: NetworkDeliveryState::DefinitelyNotSent,
                         ..
                     },
-                ) => (NamespaceAttemptEvidence::Failed(error), None, true, true),
+                ) => (NamespaceAttemptEvidence::Failed(error), None, true),
                 Err(error @ DfsError::Network { .. }) if self.remote_namespace_phase.is_some() => {
                     return Err(error);
+                }
+                // A shard whose storage is closed refused before any effect.
+                // The refusal crosses a node boundary as the text of a failed
+                // call; it is the request's answer, not a failed delivery.
+                Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => {
+                    return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
                 }
                 Err(DfsError::Network { message }) => (
                     NamespaceAttemptEvidence::Failed(DfsError::NetworkDelivery {
@@ -521,14 +636,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                     None,
                     true,
-                    exact_resend,
                 ),
-                Err(error @ DfsError::NetworkDelivery { .. }) => (
-                    NamespaceAttemptEvidence::Failed(error),
-                    None,
-                    true,
-                    exact_resend,
-                ),
+                Err(error @ DfsError::NetworkDelivery { .. }) => {
+                    (NamespaceAttemptEvidence::Failed(error), None, true)
+                }
                 Err(error) => {
                     return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
                 }
@@ -566,15 +677,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let evidence = DfsRecordChangeEvidence {
                 dispatched,
                 floor_epoch,
-                undelivered,
             };
             if undelivered {
                 self.request_primary_verification(&evidence.dispatched);
-            }
-            if !resendable {
-                // An attempt under an id of its own that may have applied is
-                // never repeated under another.
-                return ended(unresolved.unwrap_or(left));
             }
             let followed = match self.await_newer_shard_record(&evidence, &mut resend) {
                 Ok(followed) => followed,
@@ -593,8 +698,453 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     primary = record.primary_node_id;
                 }
                 DfsRecordFollowed::ResendDue(record) => primary = record.primary_node_id,
-                DfsRecordFollowed::Ended => return ended(unresolved.unwrap_or(left)),
+                DfsRecordFollowed::Woken | DfsRecordFollowed::Ended => {
+                    return ended(unresolved.unwrap_or(left));
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DfsControlPlaneKvClient, DfsRoutedCall, DfsRoutedMessage, LocalContentStore};
+    use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
+    use sinomo_core::network::NetworkError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+
+    /// A delegating requester's transport that sends nothing: it counts the
+    /// hints posted to its node's Main and holds what a test makes arrive.
+    struct RequesterTransport {
+        node: NodeId,
+        hints: Arc<AtomicUsize>,
+        arrived: Arc<Mutex<Vec<DfsRoutedMessage>>>,
+        arrival: Arc<Mutex<Option<crate::service_state::DfsCancellationWaker>>>,
+        deadline: Option<Instant>,
+    }
+
+    impl crate::DfsTransportIdentity for RequesterTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.node
+        }
+    }
+
+    impl DfsMessageTransport for RequesterTransport {
+        fn delegates_local_namespace_authority(&self) -> bool {
+            true
+        }
+        fn send_routed_call(
+            &mut self,
+            target_node_id: &NodeId,
+            _call: DfsRoutedCall,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+        }
+        fn post_hint_to_local_main(
+            &mut self,
+            _message: DfsRoutedMessage,
+        ) -> Result<(), NetworkError> {
+            self.hints.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(std::mem::take(&mut *self.arrived.lock().unwrap()))
+        }
+        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+            Ok(Some(self.arrived.lock().unwrap().len()))
+        }
+        fn set_incoming_arrival_waker(
+            &mut self,
+            waker: Option<crate::service_state::DfsCancellationWaker>,
+        ) {
+            *self.arrival.lock().unwrap() = waker;
+        }
+        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+            std::mem::replace(&mut self.deadline, deadline)
+        }
+        fn operation_deadline(&self) -> Option<Instant> {
+            self.deadline
+        }
+    }
+
+    /// The publication a watch waits on: how many times it was replaced, and
+    /// one pending wake.
+    #[derive(Debug, Default)]
+    struct Publication {
+        state: Mutex<(u64, bool)>,
+        changed: Condvar,
+    }
+
+    impl Publication {
+        fn replace(&self) {
+            self.state.lock().unwrap().0 += 1;
+            self.changed.notify_all();
+        }
+    }
+
+    struct PublicationWatch {
+        publication: Arc<Publication>,
+        seen: u64,
+    }
+
+    impl crate::DfsConfigurationChangeWatch for PublicationWatch {
+        fn wait_for_change(&mut self, wait: Duration) -> Result<bool, KvError> {
+            let state = self.publication.state.lock().unwrap();
+            let seen = self.seen;
+            let (mut state, _) = self
+                .publication
+                .changed
+                .wait_timeout_while(state, wait, |state| state.0 == seen && !state.1)
+                .unwrap();
+            state.1 = false;
+            let changed = state.0 != self.seen;
+            self.seen = state.0;
+            Ok(changed)
+        }
+
+        fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let publication = Arc::clone(&self.publication);
+            Arc::new(move || {
+                publication.state.lock().unwrap().1 = true;
+                publication.changed.notify_all();
+            })
+        }
+    }
+
+    /// An in-process configuration whose replacements a requester can watch.
+    #[derive(Debug)]
+    struct WatchedConfiguration {
+        kv: Arc<Mutex<InProcessKvStore>>,
+        publication: Arc<Publication>,
+    }
+
+    impl DfsControlPlaneKvClient for WatchedConfiguration {
+        fn watch_configuration_changes(
+            &self,
+        ) -> Option<Box<dyn crate::DfsConfigurationChangeWatch>> {
+            Some(Box::new(PublicationWatch {
+                seen: self.publication.state.lock().unwrap().0,
+                publication: Arc::clone(&self.publication),
+            }))
+        }
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::get(&*self.kv.lock().unwrap(), key)
+        }
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::range_prefix(&*self.kv.lock().unwrap(), prefix)
+        }
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            DfsControlPlaneKvClient::put(&mut *self.kv.lock().unwrap(), key, value)
+        }
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            DfsControlPlaneKvClient::txn(&mut *self.kv.lock().unwrap(), txn)
+        }
+    }
+
+    struct Requester {
+        service: NetworkedDfsService<RequesterTransport>,
+        kv: Arc<Mutex<InProcessKvStore>>,
+        publication: Arc<Publication>,
+        hints: Arc<AtomicUsize>,
+        arrived: Arc<Mutex<Vec<DfsRoutedMessage>>>,
+        arrival: Arc<Mutex<Option<crate::service_state::DfsCancellationWaker>>>,
+        shard: DfsMetadataShardConfig,
+        _root: sinomo_testdir::TestDir,
+    }
+
+    impl Requester {
+        /// A delegating requester on one node whose shard's primary is another.
+        fn new(name: &str) -> Self {
+            let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-record-follow-{name}"));
+            let node = NodeId::from_legacy_named("follow-requester").unwrap();
+            let shard = DfsMetadataShardConfig {
+                file_system_id: crate::sifs_file_system_id(),
+                shard_id: "root".into(),
+                primary_node_id: NodeId::from_legacy_named("follow-primary").unwrap(),
+                replica_node_ids: Vec::new(),
+                epoch: 4,
+                assignment: crate::DfsMetadataShardAssignment::Root,
+                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            };
+            let kv = Arc::new(Mutex::new(InProcessKvStore::default()));
+            let publication = Arc::new(Publication::default());
+            let hints = Arc::new(AtomicUsize::new(0));
+            let arrived = Arc::new(Mutex::new(Vec::new()));
+            let arrival = Arc::new(Mutex::new(None));
+            let service = NetworkedDfsService::new(
+                RequesterTransport {
+                    node,
+                    hints: Arc::clone(&hints),
+                    arrived: Arc::clone(&arrived),
+                    arrival: Arc::clone(&arrival),
+                    deadline: None,
+                },
+                LocalContentStore::new(root.path().join("content")).unwrap(),
+            )
+            .with_control_plane(WatchedConfiguration {
+                kv: Arc::clone(&kv),
+                publication: Arc::clone(&publication),
+            });
+            let requester = Self {
+                service,
+                kv,
+                publication,
+                hints,
+                arrived,
+                arrival,
+                shard,
+                _root: root,
+            };
+            requester.publish(&requester.shard);
+            requester
+        }
+
+        /// Replace the published configuration with one holding `record`.
+        fn publish(&self, record: &DfsMetadataShardConfig) {
+            self.kv
+                .lock()
+                .unwrap()
+                .put(
+                    crate::metadata_shard_key(&record.file_system_id, &record.shard_id),
+                    sinomo_core::kv::encode_kv_value(record).unwrap(),
+                    None,
+                )
+                .unwrap();
+            self.publication.replace();
+        }
+
+        fn evidence(&self) -> DfsRecordChangeEvidence {
+            DfsRecordChangeEvidence {
+                dispatched: self.shard.clone(),
+                floor_epoch: None,
+            }
+        }
+    }
+
+    /// A wait posts no hint, however often its watch wakes. Only an attempt
+    /// that could not be delivered posts one.
+    #[test]
+    fn a_woken_record_wait_posts_no_primary_verification_hint() {
+        let mut requester = Requester::new("wakes");
+        assert!(requester.service.follows_record_changes());
+        let shard = requester.shard.clone();
+        requester.service.request_primary_verification(&shard);
+        assert_eq!(requester.hints.load(Ordering::SeqCst), 1);
+
+        // Replacements that leave the record as it is wake the watch.
+        let publication = Arc::clone(&requester.publication);
+        let waking = std::thread::spawn(move || {
+            for _ in 0..40 {
+                publication.replace();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut resend = DfsRecordFollowResend::new();
+        let evidence = requester.evidence();
+        let followed = requester
+            .service
+            .await_newer_shard_record(&evidence, &mut resend)
+            .unwrap();
+        waking.join().unwrap();
+        assert!(
+            matches!(&followed, DfsRecordFollowed::ResendDue(record) if record == &shard),
+            "an unchanged record ends the wait only at the re-send timer: {followed:?}"
+        );
+        assert_eq!(
+            requester.hints.load(Ordering::SeqCst),
+            1,
+            "the wait itself posted nothing"
+        );
+        // The attempt the timer makes posts the next one.
+        requester.service.request_primary_verification(&shard);
+        assert_eq!(requester.hints.load(Ordering::SeqCst), 2);
+    }
+
+    /// The projection showing a newer record ends the wait with that record,
+    /// well before the re-send timer.
+    #[test]
+    fn a_newer_record_ends_the_wait_with_the_record_it_names() {
+        let mut requester = Requester::new("newer");
+        let mut newer = requester.shard.clone();
+        newer.epoch += 1;
+        newer.primary_node_id = NodeId::from_legacy_named("follow-successor").unwrap();
+        let (kv, publication, record) = (
+            Arc::clone(&requester.kv),
+            Arc::clone(&requester.publication),
+            newer.clone(),
+        );
+        let changing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            kv.lock()
+                .unwrap()
+                .put(
+                    crate::metadata_shard_key(&record.file_system_id, &record.shard_id),
+                    sinomo_core::kv::encode_kv_value(&record).unwrap(),
+                    None,
+                )
+                .unwrap();
+            publication.replace();
+        });
+        let evidence = requester.evidence();
+        let followed = requester
+            .service
+            .await_shard_record_change(&evidence, None, DfsRecordWaitWake::default())
+            .unwrap();
+        changing.join().unwrap();
+        assert!(
+            matches!(&followed, DfsRecordFollowed::Newer(record) if record == &newer),
+            "{followed:?}"
+        );
+    }
+
+    /// A message that arrives for the requester ends a wait whose owner asked
+    /// for it, at once and not at the next timer: the owner reads the message
+    /// before anything is sent again. A wait that did not ask stays.
+    #[test]
+    fn an_arriving_message_ends_the_wait_its_owner_asked_to_be_woken_from() {
+        let mut requester = Requester::new("arrival");
+        let message = crate::build_dfs_routed_message(
+            &requester.shard.primary_node_id,
+            &NodeId::from_legacy_named("follow-requester").unwrap(),
+            1,
+            1,
+            crate::DfsNetworkMessage::PrimaryVerificationRequest(
+                crate::DfsPrimaryVerificationRequest {
+                    file_system_id: requester.shard.file_system_id.clone(),
+                    shard_id: requester.shard.shard_id.clone(),
+                    epoch: requester.shard.epoch,
+                    primary_node_id: requester.shard.primary_node_id.clone(),
+                },
+            ),
+        );
+        let (arrived, arrival) = (
+            Arc::clone(&requester.arrived),
+            Arc::clone(&requester.arrival),
+        );
+        let delivering = std::thread::spawn(move || {
+            // Deliver once the wait has installed its arrival waker.
+            let started = Instant::now();
+            loop {
+                if let Some(waker) = arrival.lock().unwrap().clone() {
+                    arrived.lock().unwrap().push(message);
+                    waker();
+                    return;
+                }
+                assert!(started.elapsed() < Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let evidence = requester.evidence();
+        let started = Instant::now();
+        let followed = requester
+            .service
+            .await_shard_record_change(
+                &evidence,
+                None,
+                DfsRecordWaitWake {
+                    on_arrival: true,
+                    at: None,
+                },
+            )
+            .unwrap();
+        delivering.join().unwrap();
+        assert!(matches!(followed, DfsRecordFollowed::Woken), "{followed:?}");
+        assert!(
+            started.elapsed() < DFS_RECORD_FOLLOW_RESEND_MAX,
+            "the arrival, not a timer, ended the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            requester.arrival.lock().unwrap().is_none(),
+            "the wait took its arrival waker with it"
+        );
+        // The message is still the owner's to read.
+        assert_eq!(requester.arrived.lock().unwrap().len(), 1);
+    }
+
+    /// The owner's own timer ends its wait; the caller's deadline ends it for
+    /// good.
+    #[test]
+    fn the_owners_timer_and_the_callers_deadline_end_the_wait() {
+        let mut requester = Requester::new("timers");
+        let evidence = requester.evidence();
+        let woken = requester
+            .service
+            .await_shard_record_change(
+                &evidence,
+                None,
+                DfsRecordWaitWake {
+                    on_arrival: true,
+                    at: Some(Instant::now() + Duration::from_millis(40)),
+                },
+            )
+            .unwrap();
+        assert!(matches!(woken, DfsRecordFollowed::Woken), "{woken:?}");
+        requester
+            .service
+            .transport
+            .set_operation_deadline(Some(Instant::now() + Duration::from_millis(40)));
+        let ended = requester
+            .service
+            .await_shard_record_change(&evidence, None, DfsRecordWaitWake::default())
+            .unwrap();
+        assert!(matches!(ended, DfsRecordFollowed::Ended), "{ended:?}");
+    }
+
+    /// A hint is heard only from this node's own requesters and only about
+    /// the record this node still projects.
+    #[test]
+    fn a_hint_is_heard_only_from_this_node_about_the_record_it_projects() {
+        let local = NodeId::from_legacy_named("hint-local").unwrap();
+        let other = NodeId::from_legacy_named("hint-other").unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "hint-shard".into(),
+            primary_node_id: NodeId::from_legacy_named("hint-primary").unwrap(),
+            replica_node_ids: Vec::new(),
+            epoch: 7,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let request = crate::DfsPrimaryVerificationRequest {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            epoch: shard.epoch,
+            primary_node_id: shard.primary_node_id.clone(),
+        };
+        let demanded = || {
+            crate::write_set_keeping_signals::take_commit_demands(&local)
+                .into_values()
+                .any(|demands| demands.primary_unreachable)
+        };
+        assert!(!hear_primary_verification_hint(
+            &local,
+            &other,
+            &request,
+            Some(&shard)
+        ));
+        assert!(!hear_primary_verification_hint(
+            &local, &local, &request, None
+        ));
+        let mut moved = shard.clone();
+        moved.epoch += 1;
+        assert!(!hear_primary_verification_hint(
+            &local,
+            &local,
+            &request,
+            Some(&moved)
+        ));
+        assert!(!demanded(), "a refused hint leaves no demand");
+        assert!(hear_primary_verification_hint(
+            &local,
+            &local,
+            &request,
+            Some(&shard)
+        ));
+        assert!(demanded(), "a heard hint leaves the keeper its demand");
     }
 }

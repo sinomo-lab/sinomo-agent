@@ -1458,6 +1458,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 result: None,
             },
         );
+        let mut unroutable = false;
         let result = (|| {
             let response = if let Some(key) = lanes_released_read {
                 match self.answered_remote_reads.get(&key).cloned() {
@@ -1494,6 +1495,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &expected.primary_node_id,
                     DfsNetworkMessage::NamespaceRequest(command.clone()),
                 )? {
+                    unroutable = true;
                     return Err(error("metadata query primary is not routable"));
                 }
                 wait_for_metadata_query_response(
@@ -1533,6 +1535,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.pending_routed_namespace_ops.remove(&request_id);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
         self.transport.set_operation_deadline(previous_deadline);
+        // One exact record answers this query, and the collection it belongs
+        // to plans again when that record changes, so the query itself is not
+        // sent again. One that could not be delivered still asks this node's
+        // candidate role to have the network verify the primary.
+        if let Err(failed) = &result
+            && (unroutable
+                || matches!(
+                    failed,
+                    DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
+                ))
+            && !crate::error::dfs_error_is_closed_shard_storage(failed)
+        {
+            self.request_primary_verification(expected);
+        }
         result
     }
 

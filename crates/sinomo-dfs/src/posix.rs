@@ -429,7 +429,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         foreground_replica_repair: bool,
     ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
         // Its dispatch is done: a later dispatch belongs to another caller.
-        self.writes.follow_next_dispatch = false;
+        self.writes.followed_write = None;
         let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {
             return Ok(outcome);
         };
@@ -465,11 +465,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             // Evidence that the shard record is changing holds the write with
             // its body: this call waits for the newer record and sends the
-            // same write, under the same id, to the primary it names.
+            // same write, under the same id, to the primary it names. An
+            // answer that arrives meanwhile ends the wait and is read above.
             if !deadline_passed() {
                 match self.follow_held_routed_write(&intent_id, &mut record_resend) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
+                    Ok(
+                        crate::service_routed_write::RoutedWriteRecordFollow::Resent
+                        | crate::service_routed_write::RoutedWriteRecordFollow::Woken,
+                    ) => continue,
+                    Ok(crate::service_routed_write::RoutedWriteRecordFollow::NotFollowed) => {}
                     Err(error) => {
                         self.compact_pending_routed_write(&intent_id);
                         return Err(error);
@@ -540,9 +544,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if let Some(deadline) = caller_deadline {
                     wait = wait.min(deadline.saturating_duration_since(now));
                 }
-                if let Err(error) = self.transport.wait_for_incoming(wait) {
-                    self.compact_pending_routed_write(&intent_id);
-                    return Err(DfsError::from_network(error));
+                // A routed write its primary holds also waits on the shard's
+                // record: a record that moves past the one the write was sent
+                // under sends it to the primary the projection names.
+                match self.await_pending_routed_write(&intent_id, now + wait) {
+                    Ok(
+                        crate::service_routed_write::RoutedWriteRecordFollow::Resent
+                        | crate::service_routed_write::RoutedWriteRecordFollow::Woken,
+                    ) => {}
+                    Ok(crate::service_routed_write::RoutedWriteRecordFollow::NotFollowed) => {
+                        if let Err(error) = self.transport.wait_for_incoming(wait) {
+                            self.compact_pending_routed_write(&intent_id);
+                            return Err(DfsError::from_network(error));
+                        }
+                    }
+                    Err(error) => {
+                        self.compact_pending_routed_write(&intent_id);
+                        return Err(error);
+                    }
                 }
                 ready_drains = 0;
             } else {
@@ -3943,7 +3962,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_version: target_version.clone(),
             requesting_node_id: write_requester,
         };
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = if streamed_remote_primary_write {
             self.write_distributed_bytes_with_base(
                 request,
@@ -4335,7 +4358,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .put_object_version_from_reader(object_id.as_str(), target_version.as_str(), reader)
                 .map_err(DfsError::from)?;
             phase.mark("internal_cas_staging");
-            self.writes.follow_next_dispatch = true;
+            self.writes.follow_write(object_id, &target_version, true);
             let outcome = self.route_distributed_manifest(
                 DfsWriteRequest {
                     file_system_id: object.file_system_id.clone(),
@@ -4714,7 +4737,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requesting_node_id: write_requester.clone(),
         };
         timing.mark("reader_planning");
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = if let Some(input) = restore_input {
             let operation_id = operation_id.ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
@@ -5020,7 +5047,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let patch_outcome = if let Some(current_size) = object.content_size_bytes {
             if offset <= current_size {
                 self.write_distributed_eventual_patch_from_reader_with_base(
@@ -5099,7 +5130,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
         };
         let mut overlay = RangedWriteOverlayReader::new(current, offset, reader);
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_reader_with_base(
             request,
             Some(base_version),
@@ -5238,7 +5273,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsPosixError::InvalidPath {
                     path: format!("{path}@{offset}+{}", bytes.len()),
                 })?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         if object
             .content_size_bytes
             .is_some_and(|current_size| offset <= current_size)
@@ -5310,7 +5349,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         current[start..end].copy_from_slice(bytes);
         let result_size = current.len() as u64;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),
@@ -5444,7 +5487,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),

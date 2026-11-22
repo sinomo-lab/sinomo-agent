@@ -412,6 +412,150 @@ fn native_stale_authority_redirect_keeps_original_identity_after_lost_reply() {
     runtime.close().unwrap();
 }
 
+/// A commit the dispatch primary reports after this requester's projection
+/// moved past the record the write was sent under is still that write's
+/// result: the caller is answered with the commit, not with an error about
+/// the record.
+#[test]
+fn native_late_commit_after_a_record_change_completes_with_its_result() {
+    let nodes = DfsTestRuntime::ordered_node_ids("native-routed-late-commit", 3);
+    let mut runtime = DfsTestRuntime::new("native-routed-late-commit", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let shard = runtime.root_shard().unwrap();
+    let primary = shard.primary_node_id.clone();
+    let requester = nodes.iter().find(|node| **node != primary).unwrap().clone();
+    let successor = nodes
+        .iter()
+        .find(|node| **node != primary && **node != requester)
+        .unwrap()
+        .clone();
+    let path = "/late-commit";
+    let mut authority = runtime.client(&primary).unwrap();
+    let original = authority
+        .posix_write_file(
+            path,
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    let object = runtime
+        .node_metadata(&primary)
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    let mut client = runtime.client(&requester).unwrap();
+    let operation = sinomo_core::Id::generate().to_string();
+    let target = DfsVersion::generate();
+    // The primary's answers to this write are captured and never delivered.
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    runtime.install_fault(FaultRule {
+        source: Some(requester.clone()),
+        target: Some(primary.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: FaultAction::CaptureWriteReplyAndLoseAfterDispatch(Arc::clone(&captured)),
+    });
+    let committed = |captured: &std::sync::Mutex<Vec<crate::DfsRoutedMessage>>| {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|message| match &message.message {
+                DfsNetworkMessage::DistributedWriteResponse(response)
+                    if matches!(
+                        &response.result,
+                        crate::DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                        }
+                    ) =>
+                {
+                    Some(response.clone())
+                }
+                _ => None,
+            })
+    };
+    // The same write is sent, under its one id, until the primary answers it
+    // with its commit; every answer is lost on the way back.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT * 4;
+    let late = loop {
+        let lost = route(
+            &mut client,
+            &object,
+            &shard,
+            &target,
+            &operation,
+            Body::Bytes,
+        );
+        assert!(
+            matches!(
+                lost,
+                Err(DfsError::NetworkDelivery {
+                    delivery_state: NetworkDeliveryState::PossiblyApplied,
+                    ..
+                })
+            ),
+            "the answer is lost: {lost:?}"
+        );
+        if let Some(late) = committed(&captured) {
+            break late;
+        }
+        assert!(Instant::now() < deadline, "the primary commits the write");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    runtime.clear_faults();
+    assert!(
+        client.writes.pending_routed_writes[&operation]
+            .result
+            .is_none(),
+        "no answer reached the requester"
+    );
+    // The record moves on, and the requester's projection shows it.
+    let active = runtime
+        .reassign_metadata_shard(
+            &shard.file_system_id,
+            &shard.shard_id,
+            successor.clone(),
+            nodes
+                .iter()
+                .filter(|node| **node != successor)
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+    assert_ne!(active, shard);
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT * 4;
+    while client
+        .projected_shard_record(&shard.file_system_id, &shard.shard_id)
+        .unwrap()
+        .as_ref()
+        != Some(&active)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the requester projects the newer record"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The old primary's commit arrives late.
+    client
+        .handle_distributed_write_response(primary.clone(), late)
+        .unwrap();
+    let outcome = client.write_outcome(&operation);
+    assert!(
+        matches!(&outcome, Ok(NetworkedDfsWriteOutcome::Committed { version, .. }) if version == &target),
+        "the late commit is the write's result: {outcome:?}"
+    );
+    drop((authority, client));
+    runtime.close().unwrap();
+}
+
 /// A refusal for the write's authority is followed only to a strictly newer
 /// record of the requester's own projection. While that projection shows
 /// none, the one call waits: it is not answered with the refusal, it does
@@ -453,7 +597,7 @@ fn native_redirect_without_a_newer_record_waits_and_does_not_loop() {
     let budget = Duration::from_secs(3);
     let started = Instant::now();
     client.set_transport_operation_deadline(Some(started + budget));
-    client.writes.follow_next_dispatch = true;
+    client.writes.follow_write(&object.object_id, &target, true);
     let pending = route(
         &mut client,
         &object,

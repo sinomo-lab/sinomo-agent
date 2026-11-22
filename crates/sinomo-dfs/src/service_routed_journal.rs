@@ -419,17 +419,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// Validate a successful routed-write response against the exact committed
+    /// Compare a routed-write outcome's source with the exact committed
     /// authority snapshot that selected its transport destination.
     ///
-    /// This check is independent of journal replay because a valid response may
-    /// carry no journal batches. Rejected responses use their separate
-    /// corroborated-redirect path instead of this completion gate.
-    pub(crate) fn validate_routed_write_response_authority(
+    /// An outcome from another node than the dispatch primary is an error.
+    /// An outcome from the dispatch primary is that write's answer whether or
+    /// not this requester still projects the record it dispatched with: a
+    /// primary commits only with its write set, so a commit it reports stays
+    /// in its shard's history across a record change. The response's journal
+    /// is replayed only under the record this requester still projects.
+    /// Rejected responses use their separate corroborated-redirect path.
+    pub(crate) fn routed_write_response_authority(
         &mut self,
         primary_node_id: &NodeId,
         expected_authority_shard: &DfsMetadataShardConfig,
-    ) -> Result<DfsMetadataShardConfig, DfsError> {
+    ) -> Result<RoutedWriteResponseAuthority, DfsError> {
         if primary_node_id != &expected_authority_shard.primary_node_id {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -459,17 +463,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         };
         if current != *expected_authority_shard {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "routed write response dispatch authority for shard {} epoch {} is no longer current (current primary {}, epoch {})",
-                    expected_authority_shard.shard_id,
-                    expected_authority_shard.epoch,
-                    current.primary_node_id,
-                    current.epoch
-                ),
-            });
+            return Ok(RoutedWriteResponseAuthority::Superseded);
         }
-        Ok(current)
+        Ok(RoutedWriteResponseAuthority::Current(current))
     }
 
     /// Validate journal batches carried in a routed-operation response.
@@ -524,6 +520,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             validated_authority_shard.epoch,
         ))
     }
+}
+
+/// Where a routed-write outcome's dispatch record stands in this requester's
+/// projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RoutedWriteResponseAuthority {
+    /// The requester still projects the record it dispatched with.
+    Current(DfsMetadataShardConfig),
+    /// The projection moved past that record after the dispatch.
+    Superseded,
 }
 
 /// Whether `node_id` is the shard's primary or one of its replicas.

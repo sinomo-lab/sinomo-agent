@@ -106,9 +106,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
 
+        // One id for the whole call. The lock command carries its own
+        // request id, which the shard's lock state records with its outcome:
+        // a repeat is answered from that record, at whichever primary holds
+        // the state.
+        let operation_id = self.next_request_id();
         let followed = self
             .route_namespace_following_record(
-                None,
+                &operation_id,
                 &file_system_id,
                 primary,
                 &operation,

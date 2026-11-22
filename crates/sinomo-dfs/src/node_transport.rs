@@ -1440,6 +1440,9 @@ pub struct DfsNodeTransport {
     next_content_root_catalog_frame_id: Arc<AtomicU64>,
     operation_deadline: Option<Instant>,
     incoming_wait_interrupt: Arc<DfsIncomingWaitInterrupt>,
+    /// A hint to this node's Main is on its way. One at a time: the next
+    /// attempt of its sender posts the next one.
+    hint_to_main_in_flight: Arc<AtomicBool>,
     /// The cancellation of the caller this transport sends for.
     send_cancellation: Option<crate::DfsCancellationFlag>,
     #[cfg(any(test, feature = "test-support"))]
@@ -2072,6 +2075,7 @@ impl Clone for DfsNodeTransport {
             operation_deadline: self.operation_deadline,
             // Waits belong to one transport; a clone has its own.
             incoming_wait_interrupt: Arc::default(),
+            hint_to_main_in_flight: Arc::default(),
             send_cancellation: None,
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: self.test_drain_counter.clone(),
@@ -2518,6 +2522,7 @@ impl DfsNodeTransport {
             next_content_root_catalog_frame_id: Arc::new(AtomicU64::new(1_u64 << 63)),
             operation_deadline: None,
             incoming_wait_interrupt: Arc::default(),
+            hint_to_main_in_flight: Arc::default(),
             send_cancellation: None,
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: None,
@@ -5797,6 +5802,61 @@ impl DfsMessageTransport for DfsNodeTransport {
                 inbox();
             }
         }))
+    }
+    fn set_incoming_arrival_waker(
+        &mut self,
+        waker: Option<crate::service_state::DfsCancellationWaker>,
+    ) {
+        // Only the response inbox receives from another thread; every other
+        // message of this transport arrives through its own sends.
+        if let Some(inbox) = &self.response_inbox {
+            inbox.set_arrival_waker(waker);
+        }
+    }
+    fn post_hint_to_local_main(&mut self, message: DfsRoutedMessage) -> Result<(), NetworkError> {
+        let target_node_id = self.local_node_id.clone();
+        if self.served_message.is_some()
+            || !self.routes_local_request_to_main(&target_node_id, &message.message)
+        {
+            return self.send_routed_call(&target_node_id, DfsRoutedCall::value(message));
+        }
+        self.validate_routed_message_target(&target_node_id, &message, true)?;
+        let sender = self
+            .sender
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::Io {
+                operation: format!("post DFS hint to Main {target_node_id}"),
+                detail: "registered Main request has no actual sender".into(),
+            })?;
+        if self
+            .hint_to_main_in_flight
+            .swap(true, AtomicOrdering::AcqRel)
+        {
+            return Ok(());
+        }
+        // The hint is not part of its sender's call: it carries neither that
+        // call's deadline nor its cancellation, and its answer is dropped.
+        let options = DfsObjectRpcSendOptions::new(self.connect_timeout);
+        let in_flight = Arc::clone(&self.hint_to_main_in_flight);
+        let posted = std::thread::Builder::new()
+            .name("sinomo-dfs-hint".into())
+            .spawn({
+                let in_flight = Arc::clone(&in_flight);
+                move || {
+                    let _ =
+                        send_dfs_routed_message_to_peer(sender, options, target_node_id, message);
+                    in_flight.store(false, AtomicOrdering::Release);
+                }
+            });
+        if let Err(error) = posted {
+            in_flight.store(false, AtomicOrdering::Release);
+            return Err(NetworkError::Io {
+                operation: "post DFS hint to Main".into(),
+                detail: error.to_string(),
+            });
+        }
+        Ok(())
     }
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         if self.served_message.is_some() {

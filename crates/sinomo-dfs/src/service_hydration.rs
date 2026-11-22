@@ -1649,14 +1649,21 @@ mod cancelled_catalog_tests {
                         .as_ref(),
                     Some(&actual)
                 );
-                if checked.load(Ordering::SeqCst) == cancel_at {
+                let reached = checked.load(Ordering::SeqCst);
+                if reached == cancel_at {
                     break;
                 }
-                // The recovery variant also yields if a resident writer holds
-                // its snapshot. The unchanged catalog is checked on every yield.
+                // The recovery variant yields, after its first check and
+                // before it reads anything, while a resident writer holds its
+                // snapshot. An attempt that stopped anywhere else stopped at
+                // a checkpoint nobody asked for.
+                assert_eq!(
+                    reached, 1,
+                    "hydration stopped at checkpoint {reached}: neither the writer yield nor the requested checkpoint {cancel_at}"
+                );
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "hydration never reached cancellation checkpoint {cancel_at}"
+                    "a resident writer held the snapshot until hydration could not reach checkpoint {cancel_at}"
                 );
                 std::thread::yield_now();
             }

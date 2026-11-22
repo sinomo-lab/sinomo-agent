@@ -4986,10 +4986,14 @@ fn normal_main_abort_replays_actual_durable_outcome_after_lost_reply_and_restart
         remaining_hits: 1,
         action: crate::test_runtime::FaultAction::LoseReplyAfterDispatch,
     });
+    // The subject is what one attempt whose reply is lost returns. A caller
+    // that follows its shard's record sends the abort again under its id.
+    case.writer.single_attempt_for_test(true);
     let uncertain = case
         .writer
         .abort_pending_write(&case.intent_id)
         .unwrap_err();
+    case.writer.single_attempt_for_test(false);
     assert!(
         matches!(
             uncertain,

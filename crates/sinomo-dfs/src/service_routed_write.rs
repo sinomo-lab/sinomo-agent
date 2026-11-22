@@ -125,6 +125,20 @@ pub(crate) fn validate_retained_write_opening(
     Ok(())
 }
 
+/// What following the shard's record did for one unresolved routed write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoutedWriteRecordFollow {
+    /// The write was sent again: to the primary a newer record names or, for
+    /// a held write, to the current primary on the re-send timer.
+    Resent,
+    /// The wait ended for its caller: a message arrived for this requester,
+    /// or the caller's own timer is due.
+    Woken,
+    /// Nothing was followed: the write is settled or has no body left, this
+    /// requester does not wait on the record, or its caller's budget ended.
+    NotFollowed,
+}
+
 /// Compact requester-local identity needed to publish a manifest after an
 /// authoritative routed write commits. The content hash and version arrive in
 /// the terminal outcome; the local content store proves whether this node
@@ -640,62 +654,90 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         let file_system_id = sifs_file_system_id();
-        self.refresh_control_plane_latest()?;
-        let shards = self
-            .metadata_shard_config_snapshot(&file_system_id)?
-            .unwrap_or_default();
-        let authority_shard =
-            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &file_system_id,
-                &shards,
-                &path,
-            )?
-            .ok_or_else(|| DfsError::Distributed {
-                message: format!("stable write reconciliation for {path} has no authority shard"),
-            })?;
-        if authority_shard.primary_node_id == self.node_id
-            && !self.transport.delegates_local_namespace_authority()
-        {
-            return self.reconcile_stable_write_operation_locally_for_requester(
-                object_id,
-                operation_id,
-                &requester_node_id,
-                expected_content_hash,
-                expected_content_size_bytes,
-                Some(&DfsMetadataShardId::new(authority_shard.shard_id.clone())),
-                true,
-            );
-        }
-        let request_id = self.next_request_id();
-        let authority_node_id = authority_shard.primary_node_id.clone();
-        self.writes
-            .stable_write_reconciliation_targets
-            .insert(request_id.clone(), authority_node_id.clone());
-        let sent = self.send_dfs_message_if_routable(
-            &authority_node_id,
-            DfsNetworkMessage::StableWriteReconciliationRequest(
-                DfsStableWriteReconciliationRequest {
-                    request_id: request_id.clone(),
-                    operation_id: operation_id.to_string(),
-                    path,
-                    object_id: object_id.clone(),
-                    requesting_node_id: requester_node_id,
-                    expected_content_hash: expected_content_hash.to_string(),
+        // The probe changes nothing, so it is sent again like a read: one
+        // that cannot be delivered asks for the primary's verification and
+        // goes, after the record changes or on the re-send timer, to the
+        // primary the projection names then.
+        let mut resend = crate::service_record_follow::DfsRecordFollowResend::new();
+        let request_id = loop {
+            self.refresh_control_plane_latest()?;
+            let shards = self
+                .metadata_shard_config_snapshot(&file_system_id)?
+                .unwrap_or_default();
+            let authority_shard =
+                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &file_system_id,
+                    &shards,
+                    &path,
+                )?
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!(
+                        "stable write reconciliation for {path} has no authority shard"
+                    ),
+                })?;
+            if authority_shard.primary_node_id == self.node_id
+                && !self.transport.delegates_local_namespace_authority()
+            {
+                return self.reconcile_stable_write_operation_locally_for_requester(
+                    object_id,
+                    operation_id,
+                    &requester_node_id,
+                    expected_content_hash,
                     expected_content_size_bytes,
-                    authority_shard,
-                },
-            ),
-        )?;
-        if !sent {
+                    Some(&DfsMetadataShardId::new(authority_shard.shard_id.clone())),
+                    true,
+                );
+            }
+            let request_id = self.next_request_id();
+            let authority_node_id = authority_shard.primary_node_id.clone();
+            self.writes
+                .stable_write_reconciliation_targets
+                .insert(request_id.clone(), authority_node_id.clone());
+            let sent = self.send_dfs_message_if_routable(
+                &authority_node_id,
+                DfsNetworkMessage::StableWriteReconciliationRequest(
+                    DfsStableWriteReconciliationRequest {
+                        request_id: request_id.clone(),
+                        operation_id: operation_id.to_string(),
+                        path: path.clone(),
+                        object_id: object_id.clone(),
+                        requesting_node_id: requester_node_id.clone(),
+                        expected_content_hash: expected_content_hash.to_string(),
+                        expected_content_size_bytes,
+                        authority_shard: authority_shard.clone(),
+                    },
+                ),
+            );
+            let undelivered = match sent {
+                Ok(true) => break request_id,
+                Ok(false) => None,
+                Err(error @ (DfsError::Network { .. } | DfsError::NetworkDelivery { .. }))
+                    if !crate::error::dfs_error_is_closed_shard_storage(&error) =>
+                {
+                    Some(error)
+                }
+                Err(error) => {
+                    self.writes
+                        .stable_write_reconciliation_targets
+                        .remove(&request_id);
+                    return Err(error);
+                }
+            };
             self.writes
                 .stable_write_reconciliation_targets
                 .remove(&request_id);
-            return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
-                reason: format!(
-                    "stable write reconciliation authority {authority_node_id} is unroutable"
-                ),
-            });
-        }
+            if self.follow_undelivered_probe(&authority_shard, &mut resend)? {
+                continue;
+            }
+            return match undelivered {
+                Some(error) => Err(error),
+                None => Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                    reason: format!(
+                        "stable write reconciliation authority {authority_node_id} is unroutable"
+                    ),
+                }),
+            };
+        };
         self.wait_for_stable_write_reconciliation(&request_id, self.transport.operation_deadline())
     }
 
@@ -2816,48 +2858,108 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    /// The record-change evidence a held routed write waits on.
-    fn held_routed_write(
+    /// The unresolved routed write behind `request_id`: its canonical id, the
+    /// record it was last sent under with the lowest epoch its evidence
+    /// names, and whether evidence holds it.
+    fn unresolved_routed_write(
         &self,
         request_id: &str,
     ) -> Option<(
         String,
         crate::service_record_follow::DfsRecordChangeEvidence,
+        bool,
     )> {
         let canonical = self.canonical_pending_routed_write_request_id(request_id)?;
         let pending = self.writes.pending_routed_writes.get(&canonical)?;
-        let follow = pending.follow.as_ref()?;
         (pending.result.is_none() && pending.command.is_some()).then(|| {
             (
                 canonical,
                 crate::service_record_follow::DfsRecordChangeEvidence {
                     dispatched: pending.authority_shard.clone(),
-                    floor_epoch: follow.floor_epoch,
-                    undelivered: false,
+                    floor_epoch: pending
+                        .follow
+                        .as_ref()
+                        .and_then(|follow| follow.floor_epoch),
                 },
+                pending.follow.is_some(),
             )
         })
     }
 
     /// Follow the shard record for a held routed write: wait for the newer
-    /// record, or for the re-send timer, and send the write again. Returns
-    /// whether the write was sent again; `false` leaves its evidence as the
-    /// outcome the caller takes.
+    /// record, or for the re-send timer, and send the write again. A message
+    /// that arrives for this requester ends the wait, so the caller reads an
+    /// answer to an earlier dispatch before anything is sent again.
+    /// `NotFollowed` leaves the write's evidence as the outcome the caller
+    /// takes.
     pub(crate) fn follow_held_routed_write(
         &mut self,
         request_id: &str,
         resend: &mut crate::service_record_follow::DfsRecordFollowResend,
-    ) -> Result<bool, DfsError> {
-        let Some((canonical, evidence)) = self.held_routed_write(request_id) else {
-            return Ok(false);
+    ) -> Result<RoutedWriteRecordFollow, DfsError> {
+        let Some((canonical, evidence, true)) = self.unresolved_routed_write(request_id) else {
+            return Ok(RoutedWriteRecordFollow::NotFollowed);
         };
-        let record = match self.await_newer_shard_record(&evidence, resend)? {
-            crate::service_record_follow::DfsRecordFollowed::Newer(record) => record,
-            crate::service_record_follow::DfsRecordFollowed::ResendDue(record) => record,
-            crate::service_record_follow::DfsRecordFollowed::Ended => return Ok(false),
+        let record = match self.await_shard_record_change(
+            &evidence,
+            Some(resend),
+            crate::service_record_follow::DfsRecordWaitWake {
+                on_arrival: true,
+                at: None,
+            },
+        )? {
+            crate::service_record_follow::DfsRecordFollowed::Newer(record)
+            | crate::service_record_follow::DfsRecordFollowed::ResendDue(record) => record,
+            crate::service_record_follow::DfsRecordFollowed::Woken => {
+                return Ok(RoutedWriteRecordFollow::Woken);
+            }
+            crate::service_record_follow::DfsRecordFollowed::Ended => {
+                return Ok(RoutedWriteRecordFollow::NotFollowed);
+            }
         };
         self.dispatch_held_routed_write(&canonical, &record, true)?;
-        Ok(true)
+        Ok(RoutedWriteRecordFollow::Resent)
+    }
+
+    /// One wait of a routed write its primary answered `Pending`. The primary
+    /// holds the write and answers again when it commits, so nothing re-sends
+    /// it on a timer. The wait also observes the shard's record: when this
+    /// requester's projection moves past the record the write was sent
+    /// under, that primary may never answer, and the same write, under the
+    /// same id and with the body the requester kept, goes to the primary the
+    /// projection names. The wait ends for its caller when a message arrives
+    /// or at `wake_at`.
+    pub(crate) fn await_pending_routed_write(
+        &mut self,
+        request_id: &str,
+        wake_at: Instant,
+    ) -> Result<RoutedWriteRecordFollow, DfsError> {
+        if !self.follows_record_changes() {
+            return Ok(RoutedWriteRecordFollow::NotFollowed);
+        }
+        let Some((canonical, evidence, false)) = self.unresolved_routed_write(request_id) else {
+            return Ok(RoutedWriteRecordFollow::NotFollowed);
+        };
+        match self.await_shard_record_change(
+            &evidence,
+            None,
+            crate::service_record_follow::DfsRecordWaitWake {
+                on_arrival: true,
+                at: Some(wake_at),
+            },
+        )? {
+            crate::service_record_follow::DfsRecordFollowed::Newer(record) => {
+                self.dispatch_held_routed_write(&canonical, &record, true)?;
+                Ok(RoutedWriteRecordFollow::Resent)
+            }
+            crate::service_record_follow::DfsRecordFollowed::ResendDue(_)
+            | crate::service_record_follow::DfsRecordFollowed::Woken => {
+                Ok(RoutedWriteRecordFollow::Woken)
+            }
+            crate::service_record_follow::DfsRecordFollowed::Ended => {
+                Ok(RoutedWriteRecordFollow::NotFollowed)
+            }
+        }
     }
 
     /// Send a held routed write to the primary `record` names.
@@ -2963,11 +3065,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let validated_authority_shard =
             if matches!(&response.result, DfsDistributedWriteResult::Outcome { .. }) {
-                match self.validate_routed_write_response_authority(
-                    &primary_node_id,
-                    &expected_authority_shard,
-                ) {
-                    Ok(validated) => Some(validated),
+                match self
+                    .routed_write_response_authority(&primary_node_id, &expected_authority_shard)
+                {
+                    Ok(crate::service_routed_journal::RoutedWriteResponseAuthority::Current(
+                        validated,
+                    )) => Some(validated),
+                    // The projection moved past the record this write was
+                    // sent under. The dispatch primary's outcome is still the
+                    // write's own: it is taken below with its real result,
+                    // and only the response journal stays unreplayed.
+                    Ok(crate::service_routed_journal::RoutedWriteResponseAuthority::Superseded) => {
+                        None
+                    }
                     Err(error) => {
                         let reason = format!("routed write response authority is stale: {error}");
                         self.complete_pending_routed_write(
@@ -3045,7 +3155,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let evidence = crate::service_record_follow::DfsRecordChangeEvidence {
                 dispatched,
                 floor_epoch: None,
-                undelivered: false,
             };
             let newer = self
                 .projected_shard_record(
@@ -3189,7 +3298,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
         }
-        if let Some((publication, outcome)) = committed_manifest_publish {
+        // The requester's own projection of a commit follows only an outcome
+        // whose record it still projects, after that response's journal.
+        if let Some((publication, outcome)) =
+            committed_manifest_publish.filter(|_| validated_authority_shard.is_some())
+        {
             if primary_node_id == self.node_id
                 && self.transport.delegates_local_namespace_authority()
                 && let Err(error) = self

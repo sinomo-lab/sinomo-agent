@@ -784,9 +784,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// `DfsPosixError` a local execution would have produced. On success the
     /// response journal batches are already replayed locally.
     ///
-    /// A node routing on a stale shard view can address a former primary;
-    /// the authority rejection names the current primary, and the operation
-    /// is retried against it (bounded) instead of failing.
+    /// The call keeps one operation id. A node routing on a stale shard view
+    /// can address a former primary: its refusal, like an unknown outcome or
+    /// an undelivered request, makes the caller wait for its own projection
+    /// of the shard's record to change and send the same request to the
+    /// primary that record names. Only the caller's budget bounds the wait.
     pub(crate) fn route_namespace_operation(
         &mut self,
         primary_node_id: NodeId,
@@ -835,7 +837,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // it from durable admission, at whichever node the record names.
         let followed = self
             .route_namespace_following_record(
-                Some(&operation_id),
+                &operation_id,
                 &file_system_id,
                 primary_node_id,
                 &operation,
@@ -895,21 +897,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.execute_posix_coordination_operation_local(operation)
     }
 
+    /// Route one bounded namespace-job step under one operation id. Starting
+    /// a job is answered from its request row on a repeat, and resuming one
+    /// only advances the durable job it names, so the same request is sent
+    /// again like any other mutation.
     pub(super) fn route_namespace_job_operation(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<DfsNamespaceJobRecord> {
-        let routed = self
-            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                sifs_file_system_id(),
+        let file_system_id = sifs_file_system_id();
+        let operation_id = self.next_request_id();
+        let followed = self
+            .route_namespace_following_record(
+                &operation_id,
+                &file_system_id,
                 primary_node_id,
-                operation.clone(),
+                &operation,
                 DFS_NO_CALLER_BUDGET,
                 true,
                 true,
             )
             .map_err(DfsPosixError::Dfs)?;
+        let routed = match followed {
+            DfsFollowedNamespaceRoute::Settled(routed) => routed,
+            // Authority moved to this node, which runs the step itself.
+            DfsFollowedNamespaceRoute::LocalAuthority => {
+                return match &operation {
+                    DfsNamespaceOperation::RenameDirectoryBounded {
+                        from,
+                        to,
+                        max_steps,
+                    } => self.posix_rename_directory_bounded(
+                        from,
+                        to,
+                        usize::try_from(*max_steps).unwrap_or(usize::MAX),
+                    ),
+                    DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                        job_id, max_steps, ..
+                    } => self.posix_resume_namespace_job_bounded(
+                        job_id,
+                        usize::try_from(*max_steps).unwrap_or(usize::MAX),
+                    ),
+                    _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "namespace job route carried another operation".to_string(),
+                    })),
+                };
+            }
+        };
         match routed.result.clone() {
             DfsNamespaceResult::Applied => match routed.posix_coordination_result {
                 Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
@@ -925,18 +960,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Route one mutation whose reply this caller does not replay into local
+    /// metadata. It keeps one operation id like every other mutation: the
+    /// primary answers a repeat from the request row it recorded.
     pub(super) fn route_namespace_operation_without_local_replay(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
         let file_system_id = sifs_file_system_id();
-        // Each attempt here has a new request id, so only an attempt that was
-        // not delivered, or was refused for its authority, is sent again. A
-        // possibly applied dispatch is returned unchanged.
+        let operation_id = self.next_request_id();
         let followed = self
             .route_namespace_following_record(
-                None,
+                &operation_id,
                 &file_system_id,
                 primary_node_id,
                 &operation,
@@ -947,7 +983,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsPosixError::Dfs)?;
         match followed {
             DfsFollowedNamespaceRoute::LocalAuthority => self
-                .execute_routed_namespace_operation_locally(None, &operation)
+                .execute_routed_namespace_operation_locally(Some(&operation_id), &operation)
                 .map(drop),
             DfsFollowedNamespaceRoute::Settled(routed) => match routed.result {
                 DfsNamespaceResult::Applied => Ok(()),

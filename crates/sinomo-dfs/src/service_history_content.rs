@@ -62,7 +62,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_id: object.object_id.clone(),
             version: target_version.clone(),
         };
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes
+            .follow_write(&object.object_id, &target_version, options.wait_for_commit);
         let outcome = self.write_stable_distributed_reader(
             sinomo_core::DfsWriteRequest {
                 file_system_id: object.file_system_id,

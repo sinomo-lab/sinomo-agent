@@ -62,8 +62,26 @@ fn write_from(
     operation: &'static str,
     budget: Option<Duration>,
 ) -> mpsc::Receiver<Result<crate::DfsStat, crate::DfsPosixError>> {
+    write_with(
+        runtime,
+        write_options(config, rule),
+        from,
+        path,
+        operation,
+        budget,
+    )
+}
+
+/// [`write_from`] under the write options the caller chose.
+fn write_with(
+    runtime: &DfsTestRuntime,
+    options: crate::DfsWriteOptions,
+    from: &NodeId,
+    path: &'static str,
+    operation: &'static str,
+    budget: Option<Duration>,
+) -> mpsc::Receiver<Result<crate::DfsStat, crate::DfsPosixError>> {
     let data_dir = runtime.data_dir(from).clone();
-    let options = write_options(config, rule);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut client = crate::runtime_host::open_dfs_runtime_service(
@@ -823,5 +841,410 @@ fn native_mounted_client_request_asks_its_node_to_verify_the_primary() {
     writer.join().unwrap();
     assert_ne!(record_from(&runtime, &config, &b).shard.primary_node_id, p);
     heal(&runtime, &config, &p, [&b, &c]);
+    runtime.close().unwrap();
+}
+
+/// A requester's hint takes no admission at its node's Main. With that
+/// node's global mutation writer held, the hint of a mounted client there is
+/// still heard, and the keeper asks the network to verify the primary.
+#[test]
+fn native_primary_verification_hint_takes_no_mutation_admission() {
+    let (runtime, config) = switched_with_kv_voters("native-follow-hint-admission", Some((2, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/unadmitted");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: true,
+            dfs: true,
+        },
+    );
+    let mut mount = mounted(&runtime, &b);
+    let options = write_options(&config, Some((2, 3)));
+    // Every lane of the requester's node is closed to new mutation work.
+    let held = runtime.hold_main_mutation_admission(&b).unwrap();
+    assert!(runtime.main_global_writer_holds(&b).unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let written = mount.posix_write_file("/services/unadmitted/kept.txt", b"kept", options);
+        let _ = sender.send(written);
+    });
+    let started = Instant::now();
+    while !runtime.peer_verification_requests(&b).contains(&p) {
+        assert!(
+            started.elapsed() < EVENT_BOUND,
+            "the hint is heard while the node's global writer is held; calls {:?}",
+            calls_from(&runtime, &b)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        runtime.main_global_writer_holds(&b).unwrap(),
+        "the writer was held for the whole time the hint took"
+    );
+    drop(held);
+    // The verdict settles: the takeover starts, and the call follows it.
+    lose(&runtime, &[&b, &c], &p);
+    committed_across_takeover(
+        receiver.recv_timeout(EVENT_BOUND * 2).unwrap_or_else(|_| {
+            panic!(
+                "the syscall returns once a member has taken over; calls {:?}\n{}",
+                calls_from(&runtime, &b),
+                event_log(&runtime, &[&b, &c])
+            )
+        }),
+        || event_log(&runtime, &[&b, &c]),
+    );
+    writer.join().unwrap();
+    assert_ne!(record_from(&runtime, &config, &b).shard.primary_node_id, p);
+    heal(&runtime, &config, &p, [&b, &c]);
+    runtime.close().unwrap();
+}
+
+/// The namespace request ids under which the primary was asked to execute
+/// one kind of operation for one requester. Its first execution is refused
+/// before anything runs, with an error that tells the requester nothing about
+/// what the primary did.
+struct Repeated {
+    ids: Arc<std::sync::Mutex<Vec<String>>>,
+    _hook: crate::runtime_host::DaemonDfsPreDispatchTestHookGuard,
+}
+
+impl Repeated {
+    fn refuse_first(
+        runtime: &DfsTestRuntime,
+        primary: &NodeId,
+        requester: &NodeId,
+        picks: fn(&crate::DfsNamespaceOperation) -> bool,
+    ) -> Self {
+        use crate::runtime_host::DaemonDfsPreDispatchTestPoint as Point;
+        let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&ids);
+        let requester = requester.clone();
+        let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            runtime.data_dir(primary),
+            Arc::new(move |point, command, _| {
+                if !matches!(point, Point::BeforeExecute { .. }) {
+                    return Ok(());
+                }
+                let Some(command) = command else {
+                    return Ok(());
+                };
+                let crate::DfsNetworkMessage::NamespaceRequest(request) =
+                    &command.routed_message.message
+                else {
+                    return Ok(());
+                };
+                if command.routed_message.source_node_id != requester || !picks(&request.operation)
+                {
+                    return Ok(());
+                }
+                let mut seen = seen.lock().unwrap();
+                seen.push(request.request_id.clone());
+                if seen.len() == 1 {
+                    return Err(crate::DfsError::Network {
+                        message: "the carrier ended while the primary served the call".into(),
+                    });
+                }
+                Ok(())
+            }),
+        );
+        Self { ids, _hook: hook }
+    }
+
+    /// The call was sent twice, under one id.
+    fn assert_one_id(self, call: &str) {
+        let ids = self.ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "{call} was sent again once: {ids:?}");
+        assert_eq!(ids[0], ids[1], "{call} keeps one operation id per call");
+    }
+}
+
+/// A sync, a lock, a directory touch, a `MkdirAll` and a bounded job step
+/// each keep one operation id for their call: an attempt whose outcome the
+/// caller cannot know is sent again under the same id and answered, instead
+/// of ending the call.
+#[test]
+fn native_syncs_locks_and_unreplayed_mutations_keep_one_operation_id_per_call() {
+    let (runtime, config) = switched("native-follow-one-id", None);
+    let p = config.primary_node_id.clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/ids");
+        directory(&mut service, "/services/ids/moved");
+    }
+    let mut client = runtime.client(&c).unwrap();
+    let file = "/services/ids/file.txt";
+    client
+        .posix_write_file(file, b"synced", write_options(&config, None))
+        .expect("the file to sync and lock is written");
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(operation, crate::DfsNamespaceOperation::FileSync { .. })
+    });
+    client
+        .posix_sync_file(file, crate::DfsPosixSyncKind::FileData)
+        .expect("an fsync whose first attempt is unknown is sent again");
+    repeated.assert_one_id("fsync");
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(
+            operation,
+            crate::DfsNamespaceOperation::DirectorySync { .. }
+        )
+    });
+    client
+        .posix_sync_directory("/services/ids")
+        .expect("an fsyncdir whose first attempt is unknown is sent again");
+    repeated.assert_one_id("fsyncdir");
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(operation, crate::DfsNamespaceOperation::AdvisoryLock { .. })
+    });
+    let locked = client
+        .posix_advisory_lock(
+            file,
+            crate::DfsAdvisoryLockCommand::Acquire {
+                request_id: crate::DfsAdvisoryLockRequestId::new("one-id-acquire"),
+                session_id: crate::DfsAdvisoryLockSessionId::new("one-id-session"),
+                mode: crate::DfsAdvisoryLockMode::Exclusive,
+                blocking: false,
+                process_id: None,
+            },
+        )
+        .expect("a lock whose first attempt is unknown is sent again");
+    assert!(
+        matches!(locked, crate::DfsAdvisoryLockOutcome::Acquired { .. }),
+        "the lock is acquired once: {locked:?}"
+    );
+    repeated.assert_one_id("lock");
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(
+            operation,
+            crate::DfsNamespaceOperation::TouchDirectoryModified { .. }
+        )
+    });
+    client
+        .posix_touch_directory_modified_without_local_replay("/services/ids")
+        .expect("a touch whose first attempt is unknown is sent again");
+    repeated.assert_one_id("touch");
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(operation, crate::DfsNamespaceOperation::MkdirAll { .. })
+    });
+    client
+        .posix_mkdir_all_without_local_replay("/services/ids/made/deeper")
+        .expect("a MkdirAll whose first attempt is unknown is sent again");
+    repeated.assert_one_id("MkdirAll");
+    assert_eq!(
+        client
+            .posix_stat_distributed("/services/ids/made/deeper")
+            .unwrap()
+            .kind,
+        crate::DfsObjectKind::Directory
+    );
+
+    let repeated = Repeated::refuse_first(&runtime, &p, &c, |operation| {
+        matches!(
+            operation,
+            crate::DfsNamespaceOperation::RenameDirectoryBounded { .. }
+        )
+    });
+    let job = client
+        .posix_rename_directory_bounded_routed("/services/ids/moved", "/services/ids/renamed", 64)
+        .expect("a job step whose first attempt is unknown is sent again");
+    repeated.assert_one_id("a bounded job step");
+    assert_eq!(job.root_path, "/services/ids/moved");
+    drop(client);
+    runtime.close().unwrap();
+}
+
+/// A routed write its primary answered `Pending`, whose primary is then lost.
+/// The primary could not stage a second copy, so it answered with what it
+/// held and nothing more comes from it. Returns the runtime, the shard, the
+/// write options, and the outcome of the caller's one call once a member has
+/// taken over.
+#[allow(clippy::type_complexity)]
+fn pending_write_whose_primary_is_lost(
+    name: &str,
+    path: &'static str,
+    operation: &'static str,
+) -> (
+    DfsTestRuntime,
+    DfsMetadataShardConfig,
+    crate::DfsWriteOptions,
+    Result<crate::DfsStat, crate::DfsPosixError>,
+) {
+    let (runtime, config) = switched_with_kv_voters(name, Some((2, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/pending");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    for target in [&b, &c] {
+        for route in [
+            crate::DFS_DATA_STAGE_BLOB_ROUTE,
+            crate::DFS_DATA_STAGE_PATCH_ROUTE,
+            crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(FaultRule {
+                source: Some(p.clone()),
+                target: Some(target.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: FaultAction::BudgetExhausted,
+            });
+        }
+    }
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    // The requester streams its bytes to the primary and waits for the
+    // commit there; the primary answers at once with what it holds.
+    let options = crate::DfsWriteOptions {
+        foreground_replica_repair: true,
+        ..write_options(&config, Some((2, 3)))
+    };
+    let receiver = write_with(&runtime, options.clone(), &c, path, operation, None);
+    let started = Instant::now();
+    let answered_by_the_primary = || {
+        let calls = runtime.rpc_observations();
+        calls.iter().any(|call| {
+            call.source == c
+                && call.target == p
+                && call.dfs_request_id.as_deref() == Some(operation)
+                && calls.iter().any(|answer| {
+                    answer.call_id == call.call_id
+                        && answer.phase == crate::test_runtime::RpcPhase::Completed
+                })
+        })
+    };
+    while !answered_by_the_primary() {
+        assert!(
+            started.elapsed() < EVENT_BOUND,
+            "the primary answered the write; calls {:?}",
+            calls_from(&runtime, &c)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        receiver.recv_timeout(Duration::from_secs(2)).is_err(),
+        "the primary holds the write below its W: the caller waits"
+    );
+    assert_eq!(
+        sends_to(&runtime, &c, &p, operation),
+        1,
+        "nothing sends a write its primary holds again"
+    );
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: true,
+            dfs: true,
+        },
+    );
+    lose(&runtime, &[&b, &c], &p);
+    let outcome = receiver.recv_timeout(EVENT_BOUND * 2).unwrap_or_else(|_| {
+        panic!(
+            "the caller follows the record to the member that took over; record {:?}\ncalls {:?}\n{}",
+            record_from(&runtime, &config, &b).shard,
+            calls_from(&runtime, &c),
+            event_log(&runtime, &[&b, &c])
+        )
+    });
+    runtime.clear_faults();
+    (runtime, config, options, outcome)
+}
+
+/// The settle wait of a write its primary answered `Pending` observes the
+/// shard's record. When the primary is lost and a member takes over, the
+/// caller, which set no budget, sends the same write under the same id to
+/// that member and is answered by it, instead of waiting for a primary that
+/// will never answer.
+#[test]
+fn native_pending_write_goes_under_its_id_to_the_member_that_took_over() {
+    let path = "/services/pending/followed.txt";
+    let operation = "follow-pending-sent";
+    let (runtime, config, _, outcome) =
+        pending_write_whose_primary_is_lost("native-follow-pending-sent", path, operation);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
+    assert_ne!(winner, p, "a member took over");
+    assert!(
+        winner == c || sends_to(&runtime, &c, &winner, operation) >= 1,
+        "the same operation id went to the new primary; calls {:?}",
+        calls_from(&runtime, &c)
+    );
+    assert_eq!(
+        sends_to(&runtime, &c, &p, operation),
+        1,
+        "the lost primary was sent the write once"
+    );
+    // The call ended on what the member that took over answered: its result,
+    // or that member's own refusal, never a failed delivery to the old one.
+    assert!(
+        !matches!(
+            &outcome,
+            Err(crate::DfsPosixError::Dfs(crate::DfsError::NetworkDelivery { message, .. }))
+                if !message.contains("the write committed")
+        ) && !matches!(
+            &outcome,
+            Err(crate::DfsPosixError::Dfs(crate::DfsError::Network { .. }))
+        ),
+        "the member that took over answered the call: {outcome:?}"
+    );
+    heal(&runtime, &config, &p, [&b, &c]);
+    runtime.close().unwrap();
+}
+
+/// The caller of a write its primary answered `Pending` completes exactly
+/// once across that primary's loss: the member that took over answers the
+/// same operation id with the write's one commit.
+#[test]
+#[ignore = "the member that took over refuses a same-id write whose intent the lost primary replicated: it compares the intents including the owner epoch (service_commit.rs, recover_prepared_intent_opening_publication) and has no transfer descriptor for the replicated intent"]
+fn native_pending_write_completes_once_past_a_lost_primary() {
+    let path = "/services/pending/held.txt";
+    let operation = "follow-pending";
+    let (runtime, config, options, outcome) =
+        pending_write_whose_primary_is_lost("native-follow-pending", path, operation);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let answered = committed_across_takeover(outcome, || event_log(&runtime, &[&b, &c]));
+    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
+    assert_ne!(winner, p, "a member took over");
+    assert!(
+        winner == c || sends_to(&runtime, &c, &winner, operation) >= 1,
+        "the same operation id went to the new primary"
+    );
+    heal(&runtime, &config, &p, [&b, &c]);
+    // The same call again is answered from the one commit.
+    let again = write_with(&runtime, options, &c, path, operation, None)
+        .recv_timeout(EVENT_BOUND)
+        .expect("a retry of a committed operation is answered")
+        .expect("a retry of a committed operation succeeds");
+    if let Some(answered) = answered {
+        assert_eq!(answered.version, again.version);
+    }
+    assert_written_once(&runtime, &winner, &c, path, operation, &again);
     runtime.close().unwrap();
 }

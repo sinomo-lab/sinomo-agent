@@ -761,9 +761,7 @@ fn cross_shard_alias_rename_waits_while_its_target_shard_converts() {
     let mut kv = cluster._runtime.configuration_publisher(&root_node);
     let (active, converting) =
         close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
-    cluster.replica.single_attempt_for_test(true);
     let refused = cluster.replica.posix_rename(alias, moved);
-    cluster.replica.single_attempt_for_test(false);
     assert!(
         matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
         "a move of an alias whose target shard converts is retriable: {refused:?}"
@@ -843,9 +841,7 @@ fn cross_shard_alias_rename_reads_the_target_record_while_the_target_still_serve
             .any(|event| event.key == key),
         "the target's node withheld the record change"
     );
-    cluster.replica.single_attempt_for_test(true);
     let refused = cluster.replica.posix_rename(alias, moved);
-    cluster.replica.single_attempt_for_test(false);
     assert!(
         matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
         "the coordinator reads the target's record, not only its reachability: {refused:?}"
@@ -939,9 +935,7 @@ fn cross_shard_alias_rename_waits_while_its_target_shard_has_no_storage_record()
             .any(|event| event.key == key),
         "the target's node withheld the record change"
     );
-    cluster.replica.single_attempt_for_test(true);
     let refused = cluster.replica.posix_rename(alias, moved);
-    cluster.replica.single_attempt_for_test(false);
     assert!(
         matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
         "a target shard with no storage record is closed: {refused:?}"
@@ -1138,9 +1132,7 @@ fn cross_shard_global_operations_serve_beside_a_closed_shard_copy() {
 
     // A globally admitted operation that addresses the closed shard still
     // meets its storage refusal.
-    cluster.replica.single_attempt_for_test(true);
     let refused = cluster.replica.posix_rename(closed, closed_renamed);
-    cluster.replica.single_attempt_for_test(false);
     assert!(
         matches!(&refused, Err(error)
             if error.to_string().contains("metadata shard storage is converting")),

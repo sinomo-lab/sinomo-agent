@@ -1273,60 +1273,84 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
 
-        self.refresh_control_plane_latest()?;
-        let authority_shards =
-            self.namespace_operation_authority_shards(&file_system_id, operation)?;
-        let dispatch = Self::namespace_operation_dispatch_shard(
-            &file_system_id,
-            operation,
-            &authority_shards,
-        )?
-        .ok_or_else(|| DfsError::Distributed {
-            message: format!(
-                "stable namespace reconciliation for {operation_id} has no current dispatch authority"
-            ),
-        })?;
         let requester_node_id = self.node_id.clone();
-        if dispatch.primary_node_id == self.node_id
-            && !self.transport.delegates_local_namespace_authority()
-        {
-            return self.reconcile_stable_namespace_operation_locally_for_requester(
-                operation_id,
+        // The probe changes nothing, so it is sent again like a read: one
+        // that cannot be delivered asks for the primary's verification and
+        // goes, after the record changes or on the re-send timer, to the
+        // primary the projection names then.
+        let mut resend = crate::service_record_follow::DfsRecordFollowResend::new();
+        let request_id = loop {
+            self.refresh_control_plane_latest()?;
+            let authority_shards =
+                self.namespace_operation_authority_shards(&file_system_id, operation)?;
+            let dispatch = Self::namespace_operation_dispatch_shard(
+                &file_system_id,
                 operation,
-                &requester_node_id,
                 &authority_shards,
-                true,
+            )?
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "stable namespace reconciliation for {operation_id} has no current dispatch authority"
+                ),
+            })?;
+            if dispatch.primary_node_id == self.node_id
+                && !self.transport.delegates_local_namespace_authority()
+            {
+                return self.reconcile_stable_namespace_operation_locally_for_requester(
+                    operation_id,
+                    operation,
+                    &requester_node_id,
+                    &authority_shards,
+                    true,
+                );
+            }
+            let request_id = self.next_request_id();
+            let authority_node_id = dispatch.primary_node_id.clone();
+            self.stable_namespace_reconciliation_targets
+                .insert(request_id.clone(), authority_node_id.clone());
+            let sent = self.send_dfs_message_if_routable(
+                &authority_node_id,
+                DfsNetworkMessage::StableNamespaceReconciliationRequest(
+                    DfsStableNamespaceReconciliationRequest {
+                        request_id: request_id.clone(),
+                        operation_id: operation_id.to_string(),
+                        requesting_node_id: requester_node_id.clone(),
+                        operation: Box::new(operation.clone()),
+                        authority_shards,
+                        dispatch_authority_shard: dispatch.clone(),
+                    },
+                ),
             );
-        }
-        let probe_operation = operation.clone();
-        let request_id = self.next_request_id();
-        let authority_node_id = dispatch.primary_node_id.clone();
-        self.stable_namespace_reconciliation_targets
-            .insert(request_id.clone(), authority_node_id.clone());
-        let sent = self.send_dfs_message_if_routable(
-            &authority_node_id,
-            DfsNetworkMessage::StableNamespaceReconciliationRequest(
-                DfsStableNamespaceReconciliationRequest {
-                    request_id: request_id.clone(),
-                    operation_id: operation_id.to_string(),
-                    requesting_node_id: requester_node_id.clone(),
-                    operation: Box::new(probe_operation),
-                    authority_shards,
-                    dispatch_authority_shard: dispatch,
-                },
-            ),
-        )?;
-        if !sent {
+            let undelivered = match sent {
+                Ok(true) => break request_id,
+                Ok(false) => None,
+                Err(error @ (DfsError::Network { .. } | DfsError::NetworkDelivery { .. }))
+                    if !crate::error::dfs_error_is_closed_shard_storage(&error) =>
+                {
+                    Some(error)
+                }
+                Err(error) => {
+                    self.stable_namespace_reconciliation_targets
+                        .remove(&request_id);
+                    return Err(error);
+                }
+            };
             self.stable_namespace_reconciliation_targets
                 .remove(&request_id);
-            return Ok(
-                DfsStableNamespaceOperationReconciliation::AmbiguousOrExpired {
-                    reason: format!(
-                        "stable namespace reconciliation authority {authority_node_id} is unroutable"
-                    ),
-                },
-            );
-        }
+            if self.follow_undelivered_probe(&dispatch, &mut resend)? {
+                continue;
+            }
+            return match undelivered {
+                Some(error) => Err(error),
+                None => Ok(
+                    DfsStableNamespaceOperationReconciliation::AmbiguousOrExpired {
+                        reason: format!(
+                            "stable namespace reconciliation authority {authority_node_id} is unroutable"
+                        ),
+                    },
+                ),
+            };
+        };
         let reconciliation = self.wait_for_stable_namespace_reconciliation(
             &request_id,
             self.transport.operation_deadline(),

@@ -5053,6 +5053,44 @@ async fn prepare_daemon_dfs_genesis_ingress(
     daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
 }
 
+/// Hear a hint from one of this node's own requesters against the shard
+/// record this node's Main published. A publication that is not ready hears
+/// nothing: the requester posts the hint again with its next attempt.
+/// sinomo:kv-configuration: Read the shard record this node already published, to hear a primary-verification hint only about that record.
+fn hear_daemon_dfs_primary_verification_hint(
+    cluster_paths: &ClusterPaths,
+    cluster_id: &sinomo_core::Id,
+    local_node_id: &NodeId,
+    source_node_id: &NodeId,
+    request: &sinomo_dfs::DfsPrimaryVerificationRequest,
+    runtime: &tokio::runtime::Handle,
+) {
+    let Ok(authority) = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        cluster_id,
+        local_node_id,
+        Some(runtime),
+    ) else {
+        return;
+    };
+    let projected = authority
+        .configuration_snapshot()
+        .metadata_shards(&request.file_system_id)
+        .ok()
+        .flatten()
+        .and_then(|shards| {
+            shards
+                .into_iter()
+                .find(|shard| shard.shard_id == request.shard_id)
+        });
+    crate::service_record_follow::hear_primary_verification_hint(
+        local_node_id,
+        source_node_id,
+        request,
+        projected.as_ref(),
+    );
+}
+
 pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
@@ -5154,6 +5192,35 @@ async fn handle_served_daemon_dfs_message(
                 outbound_messages: Vec::new(),
             }));
         }
+    }
+    // A requester's hint that it could not reach a shard's primary reads this
+    // node's published record and leaves one flag for the keeper. It takes no
+    // admission: it neither waits behind a lane holder nor makes lane work
+    // wait behind it.
+    if attachment.is_none()
+        && let sinomo_dfs::DfsNetworkMessage::PrimaryVerificationRequest(request) =
+            &command.routed_message.message
+    {
+        let local =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)?;
+        if command.routed_message.target_node_id != local.local_node_id {
+            return Err(DaemonError::Network {
+                address: "DFS message".into(),
+                detail: "DFS hint target differs from the actual local identity".into(),
+            });
+        }
+        hear_daemon_dfs_primary_verification_hint(
+            &cluster_paths,
+            &local.cluster_id,
+            &local.local_node_id,
+            &command.routed_message.source_node_id,
+            request,
+            runtime,
+        );
+        return Ok(DfsDataPlaneResponse::value(crate::DfsMessageResponse {
+            request_id: command.request_id,
+            outbound_messages: Vec::new(),
+        }));
     }
     let peer_snapshot_started = Instant::now();
     // Only the requester's budget bounds the authority reads before

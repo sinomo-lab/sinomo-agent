@@ -2857,7 +2857,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// under the same id and with the body it kept, to the primary the newer
     /// record names; while the record has not changed, the re-send timer
     /// sends it to the current primary again. The wait ends once a dispatch
-    /// is delivered, at the caller's operation deadline or on cancellation.
+    /// is delivered, once an answer to an earlier dispatch settles the write,
+    /// at the caller's operation deadline or on cancellation.
     ///
     /// A dispatch failure cannot erase an earlier attempt with the same
     /// stable identity: a definitely-unsent retry says nothing about whether
@@ -2888,11 +2889,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Ok(false) => Self::metadata_primary_unroutable_error(&shard, &primary_node_id),
                 Err(error) => error,
             };
+            // A shard whose storage is closed refused before any effect; the
+            // refusal arrives as the text of a failed call and is the write's
+            // answer, not a failed delivery.
             let undelivered = unroutable
-                || matches!(
+                || (matches!(
                     error,
                     DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
-                );
+                ) && !crate::error::dfs_error_is_closed_shard_storage(&error));
             if !undelivered {
                 break (unroutable, error);
             }
@@ -2908,20 +2912,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let evidence = crate::service_record_follow::DfsRecordChangeEvidence {
                 dispatched: shard.clone(),
                 floor_epoch: None,
-                undelivered: true,
             };
             let resend =
                 resend.get_or_insert_with(crate::service_record_follow::DfsRecordFollowResend::new);
-            let record = match self.await_newer_shard_record(&evidence, resend) {
-                Ok(crate::service_record_follow::DfsRecordFollowed::Newer(record)) => record,
-                Ok(crate::service_record_follow::DfsRecordFollowed::ResendDue(record)) => record,
-                Ok(crate::service_record_follow::DfsRecordFollowed::Ended) => {
-                    break (unroutable, error);
+            let record = loop {
+                let followed = self.await_shard_record_change(
+                    &evidence,
+                    Some(&mut *resend),
+                    crate::service_record_follow::DfsRecordWaitWake {
+                        on_arrival: true,
+                        at: None,
+                    },
+                );
+                match followed {
+                    Ok(
+                        crate::service_record_follow::DfsRecordFollowed::Newer(record)
+                        | crate::service_record_follow::DfsRecordFollowed::ResendDue(record),
+                    ) => break Some(record),
+                    Ok(crate::service_record_follow::DfsRecordFollowed::Woken) => {
+                        // An answer to an earlier dispatch of this write may
+                        // have arrived. Read it now: if it settled the write,
+                        // the caller takes that result and nothing is sent.
+                        if let Err(error) = self.process_incoming() {
+                            self.compact_pending_routed_write(request_id);
+                            return Err(error);
+                        }
+                        if self
+                            .writes
+                            .pending_routed_writes
+                            .get(request_id)
+                            .is_none_or(|pending| pending.result.is_some())
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Ok(crate::service_record_follow::DfsRecordFollowed::Ended) => break None,
+                    Err(cancelled) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(cancelled);
+                    }
                 }
-                Err(cancelled) => {
-                    self.compact_pending_routed_write(request_id);
-                    return Err(cancelled);
-                }
+            };
+            let Some(record) = record else {
+                break (unroutable, error);
             };
             let ambiguous = !(unroutable
                 || matches!(
@@ -3221,7 +3254,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        let follow = self.writes.take_followed_write(&request_id) && !detach_request;
         self.finish_routed_write_dispatch(
             &request_id,
             previous,
@@ -3459,7 +3492,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 NetworkError::UnknownNode { .. } => Ok(false),
                 error => Err(DfsError::from_network(error)),
             });
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        let follow = self.writes.take_followed_write(&request_id);
         self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary, sent, follow)?;
         Ok(outcome)
     }
@@ -3571,7 +3604,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.send_dfs_message_if_routable(&primary_node_id, message)
         };
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        let follow = self.writes.take_followed_write(&request_id) && !detach_request;
         self.finish_routed_write_dispatch(
             &request_id,
             previous,
@@ -3815,7 +3848,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        let follow = self.writes.take_followed_write(&request_id);
         self.finish_routed_write_dispatch(
             &request_id,
             previous,

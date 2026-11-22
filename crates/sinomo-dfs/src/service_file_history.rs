@@ -1,7 +1,6 @@
 //! Explicit file captures and pins use the existing namespace authority lane.
 
 use crate::*;
-use std::time::Duration;
 use time::OffsetDateTime;
 
 fn history_error(message: impl Into<String>) -> DfsError {
@@ -192,18 +191,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Err(DfsContentReferenceMutationError::Rejected { reason });
                 }
             } else {
-                let result = self
-                    .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-                        request.operation_id.clone(),
-                        request.identity.file_system_id.clone(),
-                        shard.primary_node_id.clone(),
-                        operation,
-                        Duration::from_secs(60),
-                        false,
-                        false,
-                    )?;
-                if let DfsNamespaceResult::Rejected { reason, .. } = result.result {
-                    return Err(DfsContentReferenceMutationError::Rejected { reason });
+                // The request's own operation id is kept on every attempt,
+                // and only its caller's budget bounds the call.
+                let followed = self.route_namespace_following_record(
+                    &request.operation_id,
+                    &request.identity.file_system_id,
+                    shard.primary_node_id.clone(),
+                    &operation,
+                    crate::DFS_NO_CALLER_BUDGET,
+                    false,
+                    false,
+                )?;
+                let result = match followed {
+                    crate::service_record_follow::DfsFollowedNamespaceRoute::Settled(routed) => {
+                        routed.result
+                    }
+                    // Authority moved to this node: it admits the same request.
+                    crate::service_record_follow::DfsFollowedNamespaceRoute::LocalAuthority => self
+                        .execute_local_primary_namespace_result_for_file_system(
+                            request.identity.file_system_id.clone(),
+                            request.operation_id.clone(),
+                            operation,
+                        )
+                        .map_err(content_reference_posix_error)?,
+                };
+                match result {
+                    DfsNamespaceResult::Applied => {}
+                    // An outcome still unknown when the caller's budget ended
+                    // is not a refusal.
+                    DfsNamespaceResult::Rejected {
+                        reason,
+                        posix_error:
+                            posix_error @ Some(DfsNamespacePosixError::CommitOutcomeUnknown { .. }),
+                        ..
+                    } => {
+                        return Err(DfsContentReferenceMutationError::Uncertain(
+                            content_reference_posix_error(
+                                crate::posix_model::posix_error_for_namespace_rejection(
+                                    reason,
+                                    posix_error,
+                                ),
+                            ),
+                        ));
+                    }
+                    DfsNamespaceResult::Rejected { reason, .. } => {
+                        return Err(DfsContentReferenceMutationError::Rejected { reason });
+                    }
                 }
             }
         } else {
