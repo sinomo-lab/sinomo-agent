@@ -7730,13 +7730,21 @@ mod tests {
             first
         });
 
-        let advanced = service
+        // Placement reconciliation is Main-side work on the root owner's
+        // store-backed service. The delegating client would read the shard
+        // through Main, whose admission this test holds.
+        let mut worker = runtime
+            .metadata_primary_service("/")
+            .expect("actual root metadata owner");
+        assert_eq!(worker.node_id(), &root_shard.primary_node_id);
+        let advanced = worker
             .run_placement_reconciliation_bounded(1)
             .expect("reconciliation pass")
             .expect("oldest job");
         assert_eq!(advanced.job_id, first.job_id);
         assert_ne!(advanced.state, DfsPlacementReconciliationState::Failed);
         drop(admission);
+        drop(worker);
         drop(service);
         drop(control_plane);
         runtime.close().expect("native owner drain");

@@ -150,6 +150,7 @@ mod metadata_tombstone;
 mod model;
 mod module_surface;
 mod mount_config;
+mod mounted_call_replay;
 mod mounted_mutation_handoff;
 mod mounted_mutation_outbox;
 mod mounted_sifs;
@@ -468,7 +469,7 @@ pub use distributed::{
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, explain_replicas, plan_replicas, validate_replication_plan,
 };
-pub use error::{DfsCommitOutcomeUnknownCause, DfsError};
+pub use error::{DfsCommitOutcomeUnknownCause, DfsError, DfsShardStorageClosedCause};
 pub(crate) use error::{
     dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
     dfs_replica_not_desired_reason, distributed_write_rejection_current_primary,
@@ -716,6 +717,7 @@ pub use mount_config::{
     sifs_mount_settings_module_id, sifs_mount_status_config_definition,
     sifs_mount_status_config_definition_for_module,
 };
+pub use mounted_call_replay::{MountedSifsCallReplay, MountedSifsRecordWait};
 #[cfg(any(test, feature = "test-support"))]
 pub use mounted_mutation_handoff::MountedSifsHandoffTestDaemon;
 pub use mounted_mutation_handoff::{

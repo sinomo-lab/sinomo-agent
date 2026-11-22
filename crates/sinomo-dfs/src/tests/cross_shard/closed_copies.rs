@@ -60,8 +60,15 @@ fn a_node_holding_a_closed_shard_copy_serves_every_node_wide_path() {
         close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
     let refused = cluster.replica.posix_rename(held, held_renamed);
     assert!(
-        matches!(&refused, Err(error)
-            if error.to_string().contains("metadata shard storage is converting")),
+        matches!(
+            &refused,
+            Err(crate::DfsPosixError::Dfs(
+                crate::DfsError::ShardStorageClosed {
+                    cause: crate::DfsShardStorageClosedCause::Conversion,
+                    ..
+                }
+            ))
+        ),
         "the closed shard itself still refuses: {refused:?}"
     );
 

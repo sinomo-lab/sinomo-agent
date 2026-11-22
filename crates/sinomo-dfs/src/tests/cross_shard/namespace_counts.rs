@@ -1134,9 +1134,33 @@ fn cross_shard_global_operations_serve_beside_a_closed_shard_copy() {
     // meets its storage refusal.
     let refused = cluster.replica.posix_rename(closed, closed_renamed);
     assert!(
-        matches!(&refused, Err(error)
-            if error.to_string().contains("metadata shard storage is converting")),
+        matches!(
+            &refused,
+            Err(crate::DfsPosixError::Dfs(
+                crate::DfsError::ShardStorageClosed {
+                    cause: crate::DfsShardStorageClosedCause::Conversion,
+                    ..
+                }
+            ))
+        ),
         "a rename inside the closed shard refuses: {refused:?}"
+    );
+    // A write to a file of the closed shard is refused the same way, before
+    // any effect.
+    let refused = cluster
+        .replica
+        .posix_write_file(closed, b"rewritten bytes", options());
+    assert!(
+        matches!(
+            &refused,
+            Err(crate::DfsPosixError::Dfs(
+                crate::DfsError::ShardStorageClosed {
+                    cause: crate::DfsShardStorageClosedCause::Conversion,
+                    ..
+                }
+            ))
+        ),
+        "a write inside the closed shard refuses: {refused:?}"
     );
 
     replace_shard_storage(

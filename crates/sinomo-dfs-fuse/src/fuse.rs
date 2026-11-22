@@ -182,6 +182,9 @@ impl From<DfsPosixError> for FuseMountedMutationError {
             DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. }) => {
                 "dfs-posix-commit-outcome-unknown"
             }
+            DfsPosixError::Dfs(DfsError::ShardStorageClosed { .. }) => {
+                "dfs-posix-shard-storage-closed"
+            }
             DfsPosixError::Dfs(_) => "dfs-posix-dfs-error",
             DfsPosixError::Metadata(_) => "dfs-posix-metadata-error",
         };
@@ -1861,28 +1864,61 @@ impl SifsFuseFileSystem {
         dfs::MountedSifsCall::lock_service(&self.dfs).map_err(|_| libc::EIO)
     }
 
+    /// Run one syscall's DFS reads under the mount's service lane. A run
+    /// that would wait for a newer shard record hands the wait back: the
+    /// syscall makes it with the lane released, and the reads run again.
+    fn with_dfs<R>(
+        &self,
+        mut read: impl FnMut(&mut SifsService) -> R,
+    ) -> std::result::Result<R, libc::c_int> {
+        let mut replay = dfs::MountedSifsCallReplay::new();
+        loop {
+            let result = self
+                .lock_dfs()
+                .map(|mut service| replay.run(&mut *service, &mut read));
+            match replay.take_record_wait() {
+                Some(wait) => wait.wait(),
+                None => return result,
+            }
+        }
+    }
+
     fn run_mounted_mutation<R>(
         &self,
         operation: FuseMountedMutationOperation,
-        mutation: impl FnOnce(&mut SifsService) -> std::result::Result<R, FuseMountedMutationError>,
+        mut mutation: impl FnMut(&mut SifsService) -> std::result::Result<R, FuseMountedMutationError>,
     ) -> std::result::Result<R, libc::c_int> {
         // The budget covers the whole syscall, its wait for the mount's
         // service lane included.
         let deadline = dfs::MountedSifsCall::deadline();
-        let mutation =
-            move |service: &mut SifsService| within_operation_deadline(service, deadline, mutation);
-        let Some(handoff) = self.mounted_mutation_handoff.as_ref() else {
-            return self
-                .lock_dfs()
-                .and_then(|mut service| mutation(&mut service).map_err(|error| error.errno));
-        };
-        run_fuse_mounted_mutation_until(
-            handoff.as_ref(),
-            &self.dfs,
-            operation,
-            deadline,
-            |service| service.capture_mounted_mutation(mutation),
-        )
+        // A run that would wait for a newer shard record hands the wait
+        // back. The syscall makes it holding neither the service lane nor
+        // the mutation admission; each run hands its work to the daemon on
+        // its own, and the next run continues the same call.
+        let mut replay = dfs::MountedSifsCallReplay::new();
+        loop {
+            let mut run = |service: &mut SifsService| {
+                replay.run(service, |service| {
+                    within_operation_deadline(service, deadline, &mut mutation)
+                })
+            };
+            let result = match self.mounted_mutation_handoff.as_ref() {
+                None => self
+                    .lock_dfs()
+                    .and_then(|mut service| run(&mut service).map_err(|error| error.errno)),
+                Some(handoff) => run_fuse_mounted_mutation_until(
+                    handoff.as_ref(),
+                    &self.dfs,
+                    operation,
+                    deadline,
+                    |service| service.capture_mounted_mutation(&mut run),
+                ),
+            };
+            match replay.take_record_wait() {
+                Some(wait) => wait.wait(),
+                None => return result,
+            }
+        }
     }
 
     /// The deadline of a syscall that starts now: the mount's operation
@@ -1936,13 +1972,14 @@ impl SifsFuseFileSystem {
         path: &str,
         follow: bool,
     ) -> std::result::Result<dfs::DfsStat, libc::c_int> {
-        let mut dfs = self.lock_dfs()?;
-        let result = if follow {
-            dfs.posix_stat_distributed(path)
-        } else {
-            dfs.posix_lstat_distributed(path)
-        };
-        result.map_err(errno_for_posix_error)
+        self.with_dfs(|dfs| {
+            if follow {
+                dfs.posix_stat_distributed(path)
+            } else {
+                dfs.posix_lstat_distributed(path)
+            }
+        })?
+        .map_err(errno_for_posix_error)
     }
 
     fn reply_entry_for_path(&self, reply: ReplyEntry, path: String, stat: dfs::DfsStat) {
@@ -1999,7 +2036,7 @@ impl SifsFuseFileSystem {
                         &publication.base,
                         &publication.dirty.ranges,
                         &publication.operation_id,
-                        options,
+                        options.clone(),
                     )
                     .map_err(FuseMountedMutationError::from)
                 },
@@ -2109,8 +2146,7 @@ impl SifsFuseFileSystem {
             .ok_or(libc::EBADF)?
             .object_id
             .clone();
-        self.lock_dfs()?
-            .posix_capture_file_sync_target_for_object(&object_id, kind)
+        self.with_dfs(|dfs| dfs.posix_capture_file_sync_target_for_object(&object_id, kind))?
             .map_err(errno_for_posix_error)
     }
 
@@ -2709,7 +2745,7 @@ impl SifsFuseFileSystem {
         let stat = self.run_mounted_mutation(
             FuseMountedMutationOperation::ImmediateWritePublication,
             |dfs| {
-                dfs.posix_write_file_at_for_object(object_id, offset, data, write_options)
+                dfs.posix_write_file_at_for_object(object_id, offset, data, write_options.clone())
                     .map_err(FuseMountedMutationError::from)
             },
         )?;
@@ -2773,9 +2809,9 @@ impl SifsFuseFileSystem {
         };
         let stat = self.run_mounted_mutation(operation, |dfs| {
             if let Some(object_id) = object_id.as_ref() {
-                dfs.posix_truncate_file_for_object(object_id, size, write_options)
+                dfs.posix_truncate_file_for_object(object_id, size, write_options.clone())
             } else {
-                dfs.posix_truncate_file(&path, size, write_options)
+                dfs.posix_truncate_file(&path, size, write_options.clone())
             }
             .map_err(FuseMountedMutationError::from)
         })?;
@@ -2955,10 +2991,9 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
-            dfs.posix_readlink_distributed(&path)
-                .map_err(errno_for_posix_error)
-        });
+        let result = self
+            .with_dfs(|dfs| dfs.posix_readlink_distributed(&path))
+            .and_then(|target| target.map_err(errno_for_posix_error));
         match result {
             Ok(target) => reply.data(target.as_bytes()),
             Err(errno) => reply.error_from_i32(errno),
@@ -2991,7 +3026,7 @@ impl Filesystem for SifsFuseFileSystem {
         let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
         let write_options = self.write_options();
         let result = self.run_mounted_mutation(FuseMountedMutationOperation::Mknod, |dfs| {
-            dfs.posix_create_file_with_attrs(&path, write_options, attrs)
+            dfs.posix_create_file_with_attrs(&path, write_options.clone(), attrs)
                 .map_err(FuseMountedMutationError::from)
         });
         match result {
@@ -3105,7 +3140,7 @@ impl Filesystem for SifsFuseFileSystem {
         let attrs = DfsPosixCreateAttrs::new(0o777, req.uid(), req.gid());
         let write_options = self.write_options();
         let result = self.run_mounted_mutation(FuseMountedMutationOperation::Symlink, |dfs| {
-            dfs.posix_symlink_with_create_attrs(target, &path, write_options, attrs)
+            dfs.posix_symlink_with_create_attrs(target, &path, write_options.clone(), attrs)
                 .map_err(FuseMountedMutationError::from)
         });
         match result {
@@ -3254,7 +3289,7 @@ impl Filesystem for SifsFuseFileSystem {
         let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
         let write_options = self.write_options();
         let result = self.run_mounted_mutation(FuseMountedMutationOperation::Create, |dfs| {
-            create_file_for_fuse(dfs, &path, write_options, attrs, flags)
+            create_file_for_fuse(dfs, &path, write_options.clone(), attrs, flags)
         });
         match result {
             Ok(stat) => match self.lock_state() {
@@ -3337,10 +3372,9 @@ impl Filesystem for SifsFuseFileSystem {
                 offset,
                 max_bytes,
             } => {
-                let result = self.lock_dfs().and_then(|mut dfs| {
-                    dfs.posix_read_file_range_distributed(&path, offset, max_bytes)
-                        .map_err(errno_for_posix_error)
-                });
+                let result = self
+                    .with_dfs(|dfs| dfs.posix_read_file_range_distributed(&path, offset, max_bytes))
+                    .and_then(|bytes| bytes.map_err(errno_for_posix_error));
                 match result {
                     Ok(bytes) => reply.data(&bytes),
                     Err(errno) => reply.error_from_i32(errno),
@@ -5249,6 +5283,9 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
         // In-flight cross-shard moves reject mutations transiently; tell the
         // application to retry rather than reporting an I/O failure.
         DfsPosixError::Dfs(DfsError::Busy { .. }) => libc::EAGAIN,
+        // A shard whose storage is closed for preparation or conversion
+        // refused before any effect; the application tries again later.
+        DfsPosixError::Dfs(DfsError::ShardStorageClosed { .. }) => libc::EAGAIN,
         // An unknown outcome is what is left once the call has followed its
         // shard's record for as long as its caller allowed: the change may
         // still commit. It is reported as an I/O error; the mount keeps
@@ -5803,6 +5840,25 @@ mod errno_tests {
             }),
             libc::EAGAIN
         );
+    }
+
+    #[test]
+    fn a_closed_shard_storage_refusal_is_retried_later() {
+        for cause in [
+            dfs::DfsShardStorageClosedCause::Preparation,
+            dfs::DfsShardStorageClosedCause::Conversion,
+        ] {
+            let closed = || {
+                DfsPosixError::Dfs(DfsError::ShardStorageClosed {
+                    cause,
+                    detail: "closed".into(),
+                })
+            };
+            assert_eq!(errno_for_posix_error(closed()), libc::EAGAIN);
+            let error = FuseMountedMutationError::from(closed());
+            assert_eq!(error.errno, libc::EAGAIN);
+            assert_eq!(error.error_code, "dfs-posix-shard-storage-closed");
+        }
     }
 
     #[test]
@@ -6958,6 +7014,120 @@ mod errno_tests {
         assert_eq!(*service.lock().unwrap(), 1);
         assert_eq!(mount.unfinished(), 0);
         assert_eq!(mount.status().pending_marker_count, 0);
+    }
+
+    /// A mount over a real mounted service and a real outbox, without the
+    /// kernel: syscalls run through the filesystem's own entry points.
+    fn mounted_test_file_system(
+        service: SifsService,
+        handoff: Option<Arc<FuseMountedMutationHandoff>>,
+        cancellation: dfs::DfsCancellationFlag,
+    ) -> SifsFuseFileSystem {
+        let content_reads = service.mounted_content_read_context();
+        SifsFuseFileSystem {
+            dfs: Arc::new(MountLock::new(service)),
+            mounted_mutation_handoff: handoff,
+            content_reads,
+            read_executor: FuseReadExecutor::new(cancellation.clone())
+                .expect("start the mount's read workers"),
+            read_cancellation: cancellation,
+            state: Arc::new(MountLock::new(FuseState::new("/".to_string()))),
+            read_only: false,
+            presented_owner: None,
+            attr_ttl: Duration::from_secs(1),
+            entry_ttl: Duration::from_secs(1),
+            write_replica_candidates: Vec::new(),
+            operation_budget: None,
+            lock_mount_session_id: format!("fuse-test-{}", std::process::id()),
+            lock_request_sequence: Arc::new(AtomicU64::new(1)),
+            lock_renewer_stop: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A syscall whose shard's primary cannot be reached follows the shard's
+    /// record without holding the mount: the wait is made with the service
+    /// lane and the mutation admission released, and a syscall on a healthy
+    /// shard completes meanwhile.
+    #[test]
+    fn a_syscall_waiting_for_its_shard_record_leaves_the_mount_serving() {
+        let name = "fuse-record-wait-handback";
+        let (native, nodes) =
+            dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
+        let root = sinomo_testdir::TestDir::new(name);
+        let store = dfs::MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+            .expect("open the mount's outbox");
+        let session = store
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::Fuse,
+                format!("fuse-root:{name}"),
+            )
+            .expect("open the mount's session");
+        let daemon = TestDaemon::new(store.clone());
+        let handoff = Arc::new(FuseMountedMutationHandoff::new(
+            dfs::MountedSifsMutationHandoff::start(store, session, daemon.clone(), None)
+                .expect("start the mount's handoff"),
+        ));
+        let cancellation = dfs::DfsCancellationFlag::new();
+        let (sync_peer, async_peer) = native
+            .peer_transports(&nodes.mount_node)
+            .expect("the mount node's peer transports");
+        let opened = dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+            native.data_dir(&nodes.mount_node).clone(),
+            sync_peer,
+            async_peer,
+            Some(cancellation.clone()),
+        )
+        .expect("open the mounted service");
+        let fs = mounted_test_file_system(opened.service, Some(handoff), cancellation);
+        let mkdir = |path: &'static str| {
+            fs.run_mounted_mutation(FuseMountedMutationOperation::Mkdir, |dfs| {
+                dfs.posix_mkdir_with_create_attrs(path, DfsPosixCreateAttrs::new(0o755, 0, 0))
+                    .map(drop)
+                    .map_err(FuseMountedMutationError::from)
+            })
+        };
+        // Every request from the mount to the users primary fails undelivered.
+        native.install_fault(dfs::test_support::DfsTestFaultRule {
+            source: Some(nodes.mount_node.clone()),
+            target: Some(nodes.users_primary.clone()),
+            route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.to_string()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
+        });
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| mkdir("/users/fuse-waits-for-its-record"));
+            // Each run that hands its wait back hands its work to the daemon.
+            eventually("the users mkdir handed its record wait back", || {
+                daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN) >= 1
+            });
+            let (served, done) = std::sync::mpsc::channel();
+            let healthy = scope.spawn(move || {
+                let result = mkdir("/services/fuse-serves-meanwhile");
+                let _ = served.send(());
+                result
+            });
+            let served_meanwhile = done.recv_timeout(Duration::from_secs(60)).is_ok();
+            let still_waiting = !waiting.is_finished();
+            native.clear_faults();
+            assert!(
+                served_meanwhile,
+                "the healthy shard's syscall waited behind the other"
+            );
+            assert_eq!(healthy.join().unwrap(), Ok(()));
+            assert!(still_waiting, "the users mkdir did not wait for its record");
+            // Once the primary answers, the waiting syscall completes the
+            // same call.
+            assert_eq!(waiting.join().unwrap(), Ok(()));
+        });
+        assert!(
+            fs.stat_path("/users/fuse-waits-for-its-record", false)
+                .is_ok(),
+            "the waiting mkdir took effect"
+        );
+        drop(fs);
+        native.close().expect("close the native cluster");
     }
 
     #[test]

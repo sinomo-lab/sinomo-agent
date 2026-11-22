@@ -2,7 +2,6 @@
 
 use crate::*;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 pub(crate) const HISTORY_PAGE_LIMIT: usize = 128;
 pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
@@ -1263,6 +1262,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsNamespaceResult::Applied,
                     Some(DfsPosixCoordinationResult::MetadataQuery(response)),
                 ) => response,
+                (
+                    DfsNamespaceResult::Rejected {
+                        posix_error:
+                            Some(DfsNamespacePosixError::ShardStorageClosed { cause, detail }),
+                        ..
+                    },
+                    _,
+                ) => return Err(DfsError::ShardStorageClosed { cause, detail }),
                 (DfsNamespaceResult::Rejected { reason, .. }, _) => return Err(error(reason)),
                 _ => return Err(error("history authority omitted its typed query response")),
             }
@@ -1442,10 +1449,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
         })
         .transpose()?;
-        let requested = std::time::Instant::now() + Duration::from_secs(30);
-        let previous_deadline = self.transport.set_operation_deadline(Some(requested));
-        let deadline = previous_deadline.map_or(requested, |old| old.min(requested));
-        self.transport.set_operation_deadline(Some(deadline));
+        // A query adds no deadline of its own when nothing is held across
+        // its wait: a requester that delegates to its node's Main (a mount,
+        // the CLI, a hosted client), or a read made with the request's lanes
+        // released. Its caller's budget or departure ends it. A query this
+        // service waits for while it serves a request or holds a shard's
+        // admission keeps a bound, so that admission is never held without
+        // end.
+        let holds_nothing = self.transport.delegates_local_namespace_authority()
+            && !self.transport.serves_routed_request()
+            && self.publication_execution.current().is_none();
+        let requested = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let previous_deadline = self.transport.operation_deadline();
+        let own_deadline = previous_deadline.map_or(requested, |old| old.min(requested));
+        self.transport
+            .set_operation_deadline(if lanes_released_read.is_some() || holds_nothing {
+                previous_deadline
+            } else {
+                Some(own_deadline)
+            });
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         self.pending_routed_namespace_ops.insert(
             request_id.clone(),
@@ -1478,12 +1500,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             key,
                             command.clone(),
                             pending,
-                            Some(deadline),
+                            previous_deadline,
                         ));
                     }
                 }
             } else {
                 if expected.primary_node_id == self.node_id {
+                    self.check_mounted_call_running()?;
                     let message = self.next_dfs_routed_message(
                         &expected.primary_node_id,
                         DfsNetworkMessage::NamespaceRequest(command.clone()),
@@ -1498,13 +1521,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     unroutable = true;
                     return Err(error("metadata query primary is not routable"));
                 }
+                let effective_deadline = self.transport.operation_deadline();
                 wait_for_metadata_query_response(
                     &mut self.transport,
                     self.cancellation.as_ref(),
                     &self.node_id,
                     &expected.primary_node_id,
                     &request_id,
-                    deadline,
+                    effective_deadline,
                 )?
             };
             match &response.result {
@@ -1545,7 +1569,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     failed,
                     DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
                 ))
-            && !crate::error::dfs_error_is_closed_shard_storage(failed)
         {
             self.request_primary_verification(expected);
         }
@@ -1849,15 +1872,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 }
 
 /// Transport-only wait: no backend, service dispatcher, prepare or repair graph.
+///
+/// The answer's arrival, the caller's cancellation or the caller's deadline
+/// ends the wait. Unrelated queued traffic keeps its custody: the wait takes
+/// only this request's answer and wakes on arrivals, never on what is already
+/// queued, so it cannot spin. Without an arrival it looks again at the
+/// network's liveness interval; that look ends nothing.
 fn wait_for_metadata_query_response(
     transport: &mut dyn DfsMessageTransport,
     cancellation: Option<&DfsCancellationFlag>,
     local: &sinomo_core::node::NodeId,
     primary: &sinomo_core::node::NodeId,
     request_id: &str,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> Result<DfsNamespaceResponse, DfsError> {
-    loop {
+    let arrived = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let signal = std::sync::Arc::clone(&arrived);
+    let waker: crate::service_state::DfsCancellationWaker = std::sync::Arc::new(move || {
+        *signal
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        signal.1.notify_all();
+    });
+    let _cancellation_wake = cancellation.map(|cancellation| cancellation.register_waker(&waker));
+    transport.set_incoming_arrival_waker(Some(std::sync::Arc::clone(&waker)));
+    let answer = (|| loop {
         if cancellation.is_some_and(DfsCancellationFlag::is_cancelled) {
             return Err(DfsError::Cancelled {
                 operation: "metadata query",
@@ -1878,13 +1918,27 @@ fn wait_for_metadata_query_response(
             }
             return Ok(response);
         }
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| error("metadata query timed out waiting for its authority"))?;
-        // Unrelated queued traffic retains custody and cannot cause a busy loop.
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
+        let now = std::time::Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(error("metadata query timed out waiting for its authority"));
+        }
+        let wait = deadline.map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        });
+        let flag = arrived
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut flag, _) = arrived
+            .1
+            .wait_timeout_while(flag, wait, |arrived| !*arrived)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *flag = false;
+    })();
+    transport.set_incoming_arrival_waker(None);
+    answer
 }
 
 #[cfg(test)]

@@ -508,6 +508,12 @@ pub enum DfsDistributedWriteResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_primary_node_id: Option<NodeId>,
     },
+    /// The write's shard has its storage closed for preparation or
+    /// conversion. It refused the write before any effect.
+    ShardStorageClosed {
+        cause: crate::DfsShardStorageClosedCause,
+        detail: String,
+    },
 }
 
 /// POSIX namespace mutation routed to the metadata shard primary. The primary
@@ -1372,6 +1378,12 @@ pub enum DfsNamespacePosixError {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_primary_node_id: Option<NodeId>,
     },
+    /// Retriable: a shard the request needs has its storage closed for
+    /// preparation or conversion. Nothing ran.
+    ShardStorageClosed {
+        cause: crate::DfsShardStorageClosedCause,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2087,6 +2099,38 @@ mod commit_outcome_unknown_wire_tests {
         })
         .unwrap();
         assert!(serde_json::from_slice::<PreChangeResult>(&encoded).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shard_storage_closed_wire_tests {
+    use super::*;
+
+    #[test]
+    fn closed_storage_refusal_round_trips_on_routed_write_and_namespace_replies() {
+        for cause in [
+            crate::DfsShardStorageClosedCause::Preparation,
+            crate::DfsShardStorageClosedCause::Conversion,
+        ] {
+            let write = DfsDistributedWriteResult::ShardStorageClosed {
+                cause,
+                detail: "detail".into(),
+            };
+            let encoded = serde_json::to_vec(&write).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<DfsDistributedWriteResult>(&encoded).unwrap(),
+                write
+            );
+            let namespace = DfsNamespacePosixError::ShardStorageClosed {
+                cause,
+                detail: "detail".into(),
+            };
+            let encoded = serde_json::to_vec(&namespace).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<DfsNamespacePosixError>(&encoded).unwrap(),
+                namespace
+            );
+        }
     }
 }
 

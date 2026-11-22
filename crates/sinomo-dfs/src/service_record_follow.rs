@@ -113,7 +113,7 @@ pub(crate) struct DfsRecordWaitWake {
 }
 
 /// How a followed namespace request ended.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum DfsFollowedNamespaceRoute {
     /// The primary answered: applied, or a definite rejection.
     Settled(PendingRoutedNamespaceResult),
@@ -123,10 +123,47 @@ pub(crate) enum DfsFollowedNamespaceRoute {
 
 /// The evidence one namespace attempt left, with what the caller gets when
 /// the wait ends without a newer record.
-#[derive(Clone)]
-enum NamespaceAttemptEvidence {
+#[derive(Clone, Debug)]
+pub(crate) enum NamespaceAttemptEvidence {
     Rejected(PendingRoutedNamespaceResult),
     Failed(DfsError),
+}
+
+/// Where one followed namespace call stands between its attempts.
+#[derive(Debug)]
+pub(crate) struct DfsNamespaceFollow {
+    /// The primary the next attempt goes to.
+    pub(crate) primary: NodeId,
+    pub(crate) resend: DfsRecordFollowResend,
+    /// An earlier attempt that may have applied and that no later answer
+    /// settled.
+    pub(crate) unresolved: Option<NamespaceAttemptEvidence>,
+    /// What the last attempt left and the record change it waits for.
+    pub(crate) waiting: Option<(NamespaceAttemptEvidence, DfsRecordChangeEvidence)>,
+}
+
+impl DfsNamespaceFollow {
+    fn new(primary: NodeId) -> Self {
+        Self {
+            primary,
+            resend: DfsRecordFollowResend::new(),
+            unresolved: None,
+            waiting: None,
+        }
+    }
+}
+
+/// What a requester's projection says now about the record a wait is for.
+pub(crate) enum DfsRecordChangeNow {
+    /// The wait is over: the record changed, the re-send timer is due, or the
+    /// caller's budget ended.
+    Due(DfsRecordFollowed),
+    /// Nothing is due before `until`. `watch` was taken before the projection
+    /// was read, so a publication after that read ends a wait on it.
+    NotYet {
+        watch: Box<dyn crate::DfsConfigurationChangeWatch>,
+        until: Instant,
+    },
 }
 
 fn post_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
@@ -296,52 +333,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         deadline: Option<Instant>,
     ) -> Result<DfsRecordFollowed, DfsError> {
         loop {
-            self.check_cancelled("shard record wait")?;
-            if deadline.is_some_and(|at| Instant::now() >= at) {
-                return Ok(DfsRecordFollowed::Ended);
-            }
-            // An answer that already arrived is read before the record: it
-            // may settle the request that would otherwise be sent again.
-            if wake.on_arrival
-                && self
-                    .transport
-                    .pending_incoming_count()
-                    .map_err(DfsError::from_network)?
-                    .is_some_and(|pending| pending > 0)
+            if let Some(followed) =
+                self.record_change_due(evidence, resend.as_deref_mut(), wake, deadline)?
             {
-                return Ok(DfsRecordFollowed::Woken);
-            }
-            let current = self.current_dispatch_record(evidence);
-            if let Some(record) = current
-                .as_ref()
-                .filter(|record| evidence.satisfied_by(record))
-            {
-                if let Some(resend) = resend.as_deref_mut() {
-                    resend.restart();
-                }
-                return Ok(DfsRecordFollowed::Newer(record.clone()));
-            }
-            let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline) {
-                return Ok(DfsRecordFollowed::Ended);
-            }
-            if let Some(resend) = resend.as_deref_mut()
-                && now >= resend.due
-            {
-                resend.rearm();
-                // A membership change can keep both epoch and primary. Reuse
-                // the operation body, but take the stamp from our current
-                // projection. An older projection cannot downgrade a write.
-                let record = current
-                    .filter(|record| record.epoch == evidence.dispatched.epoch)
-                    .unwrap_or_else(|| evidence.dispatched.clone());
-                return Ok(DfsRecordFollowed::ResendDue(record));
-            }
-            if wake.at.is_some_and(|at| now >= at) {
-                return Ok(DfsRecordFollowed::Woken);
+                return Ok(followed);
             }
             // With nothing due, the wait still wakes at the network's liveness
             // interval and reads the projection again. Nothing is sent then.
+            let now = Instant::now();
             let mut wait = resend
                 .as_deref()
                 .map_or(DFS_RECORD_FOLLOW_RESEND_MAX, |resend| {
@@ -352,6 +351,99 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             watch.wait_for_change(wait).map_err(DfsError::from)?;
         }
+    }
+
+    /// One look at everything that ends a wait on the record `evidence`
+    /// names: cancellation, the caller's deadline, an arrival the owner asked
+    /// to be woken by, the record itself, the re-send timer and the owner's
+    /// own time. `None` while nothing is due.
+    fn record_change_due(
+        &mut self,
+        evidence: &DfsRecordChangeEvidence,
+        mut resend: Option<&mut DfsRecordFollowResend>,
+        wake: DfsRecordWaitWake,
+        deadline: Option<Instant>,
+    ) -> Result<Option<DfsRecordFollowed>, DfsError> {
+        self.check_cancelled("shard record wait")?;
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Ok(Some(DfsRecordFollowed::Ended));
+        }
+        // An answer that already arrived is read before the record: it may
+        // settle the request that would otherwise be sent again.
+        if wake.on_arrival
+            && self
+                .transport
+                .pending_incoming_count()
+                .map_err(DfsError::from_network)?
+                .is_some_and(|pending| pending > 0)
+        {
+            return Ok(Some(DfsRecordFollowed::Woken));
+        }
+        let current = self.current_dispatch_record(evidence);
+        if let Some(record) = current
+            .as_ref()
+            .filter(|record| evidence.satisfied_by(record))
+        {
+            if let Some(resend) = resend.as_deref_mut() {
+                resend.restart();
+            }
+            return Ok(Some(DfsRecordFollowed::Newer(record.clone())));
+        }
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Ok(Some(DfsRecordFollowed::Ended));
+        }
+        if let Some(resend) = resend
+            && now >= resend.due
+        {
+            resend.rearm();
+            // A membership change can keep both epoch and primary. Reuse the
+            // operation body, but take the stamp from our current projection.
+            // An older projection cannot downgrade a write.
+            let record = current
+                .filter(|record| record.epoch == evidence.dispatched.epoch)
+                .unwrap_or_else(|| evidence.dispatched.clone());
+            return Ok(Some(DfsRecordFollowed::ResendDue(record)));
+        }
+        if wake.at.is_some_and(|at| now >= at) {
+            return Ok(Some(DfsRecordFollowed::Woken));
+        }
+        Ok(None)
+    }
+
+    /// What this requester's projection says now about the record `evidence`
+    /// waits for, for a caller that makes the wait itself without this
+    /// service. Without a configuration watch the projection is read through,
+    /// and one read is all a wait could observe.
+    pub(crate) fn record_change_or_watch(
+        &mut self,
+        evidence: &DfsRecordChangeEvidence,
+        resend: &mut DfsRecordFollowResend,
+    ) -> Result<DfsRecordChangeNow, DfsError> {
+        let deadline = self.transport.operation_deadline();
+        let watch = self
+            .control_plane
+            .as_ref()
+            .and_then(|control_plane| control_plane.watch_configuration_changes());
+        let Some(watch) = watch else {
+            return self
+                .await_shard_record_change(evidence, Some(resend), DfsRecordWaitWake::default())
+                .map(DfsRecordChangeNow::Due);
+        };
+        Ok(
+            match self.record_change_due(
+                evidence,
+                Some(&mut *resend),
+                DfsRecordWaitWake::default(),
+                deadline,
+            )? {
+                Some(followed) => DfsRecordChangeNow::Due(followed),
+                None => DfsRecordChangeNow::NotYet {
+                    watch,
+                    until: deadline.map_or(resend.due, |deadline| deadline.min(resend.due)),
+                },
+            },
+        )
     }
 
     /// A request from this node could not be delivered to `shard`'s primary:
@@ -405,6 +497,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             dispatched: shard.clone(),
             floor_epoch: None,
         };
+        if self.mounted_call_hands_back_waits() {
+            // A probe changes nothing, so the mount's next run sends it
+            // again; only its timer carries over.
+            if let Some(carried) = self.take_mounted_probe_resend() {
+                *resend = carried;
+            }
+            return match self.record_change_or_watch(&evidence, resend)? {
+                DfsRecordChangeNow::Due(followed) => {
+                    Ok(!matches!(followed, DfsRecordFollowed::Ended))
+                }
+                DfsRecordChangeNow::NotYet { watch, until } => {
+                    Err(self.hand_back_mounted_probe_wait(*resend, watch, until))
+                }
+            };
+        }
         Ok(!matches!(
             self.await_newer_shard_record(&evidence, resend)?,
             DfsRecordFollowed::Ended
@@ -511,43 +618,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<DfsFollowedNamespaceRoute, DfsError> {
+        // A mounted call takes the answer of a call an earlier run of it
+        // settled, and resumes the wait an earlier run handed back with that
+        // call's id, body, timers and budget.
+        let (mounted, resumed) = match self.mounted_namespace_call(file_system_id, operation) {
+            crate::mounted_call_replay::DfsMountedNamespaceCall::Unscoped => (false, None),
+            crate::mounted_call_replay::DfsMountedNamespaceCall::Answered(answer) => return answer,
+            crate::mounted_call_replay::DfsMountedNamespaceCall::Stopped(error) => {
+                return Err(error);
+            }
+            crate::mounted_call_replay::DfsMountedNamespaceCall::Live { resumed } => {
+                (true, resumed)
+            }
+        };
         // One budget covers every attempt and every wait between them.
+        let own_deadline = match &resumed {
+            Some(parked) => parked.own_deadline,
+            None => timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
+        };
         let previous_deadline = self.transport.operation_deadline();
-        let deadline = match (
-            timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
-            previous_deadline,
-        ) {
+        let deadline = match (own_deadline, previous_deadline) {
             (Some(own), Some(existing)) => Some(own.min(existing)),
             (deadline, None) | (None, deadline) => deadline,
         };
         self.transport.set_operation_deadline(deadline);
-        let result = self.route_namespace_following_record_within_deadline(
-            request_id,
-            file_system_id,
-            primary_node_id,
-            operation,
-            replay_journal_batches,
-            apply_synced_path_object,
-        );
+        let result = match resumed {
+            Some(parked) => self.route_namespace_following_record_within_deadline(
+                parked.request_id.as_deref(),
+                file_system_id,
+                &parked.operation,
+                parked.follow,
+                mounted.then_some(own_deadline),
+                replay_journal_batches,
+                apply_synced_path_object,
+            ),
+            None => self.route_namespace_following_record_within_deadline(
+                request_id,
+                file_system_id,
+                operation,
+                DfsNamespaceFollow::new(primary_node_id),
+                mounted.then_some(own_deadline),
+                replay_journal_batches,
+                apply_synced_path_object,
+            ),
+        };
         self.transport.set_operation_deadline(previous_deadline);
+        if mounted {
+            self.settle_mounted_namespace_call(file_system_id, operation, &result);
+        }
         result
     }
 
+    /// The attempts of one namespace call and the waits between them.
+    /// `mounted` is the call's own deadline when the call is part of a
+    /// mounted call: a wait there is handed back to the mount instead of
+    /// made.
+    #[allow(clippy::too_many_arguments)]
     fn route_namespace_following_record_within_deadline(
         &mut self,
         request_id: Option<&str>,
         file_system_id: &DfsFileSystemId,
-        primary_node_id: NodeId,
         operation: &DfsNamespaceOperation,
+        mut follow: DfsNamespaceFollow,
+        mounted: Option<Option<Instant>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<DfsFollowedNamespaceRoute, DfsError> {
         if let Some(id) = request_id {
             crate::service_routed_namespace::validate_namespace_operation_id(id)?;
         }
-        let mut primary = primary_node_id;
-        let mut resend = DfsRecordFollowResend::new();
-        let mut unresolved = None;
         let ended = |left| match left {
             NamespaceAttemptEvidence::Rejected(routed) => {
                 Ok(DfsFollowedNamespaceRoute::Settled(routed))
@@ -555,27 +694,85 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NamespaceAttemptEvidence::Failed(error) => Err(error),
         };
         loop {
+            if let Some((left, evidence)) = follow.waiting.take() {
+                let followed = match mounted.filter(|_| self.mounted_call_hands_back_waits()) {
+                    Some(own_deadline) => {
+                        match self.record_change_or_watch(&evidence, &mut follow.resend) {
+                            Ok(DfsRecordChangeNow::Due(followed)) => Ok(followed),
+                            Ok(DfsRecordChangeNow::NotYet { watch, until }) => {
+                                // The mount waits for the record with its
+                                // service lock released, then runs the call
+                                // again; this call resumes here.
+                                follow.waiting = Some((left, evidence));
+                                let parked = crate::mounted_call_replay::DfsParkedNamespaceCall {
+                                    request_id: request_id.map(str::to_owned),
+                                    operation: operation.clone(),
+                                    own_deadline,
+                                    follow,
+                                };
+                                return Err(self.park_mounted_namespace_call(
+                                    file_system_id,
+                                    parked,
+                                    watch,
+                                    until,
+                                ));
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => self.await_newer_shard_record(&evidence, &mut follow.resend),
+                };
+                let followed = match followed {
+                    Ok(followed) => followed,
+                    Err(error) if error.is_cancellation() => return Err(error),
+                    Err(error) => {
+                        return ended(
+                            follow
+                                .unresolved
+                                .unwrap_or(NamespaceAttemptEvidence::Failed(error)),
+                        );
+                    }
+                };
+                match followed {
+                    DfsRecordFollowed::Newer(record) => {
+                        if record.primary_node_id == self.node_id
+                            && !self.transport.delegates_local_namespace_authority()
+                        {
+                            return Ok(DfsFollowedNamespaceRoute::LocalAuthority);
+                        }
+                        follow.primary = record.primary_node_id;
+                    }
+                    DfsRecordFollowed::ResendDue(record) => follow.primary = record.primary_node_id,
+                    DfsRecordFollowed::Woken | DfsRecordFollowed::Ended => {
+                        return ended(follow.unresolved.unwrap_or(left));
+                    }
+                }
+            }
             let attempt_id = request_id.map_or_else(|| self.next_request_id(), str::to_owned);
             let (command, pending) = match self.prepare_projected_namespace_request(
                 &attempt_id,
                 file_system_id.clone(),
-                &primary,
+                &follow.primary,
                 operation.clone(),
                 replay_journal_batches,
                 apply_synced_path_object,
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
+                    return ended(
+                        follow
+                            .unresolved
+                            .unwrap_or(NamespaceAttemptEvidence::Failed(error)),
+                    );
                 }
             };
-            if pending.primary_node_id != primary
+            if pending.primary_node_id != follow.primary
                 && pending.primary_node_id == self.node_id
                 && !self.transport.delegates_local_namespace_authority()
             {
                 return Ok(DfsFollowedNamespaceRoute::LocalAuthority);
             }
-            primary.clone_from(&pending.primary_node_id);
+            follow.primary.clone_from(&pending.primary_node_id);
             let dispatched = pending.dispatch_authority_shard.clone();
             let deadline = self.transport.operation_deadline();
             let attempt = self.dispatch_prepared_namespace_request(command, pending, deadline);
@@ -610,6 +807,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         // refuser itself at another epoch. It ran nothing.
                         (NamespaceAttemptEvidence::Rejected(routed), None, false)
                     }
+                    DfsNamespaceResult::Rejected {
+                        posix_error: Some(DfsNamespacePosixError::ShardStorageClosed { .. }),
+                        ..
+                    } => {
+                        // A shard whose storage is closed refused before any
+                        // effect. It could not read what an earlier attempt
+                        // of this request did, so that attempt stays the
+                        // call's answer.
+                        return ended(
+                            follow
+                                .unresolved
+                                .unwrap_or(NamespaceAttemptEvidence::Rejected(routed)),
+                        );
+                    }
                     DfsNamespaceResult::Rejected { .. } => {
                         return Ok(DfsFollowedNamespaceRoute::Settled(routed));
                     }
@@ -623,12 +834,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error @ DfsError::Network { .. }) if self.remote_namespace_phase.is_some() => {
                     return Err(error);
                 }
-                // A shard whose storage is closed refused before any effect.
-                // The refusal crosses a node boundary as the text of a failed
-                // call; it is the request's answer, not a failed delivery.
-                Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => {
-                    return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
-                }
                 Err(DfsError::Network { message }) => (
                     NamespaceAttemptEvidence::Failed(DfsError::NetworkDelivery {
                         message,
@@ -641,7 +846,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     (NamespaceAttemptEvidence::Failed(error), None, true)
                 }
                 Err(error) => {
-                    return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
+                    return ended(
+                        follow
+                            .unresolved
+                            .unwrap_or(NamespaceAttemptEvidence::Failed(error)),
+                    );
                 }
             };
             // An unsent retry or an authority refusal cannot settle an earlier dispatch.
@@ -660,7 +869,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                 )
             {
-                unresolved = Some(left.clone());
+                follow.unresolved = Some(left.clone());
             }
             let Some(dispatched) = dispatched else {
                 // The request went to a primary this requester's projection
@@ -672,7 +881,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.request_primary_verification(&shard);
                 }
-                return ended(unresolved.unwrap_or(left));
+                return ended(follow.unresolved.unwrap_or(left));
             };
             let evidence = DfsRecordChangeEvidence {
                 dispatched,
@@ -681,27 +890,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if undelivered {
                 self.request_primary_verification(&evidence.dispatched);
             }
-            let followed = match self.await_newer_shard_record(&evidence, &mut resend) {
-                Ok(followed) => followed,
-                Err(error) if error.is_cancellation() => return Err(error),
-                Err(error) => {
-                    return ended(unresolved.unwrap_or(NamespaceAttemptEvidence::Failed(error)));
-                }
-            };
-            match followed {
-                DfsRecordFollowed::Newer(record) => {
-                    if record.primary_node_id == self.node_id
-                        && !self.transport.delegates_local_namespace_authority()
-                    {
-                        return Ok(DfsFollowedNamespaceRoute::LocalAuthority);
-                    }
-                    primary = record.primary_node_id;
-                }
-                DfsRecordFollowed::ResendDue(record) => primary = record.primary_node_id,
-                DfsRecordFollowed::Woken | DfsRecordFollowed::Ended => {
-                    return ended(unresolved.unwrap_or(left));
-                }
-            }
+            follow.waiting = Some((left, evidence));
         }
     }
 }
@@ -1093,6 +1282,82 @@ mod tests {
             .await_shard_record_change(&evidence, None, DfsRecordWaitWake::default())
             .unwrap();
         assert!(matches!(ended, DfsRecordFollowed::Ended), "{ended:?}");
+    }
+
+    /// A mounted call's run hands its wait for a newer record back instead of
+    /// making it: the run ends cancelled and sends nothing more, the wait
+    /// ends on the publication, and the next run follows the newer record
+    /// with the timer the first run left.
+    #[test]
+    fn a_mounted_call_hands_its_record_wait_back_to_the_mount() {
+        let mut requester = Requester::new("handback");
+        let shard = requester.shard.clone();
+        let mut replay = crate::MountedSifsCallReplay::new();
+        // A timer far from due, so only the publication can end the wait.
+        let long = DfsRecordFollowResend {
+            interval: DFS_RECORD_FOLLOW_RESEND_MAX,
+            due: Instant::now() + DFS_RECORD_FOLLOW_RESEND_MAX,
+        };
+        let (followed, after) = replay.run(&mut requester.service, |service| {
+            let mut resend = long;
+            let followed = service.follow_undelivered_probe(&shard, &mut resend);
+            (followed, service.check_cancelled("after the hand-back"))
+        });
+        assert!(
+            matches!(&followed, Err(error) if error.is_cancellation()),
+            "{followed:?}"
+        );
+        assert!(
+            matches!(&after, Err(error) if error.is_cancellation()),
+            "the run sends nothing more: {after:?}"
+        );
+        assert_eq!(requester.hints.load(Ordering::SeqCst), 1);
+        let wait = replay
+            .take_record_wait()
+            .expect("the run handed its wait back");
+        assert!(
+            requester.service.check_cancelled("between runs").is_ok(),
+            "the service outside the run is not cancelled"
+        );
+
+        // The record changes while the mount holds none of its locks.
+        let mut newer = shard.clone();
+        newer.epoch += 1;
+        newer.primary_node_id = NodeId::from_legacy_named("follow-successor").unwrap();
+        let (kv, publication, record) = (
+            Arc::clone(&requester.kv),
+            Arc::clone(&requester.publication),
+            newer.clone(),
+        );
+        let publishing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            kv.lock()
+                .unwrap()
+                .put(
+                    crate::metadata_shard_key(&record.file_system_id, &record.shard_id),
+                    sinomo_core::kv::encode_kv_value(&record).unwrap(),
+                    None,
+                )
+                .unwrap();
+            publication.replace();
+        });
+        let started = Instant::now();
+        wait.wait();
+        publishing.join().unwrap();
+        assert!(
+            started.elapsed() < DFS_RECORD_FOLLOW_RESEND_MAX / 2,
+            "the publication, not a timer, ended the wait: {:?}",
+            started.elapsed()
+        );
+
+        // The next run follows the newer record at once.
+        let resent = replay.run(&mut requester.service, |service| {
+            let mut resend = DfsRecordFollowResend::new();
+            service.follow_undelivered_probe(&shard, &mut resend)
+        });
+        assert!(matches!(resent, Ok(true)), "{resent:?}");
+        assert!(replay.take_record_wait().is_none());
+        assert_eq!(requester.hints.load(Ordering::SeqCst), 2);
     }
 
     /// A hint is heard only from this node's own requesters and only about

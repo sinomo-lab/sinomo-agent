@@ -5103,7 +5103,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     // The requester's budget is measured from here, and this future's drop is
     // its departure. Both reach the blocking mutation through `served`.
     let (served, _departure) = sinomo_dfs::DfsServedRequestScope::at_arrival(budget);
-    served
+    let refusal = ClosedShardStorageRefusal::for_command(&command);
+    let result = served
         .until_budget(handle_served_daemon_dfs_message(
             paths,
             command,
@@ -5119,7 +5120,125 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 operation: "DFS request: its requester's budget ended before it ran",
             }
             .into())
+        });
+    match (result, refusal) {
+        (Err(error), Some(refusal)) => match closed_shard_storage_cause_of(&error) {
+            Some(cause) => Ok(refusal.reply(cause, error.to_string())),
+            None => Err(error),
+        },
+        (result, _) => result,
+    }
+}
+
+/// Why `error` is a closed shard's refusal to serve, if it is one.
+fn closed_shard_storage_cause_of(error: &DaemonError) -> Option<crate::DfsShardStorageClosedCause> {
+    match error {
+        DaemonError::StoragePreparationPending { .. } => {
+            Some(crate::DfsShardStorageClosedCause::Preparation)
+        }
+        error => crate::error::closed_shard_storage_cause_in(&error.to_string()),
+    }
+}
+
+/// The typed answer to a request whose shard has its storage closed for
+/// preparation or conversion. The shard refused before the request took any
+/// effect, so the requester receives a definite refusal, not a failed call
+/// whose effect it cannot know.
+struct ClosedShardStorageRefusal {
+    rpc_request_id: String,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    frame_id: u64,
+    message_id: u64,
+    request: ClosedShardStorageRequest,
+}
+
+enum ClosedShardStorageRequest {
+    Namespace {
+        request_id: String,
+    },
+    Write {
+        request_id: String,
+        object_id: crate::DfsObjectId,
+    },
+}
+
+impl ClosedShardStorageRefusal {
+    fn for_command(command: &DfsMessageCommand) -> Option<Self> {
+        let request = match &command.routed_message.message {
+            crate::DfsNetworkMessage::NamespaceRequest(request) => {
+                ClosedShardStorageRequest::Namespace {
+                    request_id: request.request_id.clone(),
+                }
+            }
+            crate::DfsNetworkMessage::DistributedWriteRequest(write)
+            | crate::DfsNetworkMessage::ExclusiveCreateRequest(write)
+            | crate::DfsNetworkMessage::RetainedWriteRequest(write) => {
+                ClosedShardStorageRequest::Write {
+                    request_id: write.request_id.clone(),
+                    object_id: write.request.object_id.clone(),
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            rpc_request_id: command.request_id.clone(),
+            source_node_id: command.routed_message.target_node_id.clone(),
+            target_node_id: command.routed_message.source_node_id.clone(),
+            frame_id: command.routed_message.frame_id,
+            message_id: command.routed_message.message_id,
+            request,
         })
+    }
+
+    fn reply(
+        self,
+        cause: crate::DfsShardStorageClosedCause,
+        detail: String,
+    ) -> DfsDataPlaneResponse {
+        let message = match self.request {
+            ClosedShardStorageRequest::Namespace { request_id } => {
+                crate::DfsNetworkMessage::NamespaceResponse(crate::DfsNamespaceResponse {
+                    request_id,
+                    committed_work: Default::default(),
+                    result: crate::DfsNamespaceResult::Rejected {
+                        reason: detail.clone(),
+                        posix_error: Some(crate::DfsNamespacePosixError::ShardStorageClosed {
+                            cause,
+                            detail,
+                        }),
+                        current_primary_node_id: None,
+                    },
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: false,
+                    posix_coordination_result: None,
+                })
+            }
+            ClosedShardStorageRequest::Write {
+                request_id,
+                object_id,
+            } => crate::DfsNetworkMessage::DistributedWriteResponse(
+                crate::DfsDistributedWriteResponse {
+                    request_id,
+                    object_id,
+                    result: crate::DfsDistributedWriteResult::ShardStorageClosed { cause, detail },
+                    metadata_journal_batches: Vec::new(),
+                },
+            ),
+        };
+        DfsDataPlaneResponse::value(crate::DfsMessageResponse {
+            request_id: self.rpc_request_id,
+            outbound_messages: vec![crate::DfsRoutedMessage {
+                source_node_id: self.source_node_id,
+                target_node_id: self.target_node_id,
+                frame_id: self.frame_id,
+                message_id: self.message_id,
+                message,
+            }],
+        })
+    }
 }
 
 /// The continuation of a prepared write waits for its shard's publication. The

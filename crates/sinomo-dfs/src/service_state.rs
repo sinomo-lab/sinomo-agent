@@ -848,6 +848,9 @@ pub struct NetworkedDfsService<T> {
     pub(crate) next_message_id: Arc<AtomicU64>,
     pub(crate) next_request_id: u64,
     pub(crate) cancellation: Option<DfsCancellationFlag>,
+    /// The mounted adapter call running on this service, which waits for a
+    /// newer shard record with its mount's lock released.
+    pub(crate) mounted_call: Option<Box<crate::mounted_call_replay::DfsMountedCallScope>>,
     pub(crate) writes: DfsWriteState,
     pub(crate) reads: DfsReadState,
     pub(crate) replication: DfsReplicationState,

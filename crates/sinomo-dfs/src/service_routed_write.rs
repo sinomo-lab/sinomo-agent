@@ -1770,18 +1770,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         } else if let Err(error) = self.validate_routed_write_command_authority(&command) {
             let current_primary_node_id = distributed_write_rejection_current_primary(&error);
-            DfsDistributedWriteResult::Rejected {
-                reason: error.to_string(),
-                current_primary_node_id,
-            }
+            closed_storage_write_refusal(&error).unwrap_or_else(|| {
+                DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                    current_primary_node_id,
+                }
+            })
         } else if let Err(error) = self
             .prepare_routed_patch_command(&mut command, &mut preingested_blob)
             .map(|manifest| patch_manifest = manifest)
         {
-            DfsDistributedWriteResult::Rejected {
-                reason: error.to_string(),
-                current_primary_node_id: None,
-            }
+            closed_storage_write_refusal(&error).unwrap_or_else(|| {
+                DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                    current_primary_node_id: None,
+                }
+            })
         } else if let Some(replayed_result) =
             match self.replayed_routed_write_outcome_if_known(&requester_node_id, &command) {
                 Ok(Some(outcome)) => Some(DfsDistributedWriteResult::Outcome { outcome }),
@@ -2317,14 +2321,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     let current_primary_node_id =
                         distributed_write_rejection_current_primary(&error);
-                    match error {
-                        DfsError::WritePreconditionFailed { failure } => {
+                    match (closed_storage_write_refusal(&error), error) {
+                        (Some(refusal), _) => refusal,
+                        (None, DfsError::WritePreconditionFailed { failure }) => {
                             DfsDistributedWriteResult::PreconditionFailed { failure }
                         }
-                        DfsError::UnsupportedWritePrecondition { path, reason } => {
+                        (None, DfsError::UnsupportedWritePrecondition { path, reason }) => {
                             DfsDistributedWriteResult::UnsupportedPrecondition { path, reason }
                         }
-                        error => DfsDistributedWriteResult::Rejected {
+                        (None, error) => DfsDistributedWriteResult::Rejected {
                             reason: error.to_string(),
                             current_primary_node_id,
                         },
@@ -3273,7 +3278,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.complete_pending_routed_write(&canonical_request_id,
                     Err(DfsError::UnsupportedWritePrecondition { path: path.clone(), reason: reason.clone() }));
             }
-            DfsDistributedWriteResult::Rejected { reason, .. } => {
+            DfsDistributedWriteResult::Rejected { reason, .. }
+            | DfsDistributedWriteResult::ShardStorageClosed { detail: reason, .. } => {
                 let remote_intent_id = self
                     .writes
                     .pending_routed_writes
@@ -3292,10 +3298,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     });
                 }
-                self.complete_pending_routed_write(
-                    &canonical_request_id,
-                    Err(routed_write_rejection_error(reason)),
-                );
+                // A closed shard refused before any effect: the caller tries
+                // again later.
+                let refusal = match &response.result {
+                    DfsDistributedWriteResult::ShardStorageClosed { cause, detail } => {
+                        DfsError::ShardStorageClosed {
+                            cause: *cause,
+                            detail: detail.clone(),
+                        }
+                    }
+                    _ => routed_write_rejection_error(reason),
+                };
+                self.complete_pending_routed_write(&canonical_request_id, Err(refusal));
             }
         }
         // The requester's own projection of a commit follows only an outcome
@@ -3756,6 +3770,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.touch_routed_create_parent_directory(&path);
         }
     }
+}
+
+/// The typed refusal of a served write whose shard has its storage closed for
+/// preparation or conversion. The shard refused before the write took effect.
+fn closed_storage_write_refusal(error: &DfsError) -> Option<DfsDistributedWriteResult> {
+    crate::error::closed_shard_storage_cause(error).map(|cause| {
+        DfsDistributedWriteResult::ShardStorageClosed {
+            cause,
+            detail: error.to_string(),
+        }
+    })
 }
 
 /// The routed write reply for a durable body whose commit outcome is unknown.

@@ -2889,14 +2889,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Ok(false) => Self::metadata_primary_unroutable_error(&shard, &primary_node_id),
                 Err(error) => error,
             };
-            // A shard whose storage is closed refused before any effect; the
-            // refusal arrives as the text of a failed call and is the write's
-            // answer, not a failed delivery.
             let undelivered = unroutable
-                || (matches!(
+                || matches!(
                     error,
                     DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
-                ) && !crate::error::dfs_error_is_closed_shard_storage(&error));
+                );
             if !undelivered {
                 break (unroutable, error);
             }

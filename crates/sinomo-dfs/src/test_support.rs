@@ -127,6 +127,75 @@ fn current_native_metadata_service_on(
     Ok((runtime, service, config))
 }
 
+/// The nodes of a native cluster whose users shard has a primary of its own.
+#[derive(Clone, Debug)]
+pub struct DfsTestSplitUsersPrimary {
+    /// The users shard's primary.
+    pub users_primary: NodeId,
+    /// A node that is not the users primary, for a mount: its root and
+    /// services shards are served by primaries other than the users primary.
+    pub mount_node: NodeId,
+}
+
+/// A three-node native cluster in which the users shard's primary is not the
+/// primary of the root or services shard, through an ordinary reassignment
+/// that keeps the shard's members. A fault on the users primary alone leaves
+/// root and services serving.
+pub fn split_users_primary_cluster(
+    name: &str,
+) -> Result<(DfsTestRuntime, DfsTestSplitUsersPrimary), String> {
+    let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
+    let mut runtime = DfsTestRuntime::new(name, nodes[0].clone())?;
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone())?;
+    }
+    runtime.start_nodes()?;
+    let shards = runtime.metadata_shards()?;
+    let shard = |id: &str| {
+        shards
+            .iter()
+            .find(|config| config.shard_id == id)
+            .cloned()
+            .ok_or_else(|| format!("native cluster has no {id} shard"))
+    };
+    let (root, services, mut users) = (shard("root")?, shard("services")?, shard("users")?);
+    let shared = [&root.primary_node_id, &services.primary_node_id];
+    if shared.contains(&&users.primary_node_id) {
+        let members = std::iter::once(users.primary_node_id.clone())
+            .chain(users.replica_node_ids.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let target = members
+            .iter()
+            .find(|node| !shared.contains(node))
+            .ok_or("the users shard has no member outside the root and services primaries")?
+            .clone();
+        let replicas = members
+            .iter()
+            .filter(|node| **node != target)
+            .cloned()
+            .collect();
+        users = runtime.reassign_metadata_shard(
+            &users.file_system_id,
+            &users.shard_id,
+            target,
+            replicas,
+        )?;
+    }
+    let mount_node = nodes
+        .iter()
+        .find(|node| **node != users.primary_node_id && !shared.contains(node))
+        .or_else(|| nodes.iter().find(|node| **node != users.primary_node_id))
+        .expect("a three-node cluster has a node other than the users primary")
+        .clone();
+    Ok((
+        runtime,
+        DfsTestSplitUsersPrimary {
+            users_primary: users.primary_node_id,
+            mount_node,
+        },
+    ))
+}
+
 /// Check an actual handoff proof with the SAME production joint-ACK predicate.
 /// This pure DATA validation neither publishes nor authorizes an activation.
 pub fn metadata_handoff_proof_acknowledgements_are_safe(

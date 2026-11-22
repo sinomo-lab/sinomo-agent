@@ -26,6 +26,7 @@ impl<T> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> DfsRoutedMessage {
+        self.note_mounted_call_send(&message);
         build_dfs_routed_message(
             &self.node_id,
             target_node_id,
@@ -92,6 +93,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             next_message_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             next_request_id: 1,
             cancellation: None,
+            mounted_call: None,
         }
     }
 }
@@ -364,7 +366,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Err(DfsError::Cancelled { operation });
         }
-        Ok(())
+        // A mounted call's run that handed its record wait back is over.
+        self.check_mounted_call_running()
     }
 
     pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + 'static) -> Self {

@@ -600,6 +600,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         routed_message: DfsRoutedMessage,
     ) -> Result<bool, DfsError> {
+        self.check_mounted_call_running()?;
         let target_node_id = routed_message.target_node_id.clone();
         match self.transport.send_routed_call(
             &target_node_id,
@@ -627,6 +628,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "snapshot images require the ordinary streamed call owner".into(),
             });
         }
+        self.check_mounted_call_running()?;
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
         match self
             .transport

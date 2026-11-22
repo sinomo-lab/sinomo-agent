@@ -906,6 +906,7 @@ fn namespace_execution_error_is_retriable(error: &posix_model::DfsPosixError) ->
                     | DfsError::Metadata { .. }
                     | DfsError::ContentStore { .. }
                     | DfsError::Busy { .. }
+                    | DfsError::ShardStorageClosed { .. }
                     | DfsError::Cancelled { .. }
                     // A durably prepared change that may still commit.
                     | DfsError::MetadataCommitOutcomeUnknown { .. }
@@ -3404,18 +3405,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }));
         }
         if self.transport.delegates_local_namespace_authority() {
-            let result = self
-                .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-                    operation_id,
-                    file_system_id,
-                    self.node_id.clone(),
-                    operation,
+            // A caller delegating to its Main sends the request under its id
+            // and follows the shard's record like any other mutation.
+            let local = self.node_id.clone();
+            return match self
+                .route_namespace_following_record(
+                    &operation_id,
+                    &file_system_id,
+                    local,
+                    &operation,
                     DFS_NO_CALLER_BUDGET,
                     false,
                     false,
                 )
-                .map_err(DfsPosixError::from)?;
-            return Ok((result.result, result.posix_coordination_result));
+                .map_err(DfsPosixError::from)?
+            {
+                DfsFollowedNamespaceRoute::Settled(result) => {
+                    Ok((result.result, result.posix_coordination_result))
+                }
+                // A delegating caller never executes for its node itself.
+                DfsFollowedNamespaceRoute::LocalAuthority => {
+                    Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "a caller delegating to its Main was routed to itself".into(),
+                    }))
+                }
+            };
         }
         let authority_shards =
             self.namespace_operation_effect_authority_shards(&file_system_id, &operation)?;
