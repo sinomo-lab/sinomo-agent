@@ -4025,6 +4025,95 @@ fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
     );
 }
 
+/// The probe planner seeds its cache with each committed record's own expiry.
+/// Routing keeps a committed verdict current for its lifetime from the read,
+/// but a refresh must still come due when the source's record nears expiry.
+#[test]
+fn probe_batch_seeds_committed_connectivity_with_its_own_expiry() {
+    install_kv_directory_for_tests();
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-probe-seed-expiry");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_probe_seed_expiry").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_probe_seed_expiry_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_probe_seed_expiry_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "probe seed expiry",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.41:21353".to_string(), 10);
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    // A healthy committed observation with five minutes left of its TTL.
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("kv success".to_string()),
+        None,
+        now - time::Duration::seconds(600),
+        900,
+    );
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![record.clone()])
+        .expect("sync kv connectivity");
+    write_local_cluster_connectivity_record_set(&paths, &node_a, &[])
+        .expect("clear active local connectivity");
+    let routing = read_cluster_connectivity_graph(&paths).expect("routing graph");
+    assert_eq!(routing.len(), 1);
+    assert!(
+        routing[0].expires_at > record.expires_at,
+        "routing keeps the committed verdict current from the read"
+    );
+
+    let select = |cache: &mut std::collections::BTreeMap<_, _>, at| {
+        select_cluster_connectivity_probe_batch(
+            &paths,
+            &state,
+            cache,
+            0,
+            &ClusterNodeRole::Workstation,
+            false,
+            false,
+            &ClusterConnectivityProbeScope::regular(false),
+            at,
+        )
+    };
+    let key = cluster_connectivity_probe_key(&node_a, &endpoint_b);
+    let mut cache = std::collections::BTreeMap::new();
+    assert!(
+        select(&mut cache, now).entries.is_empty(),
+        "a healthy record with five minutes left is not due"
+    );
+    assert_eq!(
+        cache
+            .get(&key)
+            .map(|probe: &ClusterConnectivityProbeState| probe.record.clone()),
+        Some(record.clone()),
+        "the seeded record keeps its source's expiry"
+    );
+    // The refresh margin reaches that expiry 181 seconds later.
+    let due = select(&mut cache, now + time::Duration::seconds(181));
+    assert!(
+        due.entries.iter().any(|entry| entry.endpoint == endpoint_b),
+        "the record comes due at its own expiry"
+    );
+}
+
 #[test]
 fn kv_cluster_directory_serves_authoritative_connectivity_records() {
     install_kv_directory_for_tests();

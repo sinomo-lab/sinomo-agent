@@ -452,6 +452,23 @@ fn effective_connectivity_records(
     )
 }
 
+/// The connectivity records this node's probes keep, each with the expiry its
+/// source gave it: committed rows and the local source set, without the
+/// records whose own expiry has passed.
+///
+/// Routing reads ([`read_cluster_connectivity_graph`]) keep a committed verdict
+/// current for its lifetime from the read, so a route survives a source that
+/// is silent past its TTL. The probe planner schedules each record's refresh
+/// from that record's own expiry, which such a read would postpone forever.
+pub(crate) fn read_cluster_connectivity_evidence(
+    paths: &ClusterPaths,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    read_cluster_connectivity_graph_with_query(
+        paths,
+        &crate::connectivity::DirectoryConnectivityRecordQuery,
+    )
+}
+
 pub fn read_cluster_connectivity_graph_with_query<Q>(
     paths: &ClusterPaths,
     query: &Q,

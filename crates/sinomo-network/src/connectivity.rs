@@ -8,7 +8,7 @@ use crate::maintenance::{
     cluster_network_probe_interval_for_role,
 };
 use crate::prelude::*;
-use crate::route_graph_read_model::read_cluster_connectivity_graph;
+use crate::route_graph_read_model::read_cluster_connectivity_evidence;
 use crate::{ClusterPaths, NetworkError};
 
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
@@ -606,12 +606,14 @@ pub fn try_select_cluster_connectivity_probe_batch(
     // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
     // local-authoritative for our own edges). A learner cannot commit its connectivity
     // edges to KV, so seeding from KV alone would discard its last-known reachability.
+    // Each record keeps the expiry its source gave it, so an expiry-driven refresh
+    // comes due; the routing read would keep a committed verdict current instead.
     //
     // Module endpoints are seeded only for a peer under verification: their
     // evidence is never renewed by the regular cadence, so a regular batch must
     // not carry a committed copy of an expired module record back as new.
     if connectivity.is_empty() {
-        for record in read_cluster_connectivity_graph(paths)
+        for record in read_cluster_connectivity_evidence(paths)
             .unwrap_or_default()
             .into_iter()
             .filter(|record| {
@@ -645,7 +647,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
             && try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)
                 .is_ok_and(|key| !connectivity.contains_key(&key))
     }) {
-        for record in read_cluster_connectivity_graph(paths)
+        for record in read_cluster_connectivity_evidence(paths)
             .unwrap_or_default()
             .into_iter()
             .filter(|record| {

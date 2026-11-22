@@ -354,8 +354,11 @@ budget. An endpoint still answering when that budget ends records nothing
 Every module endpoint of an authorized member is an active probe key, so
 verification evidence for it survives later regular batches, but only built-in
 endpoints are ever regularly due and only those records schedule renewal. The
-regular seed never copies module evidence back into a batch. Main schedules one
-wake at the earliest expiry of records no regular probe renews;
+regular seed never copies module evidence back into a batch. The seed keeps the
+expiry each record's source gave it, so a renewal comes due at that expiry;
+routing reads instead keep a committed verdict current for its lifetime from
+the read, so a route survives a source that is silent past its TTL. Main
+schedules one wake at the earliest expiry of records no regular probe renews;
 `remove_expired_local_cluster_connectivity_source_records` then removes those
 expired in both the persisted and in-memory views, once, and the source's
 publication withdraws the committed copy. A record renewed in memory by a later
