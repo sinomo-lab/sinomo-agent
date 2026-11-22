@@ -6485,14 +6485,29 @@ impl DfsTestRuntime {
 
     /// Give `observer` a connectivity probe owner, or take it away. With
     /// one, its verification requests are accepted and stay open until
-    /// [`Self::settle_peer_verification`]; without one, as by default, they
-    /// are refused and the verdict the test set answers.
+    /// [`Self::settle_peer_verification`] or
+    /// [`Self::end_peer_verification_unconcluded`]; with it taken away they
+    /// are refused. A test that sets neither gets each request for a peer
+    /// whose verdict it set answered at once, by a probe that concludes with
+    /// that verdict.
     pub fn set_probe_owner(&self, observer: &NodeId, owner: bool) {
         crate::runtime_host::set_test_probe_owner(self.data_dir(observer).root(), owner);
     }
 
+    /// End `observer`'s verification episode of `peer` without a conclusion,
+    /// as the network does when the episode is cancelled, the peer has
+    /// nothing to dial, or its rounds produce no verdict. The verdict stays
+    /// what it was.
+    pub fn end_peer_verification_unconcluded(&self, observer: &NodeId, peer: &NodeId) {
+        crate::runtime_host::end_test_peer_verification_unconcluded(
+            self.data_dir(observer).root(),
+            peer.clone(),
+        );
+    }
+
     /// Settle `observer`'s verification episode of `peer` with `verdict`, as
-    /// the network does when its probe of the peer ends.
+    /// the network does when the episode's own probe concludes: an edge
+    /// answered, or every one failed.
     pub fn settle_peer_verification(
         &self,
         observer: &NodeId,

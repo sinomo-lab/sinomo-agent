@@ -1,7 +1,7 @@
 //! The candidate role: per-shard takeover attempts, driven from the keeper's
 //! evaluation and from the completions of the steps they start.
 
-use super::super::peer_verdicts::{DfsPeerVerdictSnapshot, DfsPeerVerdicts};
+use super::super::peer_verdicts::{DfsPeerVerdictSnapshot, DfsPeerVerdicts, StandingVerdict};
 use super::super::write_set_keeping::MemberRecord;
 use super::super::*;
 use super::ShardKey;
@@ -10,9 +10,10 @@ use super::steps::{
     read_takeover_promise, retire_takeover_fence, settle_takeover_promise, take_metadata_shard,
 };
 use crate::takeover_corroboration::{
-    DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT, DfsMetadataTakeoverCorroborationReply,
-    DfsMetadataTakeoverCorroborationRequest, DfsTakeoverCorroborationKind,
-    DfsTakeoverHandOffOutcome, DfsTakeoverPrimaryReach, DfsTakeoverRank,
+    DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT, DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED,
+    DfsMetadataTakeoverCorroborationReply, DfsMetadataTakeoverCorroborationRequest,
+    DfsTakeoverCorroborationKind, DfsTakeoverHandOffOutcome, DfsTakeoverPrimaryReach,
+    DfsTakeoverRank,
 };
 use crate::{
     DfsMetadataShardConfig, DfsMetadataShardWriteSet, DfsMetadataShardWriteSetState,
@@ -117,6 +118,14 @@ fn declined_for_availability(outcome: &DfsTakeoverHandOffOutcome) -> bool {
 pub(in crate::runtime_host) const HAND_OFF_NO_QUORUM: &str = "no-quorum";
 /// The decline of a hand-off target whose keeper could not evaluate it.
 pub(in crate::runtime_host) const HAND_OFF_UNAVAILABLE: &str = "unavailable";
+/// The decline of a hand-off target whose verdict for the primary is no
+/// longer no-path but no path either: it has no evidence. It does not veto.
+const HAND_OFF_NOT_LOST: &str = "primary-not-lost";
+/// The decline of a hand-off target whose no-path verdict for the primary
+/// already stood when it first read the epoch, with nothing examining the
+/// primary: its swap would depose the primary on a verdict the network has
+/// not examined under this record.
+const HAND_OFF_UNEXAMINED: &str = "primary-unexamined";
 
 struct Attempt {
     id: String,
@@ -199,6 +208,8 @@ pub(in crate::runtime_host) struct TakeoverRole {
     /// Activations that failed, with the inputs they saw: retried only once
     /// the publication or the verdicts move.
     activation_blocked: BTreeMap<ShardKey, (u64, u64, u64)>,
+    /// Hand-offs waiting for the network to finish examining the primary.
+    waiting_hand_offs: Vec<(super::TakeoverHandOff, super::TakeoverHandOffReply)>,
     publication_generation: u64,
     verdict_generation: u64,
 }
@@ -226,6 +237,7 @@ impl TakeoverRole {
             aligning: BTreeSet::new(),
             last_events: BTreeMap::new(),
             activation_blocked: BTreeMap::new(),
+            waiting_hand_offs: Vec::new(),
             publication_generation: 0,
             verdict_generation: 0,
         }
@@ -343,26 +355,74 @@ impl TakeoverRole {
         verify
     }
 
+    /// Judge the hand-offs that arrived and the ones still waiting for the
+    /// network to examine their primary.
+    pub(in crate::runtime_host) fn hand_offs(
+        &mut self,
+        shards: &[TakeoverShard],
+        members: Option<&BTreeMap<NodeId, MemberRecord>>,
+        verdicts: &DfsPeerVerdictSnapshot,
+        source: &mut DfsPeerVerdicts,
+        arrived: Vec<(super::TakeoverHandOff, super::TakeoverHandOffReply)>,
+    ) {
+        let waiting = std::mem::take(&mut self.waiting_hand_offs);
+        for (hand_off, reply) in waiting.into_iter().chain(arrived) {
+            if let Some(waiting) = self.hand_off(shards, members, verdicts, source, hand_off, reply)
+            {
+                self.waiting_hand_offs.push(waiting);
+            }
+        }
+    }
+
+    /// Answer every waiting hand-off that this role cannot judge now. Its
+    /// asker waits without a deadline.
+    pub(in crate::runtime_host) fn decline_waiting_hand_offs(&mut self) {
+        for (_, reply) in std::mem::take(&mut self.waiting_hand_offs) {
+            let _ = reply.send(DfsTakeoverHandOffOutcome::Declined {
+                reason: HAND_OFF_UNAVAILABLE.into(),
+                prefer: None,
+            });
+        }
+    }
+
     /// Run a hand-off from another member's round: that member ranked this
     /// node first. A round of this node's own gives way to it; an attempt
     /// already promising or settling answers that the asker should follow.
-    pub(in crate::runtime_host) fn hand_off(
+    ///
+    /// This node's swap deposes the primary on this node's own verdict, so
+    /// that verdict must count under the record's epoch exactly as for an
+    /// attempt of this node's own; the asker's evidence is the asker's.
+    /// While the network examines the primary the hand-off waits, and is
+    /// returned to be judged again on the next evaluation: the episode's
+    /// settlement is that event. A verdict nothing is examining declines
+    /// the hand-off, and so does one that is no longer no-path; the asker
+    /// then ranks again without this node, unless this node now reaches the
+    /// primary, which vetoes the asker's attempt.
+    fn hand_off(
         &mut self,
         shards: &[TakeoverShard],
+        members: Option<&BTreeMap<NodeId, MemberRecord>>,
+        verdicts: &DfsPeerVerdictSnapshot,
+        source: &mut DfsPeerVerdicts,
         hand_off: super::TakeoverHandOff,
-        reply: tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>,
-    ) {
+        reply: super::TakeoverHandOffReply,
+    ) -> Option<(super::TakeoverHandOff, super::TakeoverHandOffReply)> {
         let decline = |reason: &str| DfsTakeoverHandOffOutcome::Declined {
             reason: reason.into(),
             prefer: None,
         };
+        // The asker stopped waiting: its attempt ended. Whatever this node
+        // does next is its own evaluation's.
+        if reply.is_closed() {
+            return None;
+        }
         let Some(shard) = shards.iter().find(|shard| shard.key == hand_off.key) else {
             let _ = reply.send(decline("no-record"));
-            return;
+            return None;
         };
         if shard.shard.epoch != hand_off.epoch || shard.shard.primary_node_id != hand_off.primary {
             let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
-            return;
+            return None;
         }
         if !shard
             .state
@@ -371,8 +431,9 @@ impl TakeoverRole {
             || shard.shard.primary_node_id == self.local
         {
             let _ = reply.send(decline("not-eligible"));
-            return;
+            return None;
         }
+        // An attempt of this node's own already passed the same rule.
         if let Some(attempt) = self.attempts.get_mut(&shard.key) {
             match attempt.step {
                 Step::Corroborating { .. }
@@ -388,15 +449,45 @@ impl TakeoverRole {
                     let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
                 }
             }
-            return;
+            return None;
         }
         if self.resume_promise(shard) {
             let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
-            return;
+            return None;
         }
-        let Some(write_set) = shard.state.switched() else {
-            return;
-        };
+        let write_set = shard.state.switched()?;
+        // Departure is a membership fact cluster KV ordered; it needs no
+        // examination. Without the membership scopes nobody is judged
+        // departed.
+        let primary = &shard.shard.primary_node_id;
+        let departed = members
+            .is_some_and(|members| members.get(primary).is_none_or(|member| member.departed));
+        if !departed {
+            let (verdict, verifying) = verdicts.entry(primary);
+            let standing =
+                source.standing_verdict(verdicts, &shard.key, shard.shard.epoch, primary);
+            match (verdict, standing) {
+                // An episode is running, or the one this node asked for is
+                // pending: its settlement decides.
+                _ if verifying => return Some((hand_off, reply)),
+                (sinomo_core::network::PeerPathVerdict::NoPath, StandingVerdict::Counts) => {}
+                (sinomo_core::network::PeerPathVerdict::NoPath, StandingVerdict::BeingExamined) => {
+                    return Some((hand_off, reply));
+                }
+                (sinomo_core::network::PeerPathVerdict::NoPath, StandingVerdict::Unexamined) => {
+                    let _ = reply.send(decline(HAND_OFF_UNEXAMINED));
+                    return None;
+                }
+                (sinomo_core::network::PeerPathVerdict::Path, _) => {
+                    let _ = reply.send(decline(DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED));
+                    return None;
+                }
+                _ => {
+                    let _ = reply.send(decline(HAND_OFF_NOT_LOST));
+                    return None;
+                }
+            }
+        }
         self.attempts.insert(
             shard.key.clone(),
             Attempt {
@@ -413,6 +504,7 @@ impl TakeoverRole {
             },
         );
         self.spawn_take(shard);
+        None
     }
 
     /// Forget an attempt the record moved past, unless its swap is still
@@ -732,18 +824,7 @@ impl TakeoverRole {
         let key = shard.key.clone();
         let answers = answer_summaries(&entries);
         match crate::decide_metadata_takeover_round(&local, &entries, &declined) {
-            DfsTakeoverRoundOutcome::Vetoed { by } => {
-                self.end_standing(&key);
-                let mut event = self.event(&key, None, answers);
-                event.node_ids = vec![by];
-                self.publish(
-                    &key,
-                    DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
-                    event,
-                    Vec::new(),
-                );
-                self.attempts.remove(&key);
-            }
+            DfsTakeoverRoundOutcome::Vetoed { by } => self.veto(&key, by, answers),
             DfsTakeoverRoundOutcome::Follow => {
                 self.end_standing(&key);
                 self.attempts.remove(&key);
@@ -781,6 +862,22 @@ impl TakeoverRole {
                 self.spawn_ask(key, to, request, true);
             }
         }
+    }
+
+    /// End the attempt because `by` reaches the primary. The veto ends this
+    /// attempt only: a new one starts once the record, the publication or
+    /// this node's verdicts move.
+    fn veto(&mut self, key: &ShardKey, by: NodeId, answers: Vec<DfsTakeoverAnswerSummary>) {
+        self.end_standing(key);
+        let mut event = self.event(key, None, answers);
+        event.node_ids = vec![by];
+        self.publish(
+            key,
+            DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
+            event,
+            Vec::new(),
+        );
+        self.attempts.remove(key);
     }
 
     /// Record that this attempt ended on its own evidence: no new attempt
@@ -893,6 +990,26 @@ impl TakeoverRole {
                 if id != &attempt || to != &member {
                     return None;
                 }
+                // A member that reaches the primary vetoes the attempt, as in
+                // the round: one that answered lost from a verdict that stood
+                // may find a path while it holds the hand-off.
+                if let Some(reply) = reply.as_ref().filter(|reply| reply.reaches_primary()) {
+                    let mut entries = entries.clone();
+                    let mobile = self
+                        .attempts
+                        .get(&key)
+                        .is_some_and(|current| current.mobile.contains(&member));
+                    entries.insert(
+                        member.clone(),
+                        DfsTakeoverRoundEntry::Replied {
+                            answer: DfsTakeoverPrimaryReach::Reaches,
+                            durable_sequence: reply.durable_sequence,
+                            mobile,
+                        },
+                    );
+                    self.veto(&key, member, answer_summaries(&entries));
+                    return None;
+                }
                 let outcome = reply.and_then(|reply| reply.hand_off);
                 match outcome {
                     Some(
@@ -926,7 +1043,8 @@ impl TakeoverRole {
                         }
                     }
                     // Any other decline, a second availability decline or a
-                    // failed call: rank again without it.
+                    // failed call: rank again without it. None of them
+                    // reaches the primary.
                     _ => {
                         let (local, entries) = (local.clone(), entries.clone());
                         let mut declined = declined.clone();

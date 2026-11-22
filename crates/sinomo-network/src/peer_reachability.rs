@@ -49,10 +49,18 @@ pub struct PeerReachability {
     /// The connectivity probe owner is verifying this peer's direct edges.
     pub verifying: bool,
     /// Changes each time a verification episode for this peer settles,
-    /// whatever it found; zero while none has. Equal values mean no episode
-    /// settled in between, so a subscriber that noted the value can tell a
-    /// verdict the network examined since from one that only stood.
+    /// whatever ended it: a conclusion, a bound or a cancellation. Zero while
+    /// none has. Equal values mean no episode settled in between. A settled
+    /// episode need not have examined the peer: see `concluded_generation`.
     pub examined_generation: u64,
+    /// The `examined_generation` of this peer's last episode whose own probe
+    /// concluded: a direct edge answered, or every direct edge failed. Zero
+    /// while none has. An episode that was cancelled, had nothing to dial,
+    /// produced no observation or ran out of rounds, or that recorded
+    /// evidence answered without a probe, leaves it unchanged. A subscriber
+    /// that noted the value can therefore tell a verdict the network examined
+    /// since from one that only stood.
+    pub concluded_generation: u64,
 }
 
 /// Generations of every input a snapshot was computed from.
@@ -193,6 +201,11 @@ fn compute_peers(
                 verifying: verification.verifying.contains(&peer_node_id),
                 examined_generation: verification
                     .examined
+                    .get(&peer_node_id)
+                    .copied()
+                    .unwrap_or_default(),
+                concluded_generation: verification
+                    .concluded
                     .get(&peer_node_id)
                     .copied()
                     .unwrap_or_default(),

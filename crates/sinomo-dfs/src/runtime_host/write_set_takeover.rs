@@ -21,9 +21,11 @@
 //! network bounds a verification episode.
 //!
 //! Every wait is an event: a verdict change, a publication, a reply, or a
-//! completion. The only timer re-sends an unknown swap, because while it is
-//! unknown no primary can commit and no publication may arrive to wake the
-//! candidate; it never decides an outcome.
+//! completion. The only timers re-send: an unknown swap, a failed confirm
+//! read, and a request that the network examine the primary whose episode
+//! concluded nothing. In each case no primary can commit and no publication
+//! or verdict change may arrive to wake the candidate; a timer never decides
+//! an outcome.
 
 use super::peer_verdicts::DfsPeerVerdicts;
 use super::write_set_keeping::cluster_member_facts;
@@ -242,7 +244,9 @@ fn unavailable(
 /// `NoPath` it asks the network to verify the primary, then waits for an
 /// episode that was running or requested when the question arrived to end, so
 /// a verdict from edge records that have not aged out cannot veto a primary
-/// that died. Without a probe owner the current settled verdict answers.
+/// that died. Any end of that episode ends the wait, with or without a
+/// conclusion: the answer is this node's verdict, not a certificate. Without
+/// a probe owner the current settled verdict answers.
 async fn judge_takeover_primary(
     verdicts: &mut DfsPeerVerdicts,
     primary: &NodeId,
@@ -250,7 +254,7 @@ async fn judge_takeover_primary(
 ) -> (DfsTakeoverPrimaryReach, DfsTakeoverVerdictEvidence) {
     let asked = verdicts.current();
     let settled_lost = asked.reach(primary) == DfsWriteSetMemberReach::NoPath;
-    let examined_before = asked.examined_generation(primary);
+    let settled_before = asked.settled_generation(primary);
     let requested = !departed && !settled_lost && verdicts.request_verification(primary);
     let mut episode_seen = false;
     loop {
@@ -259,7 +263,7 @@ async fn judge_takeover_primary(
         // An episode this wait saw running, or one that settled since the
         // question arrived. The second also covers an episode that began and
         // settled between two wakes, which the first never sees.
-        episode_seen |= snapshot.examined_generation(primary) > examined_before;
+        episode_seen |= snapshot.settled_generation(primary) > settled_before;
         let evidence = DfsTakeoverVerdictEvidence {
             snapshot_generation: snapshot.generation,
             verification_generation: snapshot.verification_generation,
@@ -300,7 +304,9 @@ async fn local_durable_sequence(
 /// A hand-off's outcome on this member: it runs the takeover from the
 /// asker's round when it judges the primary lost and still ranks itself first
 /// with its own head, and declines otherwise. The run belongs to this node's
-/// candidate role, so one node never runs two attempts for a shard.
+/// candidate role, so one node never runs two attempts for a shard, and that
+/// role holds the swap to the rule of an attempt of its own: this node's
+/// no-path verdict must count under the record's epoch.
 async fn run_or_decline_hand_off(
     local: &NodeId,
     request: &DfsMetadataTakeoverCorroborationRequest,
@@ -353,7 +359,7 @@ pub(super) struct TakeoverHandOff {
     pub(super) primary: NodeId,
 }
 
-type TakeoverHandOffReply = tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>;
+pub(super) type TakeoverHandOffReply = tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>;
 
 static TAKEOVER_HAND_OFFS: std::sync::LazyLock<
     std::sync::Mutex<BTreeMap<NodeId, Vec<(TakeoverHandOff, TakeoverHandOffReply)>>>,

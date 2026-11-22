@@ -2,7 +2,7 @@ use sinomo_base::ClusterNodeRole;
 use sinomo_network::{
     CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL, CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS,
     CLUSTER_PEER_VERIFICATION_MAX_ROUNDS, CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN,
-    ClusterNetworkMaintenanceSchedule, PeerVerificationCause,
+    ClusterNetworkMaintenanceSchedule, PeerVerificationCause, PeerVerificationOutcome,
     cluster_network_discovery_interval_for_role, cluster_network_maintenance_interval_remaining,
     cluster_network_maintenance_last_timestamp_for_next_due,
     cluster_network_probe_interval_for_role, cluster_network_publish_interval_for_role,
@@ -91,11 +91,34 @@ pub enum ClusterPeerVerificationRound {
 /// How a verification episode ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterPeerVerificationSettlement {
+    /// A probe of this episode found a local direct edge that answers.
     Reached,
+    /// A probe of this episode left every local direct edge at the failure
+    /// threshold.
     Exhausted,
+    /// The recorded evidence already had every local direct edge at the
+    /// failure threshold, so the failure that asked was not probed again.
+    AlreadyExhausted,
+    /// Too many rounds produced no observation.
     Inconclusive,
+    /// The rounds ran out with failure evidence still below the threshold.
     RoundLimit,
+    /// The episode was ended from outside: the peer has nothing this node
+    /// dials, or the node's own cluster state made the episode void.
     Cancelled,
+}
+
+impl ClusterPeerVerificationSettlement {
+    /// Whether the episode examined the peer: only a probe of its own that
+    /// reached or exhausted the peer's direct edges concludes anything.
+    pub const fn outcome(self) -> PeerVerificationOutcome {
+        match self {
+            Self::Reached | Self::Exhausted => PeerVerificationOutcome::Concluded,
+            Self::AlreadyExhausted | Self::Inconclusive | Self::RoundLimit | Self::Cancelled => {
+                PeerVerificationOutcome::Unconcluded
+            }
+        }
+    }
 }
 
 /// One peer's running verification episode.
@@ -1123,6 +1146,44 @@ mod tests {
             cadence.record_round(&peer, ClusterPeerVerificationRound::Continue, now),
             Some(ClusterPeerVerificationSettlement::RoundLimit)
         );
+    }
+
+    #[test]
+    fn only_a_reached_or_exhausted_episode_concludes() {
+        use ClusterPeerVerificationSettlement as Settlement;
+        for (settlement, outcome) in [
+            (Settlement::Reached, PeerVerificationOutcome::Concluded),
+            (Settlement::Exhausted, PeerVerificationOutcome::Concluded),
+            (
+                Settlement::AlreadyExhausted,
+                PeerVerificationOutcome::Unconcluded,
+            ),
+            (
+                Settlement::Inconclusive,
+                PeerVerificationOutcome::Unconcluded,
+            ),
+            (Settlement::RoundLimit, PeerVerificationOutcome::Unconcluded),
+            (Settlement::Cancelled, PeerVerificationOutcome::Unconcluded),
+        ] {
+            assert_eq!(settlement.outcome(), outcome, "{settlement:?}");
+        }
+        // The cadence itself settles only from a round's own result or a
+        // bound, never as already exhausted: that is the host's shortcut.
+        let now = Instant::now();
+        let peer = verification_peer("node_cadence_verification_outcome");
+        let peers = BTreeSet::from([peer.clone()]);
+        for (round, settlement) in [
+            (ClusterPeerVerificationRound::Reached, Settlement::Reached),
+            (
+                ClusterPeerVerificationRound::Exhausted,
+                Settlement::Exhausted,
+            ),
+        ] {
+            let mut cadence = ClusterPeerVerificationCadence::default();
+            cadence.request(peer.clone(), PeerVerificationCause::Requested, now);
+            cadence.begin_rounds(&peers, &ClusterNodeRole::Workstation, now);
+            assert_eq!(cadence.record_round(&peer, round, now), Some(settlement));
+        }
     }
 
     #[test]

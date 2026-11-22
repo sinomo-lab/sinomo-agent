@@ -359,9 +359,10 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   (`raised_n` at least their number; the switch event's cause says so). The
   pass and the switch submission hold the shard's mutation admission, so no
   version commits in between;
-- shrink a member with a settled no-path verdict, one the cluster no longer
-  authorizes, or one that refused the primary's epoch for a takeover candidate,
-  never below the W floor;
+- shrink a member with a settled no-path verdict that counts under the
+  record's epoch (the rule under [Takeover](#takeover)), one the cluster no
+  longer authorizes, or one that refused the primary's epoch for a takeover
+  candidate, never below the W floor;
 - re-add a returning member: on an epoch that started at a takeover or handoff
   it is first aligned with the epoch start; it is then caught up through the
   ordinary durability barrier, confirms the head under the record's generation,
@@ -423,8 +424,18 @@ their existing encoding.
 
 A write-set member other than the primary starts an attempt when its own
 verdict for the primary settles to no path, or the cluster no longer
-authorizes the primary (which then has no verdict at all). A request that
-cannot be delivered to the primary, a content write as much as a namespace
+authorizes the primary (which then has no verdict at all). A no-path verdict
+counts only as evidence gathered under the record's epoch. One that turns
+no-path while this node already reads that primary at that epoch counts as it
+is. One that already stood when this node first read the epoch counts once the
+network has examined the primary since: the node asks for a verification
+episode and waits until `PeerReachability::concluded_generation` moves past
+the value it noted, which only an episode whose own probe reached or exhausted
+the peer's direct edges does. An episode that settles any other way
+(cancelled, nothing to dial, no observation, out of rounds, or answered from
+recorded evidence) certifies nothing; the node asks again after 250 ms,
+doubling to the network timeout, for as long as the verdict stands. A request
+that cannot be delivered to the primary, a content write as much as a namespace
 request, asks the network to verify it first. An attempt that ended on its own evidence (a veto, a newer record or a
 failed promise) starts again only when the record, the publication or this
 node's verdicts move; a failed confirm read is re-sent instead (below). The
@@ -447,15 +458,23 @@ them.
   candidate and every `lost` member are ranked by journal head, then non-mobile
   first, then node id. A member ranked first above the candidate gets a
   `hand-off { ranking }` request and runs the attempt itself when it still
-  ranks first with its own head; it declines with `prefer` otherwise, and a
-  member already promising answers `followed`. A member that cannot run the
+  ranks first with its own head and its own no-path verdict counts under the
+  epoch by the rule above. While the examination it asked for is pending or
+  running it holds the request; it declines with `primary-unexamined` when
+  nothing is examining the primary. One that reaches the primary, by the
+  verification it ran when asked or by that examination, declines with
+  `primary-reached`, which vetoes the attempt as a `reaches` answer does; one
+  left with no verdict declines with `primary-not-lost`. It declines with
+  `prefer` when it does not rank first, and a member already promising answers
+  `followed`. A member that cannot run the
   attempt declines with `no-quorum` when its confirm read fails, or with
   `unavailable` when its keeper cannot evaluate the shard. On such a decline
   the candidate reads the record itself: if that read fails too it re-sends
   its read as a failed confirm read is re-sent (below), and once a read
   succeeds a quorum is serving, so it asks the same member once more.
-  On any other decline, or a second availability decline, the candidate ranks
-  again without that member. A write set of two asks nobody.
+  On any other decline but `primary-reached`, or a second availability
+  decline, the candidate ranks again without that member. A write set of two
+  asks nobody.
 - **Confirm, promise, swap.** The candidate reads the record with one
   authoritative read of the shard keys and its configured members; a failed read
   promises nothing, so a node outside the KV quorum promises nothing. A failed

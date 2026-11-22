@@ -23,6 +23,11 @@ use sinomo_core::node::NodeId;
 /// Wire format of the corroboration request and reply.
 pub const DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT: u16 = 1;
 
+/// The decline of a hand-off target that reaches the primary: from the
+/// verification it ran when asked, or from the examination it waited for
+/// while it held the hand-off. Like a `reaches` answer, it vetoes the attempt.
+pub(crate) const DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED: &str = "primary-reached";
+
 /// One question from a takeover candidate to another write-set member.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +136,18 @@ pub struct DfsTakeoverVerdictEvidence {
 }
 
 impl DfsMetadataTakeoverCorroborationReply {
+    /// Whether this member reaches the primary, which vetoes the attempt: it
+    /// answered `reaches`, or, asked to run the attempt, declined because its
+    /// own examination found a path.
+    pub(crate) fn reaches_primary(&self) -> bool {
+        self.answer == DfsTakeoverPrimaryReach::Reaches
+            || matches!(
+                &self.hand_off,
+                Some(DfsTakeoverHandOffOutcome::Declined { reason, .. })
+                    if reason == DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED
+            )
+    }
+
     pub(crate) fn abstain(
         request: &DfsMetadataTakeoverCorroborationRequest,
         member: &NodeId,
@@ -322,6 +339,50 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<DfsMetadataTakeoverCorroborationReply>(&encoded).unwrap(),
                 reply
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_reaches_the_primary_by_its_answer_or_its_hand_off_decline() {
+        let reply = |answer, reason: Option<&str>| DfsMetadataTakeoverCorroborationReply {
+            attempt_id: "attempt".into(),
+            member_node_id: node("corroborate-c"),
+            record_view: None,
+            answer,
+            durable_sequence: Some(9),
+            hand_off: reason.map(|reason| DfsTakeoverHandOffOutcome::Declined {
+                reason: reason.into(),
+                prefer: None,
+            }),
+            verdict_evidence: None,
+        };
+        let no_evidence = DfsTakeoverPrimaryReach::Abstain {
+            reason: DfsTakeoverAbstainReason::NoEvidence,
+        };
+        assert!(reply(DfsTakeoverPrimaryReach::Reaches, None).reaches_primary());
+        assert!(
+            reply(DfsTakeoverPrimaryReach::Reaches, Some("primary-not-lost")).reaches_primary(),
+            "a target that declines with a reaching answer reaches the primary"
+        );
+        assert!(
+            reply(
+                DfsTakeoverPrimaryReach::Lost,
+                Some(DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED)
+            )
+            .reaches_primary(),
+            "a target that answered lost and then found a path reaches it"
+        );
+        for (answer, reason) in [
+            (DfsTakeoverPrimaryReach::Lost, None),
+            (DfsTakeoverPrimaryReach::Lost, Some("primary-unexamined")),
+            (DfsTakeoverPrimaryReach::Lost, Some("prefer-asker")),
+            (no_evidence.clone(), Some("primary-not-lost")),
+            (no_evidence, None),
+        ] {
+            assert!(
+                !reply(answer.clone(), reason).reaches_primary(),
+                "{answer:?} {reason:?}"
             );
         }
     }
