@@ -73,17 +73,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
+    /// Run one authoritative stat. It adds no deadline of its own: the
+    /// operation deadline its caller installed, if any, is its only bound in
+    /// time.
     pub(crate) fn with_stat_deadline<R>(
         &mut self,
         run: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
-        let requested = std::time::Instant::now() + super::POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
-        let previous = self.transport.set_operation_deadline(Some(requested));
-        self.transport
-            .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
-        let result = run(self);
-        self.transport.set_operation_deadline(previous);
-        result
+        run(self)
     }
 
     fn check_stat_deadline(&self) -> Result<()> {

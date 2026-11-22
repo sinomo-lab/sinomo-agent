@@ -5,10 +5,7 @@
 //! facade. Write paths may reuse the read-through helper when they need the
 //! current file bytes before applying a range patch.
 
-use super::{
-    POSIX_REMOTE_READ_IDLE_WAIT_INITIAL, POSIX_REMOTE_READ_IDLE_WAIT_MAX,
-    POSIX_REMOTE_READ_TIMEOUT, now_unix_nanos,
-};
+use super::{POSIX_REMOTE_READ_IDLE_WAIT_INITIAL, POSIX_REMOTE_READ_IDLE_WAIT_MAX, now_unix_nanos};
 use crate::namespace::next_version;
 use crate::posix_model::{
     DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome,
@@ -28,7 +25,7 @@ use crate::{
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum RangeReadContext {
@@ -338,25 +335,37 @@ fn validate_inline_namespace_range(
     validate_posix_range_content_identity(object, data)
 }
 
+/// How long one pass of a remote content read waits for incoming work: its
+/// idle interval, ended sooner by a due retry or the caller's deadline, and
+/// never shorter than the initial idle interval while time remains.
+fn posix_remote_read_wait(
+    idle_wait: Duration,
+    until_retry: Option<Duration>,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    let remaining = deadline.map(|deadline| deadline.saturating_duration_since(now));
+    let floor = remaining.map_or(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL, |remaining| {
+        POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining)
+    });
+    [remaining, until_retry]
+        .into_iter()
+        .flatten()
+        .fold(idle_wait, Duration::min)
+        .max(floor)
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Run one content read that may fetch from a remote replica. The read
+    /// adds no deadline of its own: `operation` receives the deadline its
+    /// caller installed, if any. Without one the read ends on its answer, on
+    /// a definite outcome, when no source is left to ask, or on cancellation.
     fn with_posix_remote_read_deadline<R>(
         &mut self,
-        operation: impl FnOnce(&mut Self, Instant) -> Result<R>,
+        operation: impl FnOnce(&mut Self, Option<Instant>) -> Result<R>,
     ) -> Result<R> {
-        let requested_deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let effective_deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if effective_deadline != requested_deadline {
-            self.transport
-                .set_operation_deadline(Some(effective_deadline));
-        }
-        let result = operation(self, effective_deadline);
-        self.transport.set_operation_deadline(previous_deadline);
-        result
+        let deadline = self.transport.operation_deadline();
+        operation(self, deadline)
     }
 
     fn posix_file_content_object(
@@ -1161,7 +1170,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         source_node_id: &NodeId,
         pending_reads: &[PosixPendingBulkRead],
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Vec<DfsBulkReadItemResponse>> {
         let request_id = format!("dfs_bulk_read_batch_{}", EventId::generate());
         let request = DfsBulkReadRequest {
@@ -1206,10 +1215,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 break;
             }
-            let wait = idle_wait.min(deadline.saturating_duration_since(now));
+            let wait = posix_remote_read_wait(idle_wait, None, deadline, now);
             if self
                 .transport
                 .wait_for_incoming(wait)
@@ -1600,7 +1609,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn read_current_object_or_fetch_remote_with_deadline(
         &mut self,
         object_id: &DfsObjectId,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<NetworkedDfsReadOutcome> {
         let initial = self.read_local_object_with_state(object_id, false)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
@@ -1622,7 +1631,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(current);
             }
             if !self.has_pending_remote_read_for_current_object(object_id)? {
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Ok(current);
                 }
                 if self.request_remote_object_read(object_id)?.is_empty() {
@@ -1632,21 +1641,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(current);
             }
-            let remaining = deadline.saturating_duration_since(now);
             let until_retry = self
                 .next_pending_remote_read_retry_for_current_object(object_id)?
-                .map(|next_retry_at| next_retry_at.saturating_duration_since(now))
-                .unwrap_or(remaining);
+                .map(|next_retry_at| next_retry_at.saturating_duration_since(now));
             // An already-due retry must still pace the loop: on a degraded link
             // every retry fails fast and stays due, and a zero wait here spun
-            // this loop at a full core until the read timeout.
-            let wait = idle_wait
-                .min(remaining)
-                .min(until_retry)
-                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
+            // this loop at a full core.
+            let wait = posix_remote_read_wait(idle_wait, until_retry, deadline, now);
             if self
                 .transport
                 .wait_for_incoming(wait)
@@ -1674,7 +1678,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn read_object_metadata_or_fetch_remote_without_cache_with_deadline(
         &mut self,
         object: &DfsObjectMetadata,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<NetworkedDfsReadOutcome> {
         // `object` came from the authoritative routed namespace lookup.
         // No-cache reads deliberately reuse it instead of re-resolving through a
@@ -1716,7 +1720,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(current);
             }
             if !self.has_pending_remote_read_for_metadata(&object) {
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Ok(current);
                 }
                 if self
@@ -1729,20 +1733,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(current);
             }
-            let remaining = deadline.saturating_duration_since(now);
             let until_retry = self
                 .next_pending_remote_read_retry_for_metadata(&object)
-                .map(|next_retry_at| next_retry_at.saturating_duration_since(now))
-                .unwrap_or(remaining);
+                .map(|next_retry_at| next_retry_at.saturating_duration_since(now));
             // Same pacing floor as `read_current_object_or_fetch_remote`: an
             // always-due retry on a degraded link must not spin this loop hot.
-            let wait = idle_wait
-                .min(remaining)
-                .min(until_retry)
-                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
+            let wait = posix_remote_read_wait(idle_wait, until_retry, deadline, now);
             if self
                 .transport
                 .wait_for_incoming(wait)
@@ -1799,7 +1798,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         offset: u64,
         max_bytes: usize,
-        deadline: Instant,
+        deadline: Option<Instant>,
         context: RangeReadContext,
     ) -> Result<NetworkedDfsRangeReadOutcome> {
         // Preserve the same authoritative metadata for the remote range
@@ -1871,7 +1870,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(current);
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(current);
             }
             let next_retry =
@@ -1888,15 +1887,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
             }
             let now = Instant::now();
-            let remaining = deadline.saturating_duration_since(now);
             let until_retry = self
                 .next_pending_remote_range_read_retry_for_metadata(&object, offset, max_bytes)
-                .map(|retry_at| retry_at.saturating_duration_since(now))
-                .unwrap_or(remaining);
-            let wait = idle_wait
-                .min(remaining)
-                .min(until_retry)
-                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
+                .map(|retry_at| retry_at.saturating_duration_since(now));
+            let wait = posix_remote_read_wait(idle_wait, until_retry, deadline, now);
             if self
                 .transport
                 .wait_for_incoming(wait)

@@ -14,12 +14,16 @@ use sinomo_dfs::{
     DfsStat, DfsWriteOptions, MountedSifsService,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_NFS_IO_BYTES: usize = 1024 * 1024;
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 const DEFAULT_FILE_MODE: u32 = 0o644;
+
+/// An export's lock: its waiters wait for the holder's release, within the
+/// request's deadline when the export has an operation budget.
+type ExportLock<T> = dfs::MountedSifsLock<T>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsNfsHandle {
@@ -115,15 +119,28 @@ impl SifsNfsState {
     }
 }
 
+/// The export's own departure. Once the last handle to the export is gone,
+/// a request still waiting for the cluster or for the daemon has no caller
+/// left: its waits are cancelled.
+#[derive(Debug)]
+struct ExportLifetime(dfs::DfsCancellationFlag);
+
+impl Drop for ExportLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SifsNfsFileSystem {
-    service: Arc<Mutex<MountedSifsService>>,
-    state: Arc<Mutex<SifsNfsState>>,
+    service: Arc<ExportLock<MountedSifsService>>,
+    state: Arc<ExportLock<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     root: SifsNfsHandle,
     /// The operator's bound on one request's DFS work; `None` waits for
     /// events only.
     operation_budget: Option<Duration>,
+    _lifetime: Arc<ExportLifetime>,
 }
 
 impl SifsNfsFileSystem {
@@ -134,8 +151,11 @@ impl SifsNfsFileSystem {
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?,
         };
+        let closing = dfs::DfsCancellationFlag::new();
         #[cfg(test)]
-        if let Some(opened) = sinomo_vfs_sifs::test_support::open_registered(&data_dir, None) {
+        if let Some(opened) =
+            sinomo_vfs_sifs::test_support::open_registered(&data_dir, Some(closing.clone()))
+        {
             // Adapter tests borrow the real component owner in this process;
             // the external daemon handoff remains a separate host boundary.
             let mut opened = opened.map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
@@ -143,7 +163,7 @@ impl SifsNfsFileSystem {
                 .service
                 .posix_lstat_distributed(&root_path)
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-            return Self::from_opened(opened, root_stat, root_path, read_only, None);
+            return Self::from_opened(opened, root_stat, root_path, read_only, None, closing);
         }
         let clustered = sinomo_core::network::ClusterPaths::new(&data_dir)
             .state
@@ -152,6 +172,7 @@ impl SifsNfsFileSystem {
             Some(Arc::new(NfsMountedMutationHandoff::open(
                 &data_dir,
                 format!("nfs:{root_path}"),
+                &closing,
             )?))
         } else {
             None
@@ -164,15 +185,19 @@ impl SifsNfsFileSystem {
                 );
                 let sync_peer: Arc<dyn dfs::DfsPeerTransport> = peer.clone();
                 let async_peer: Arc<dyn dfs::AsyncDfsPeerTransport> = peer;
-                dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+                dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
                     data_dir.clone(),
                     sync_peer,
                     async_peer,
+                    Some(closing.clone()),
                 )
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
             } else {
-                dfs::open_mounted_sifs_service(Some(data_dir.root()))
-                    .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
+                dfs::open_mounted_sifs_service_with_cancellation(
+                    Some(data_dir.root()),
+                    Some(closing.clone()),
+                )
+                .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
             };
             let root_stat = opened
                 .service
@@ -186,7 +211,7 @@ impl SifsNfsFileSystem {
             open_service()?
         };
         let (opened, root_stat) = opened;
-        Self::from_opened(opened, root_stat, root_path, read_only, handoff)
+        Self::from_opened(opened, root_stat, root_path, read_only, handoff, closing)
     }
 
     /// Bound each request's DFS work by the export operator's own budget.
@@ -196,12 +221,13 @@ impl SifsNfsFileSystem {
         self
     }
 
-    fn from_opened(
+    pub(crate) fn from_opened(
         opened: dfs::OpenedMountedSifsService,
         root_stat: DfsStat,
         root_path: String,
         read_only: bool,
         handoff: Option<Arc<NfsMountedMutationHandoff>>,
+        closing: dfs::DfsCancellationFlag,
     ) -> Result<Self> {
         let dfs::OpenedMountedSifsService {
             service,
@@ -224,8 +250,8 @@ impl SifsNfsFileSystem {
         let mut write_options = DfsWriteOptions::replicated_eventual(replica_candidates);
         write_options.foreground_replica_repair = false;
         Ok(Self {
-            service: Arc::new(Mutex::new(service)),
-            state: Arc::new(Mutex::new(SifsNfsState {
+            service: Arc::new(ExportLock::new(service)),
+            state: Arc::new(ExportLock::new(SifsNfsState {
                 root_path,
                 write_options,
                 read_only,
@@ -233,6 +259,7 @@ impl SifsNfsFileSystem {
             handoff,
             root: SifsNfsHandle::new(root_stat.object_id),
             operation_budget: None,
+            _lifetime: Arc::new(ExportLifetime(closing)),
         })
     }
 
@@ -269,13 +296,6 @@ impl SifsNfsFileSystem {
             + Send
             + 'static,
     {
-        if self
-            .handoff
-            .as_ref()
-            .is_some_and(|handoff| handoff.is_gated())
-        {
-            return Err(nfsstat3::NFS3ERR_IO);
-        }
         let service = Arc::clone(&self.service);
         let state = Arc::clone(&self.state);
         blocking_request(deadline, move || {
@@ -815,8 +835,8 @@ impl ReadDirPlusIterator<SifsNfsHandle> for SifsNfsDirIterator {
 
 async fn directory_iterator(
     deadline: Option<Instant>,
-    service: Arc<Mutex<MountedSifsService>>,
-    state: Arc<Mutex<SifsNfsState>>,
+    service: Arc<ExportLock<MountedSifsService>>,
+    state: Arc<ExportLock<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     dirid: SifsNfsHandle,
     cookie: u64,

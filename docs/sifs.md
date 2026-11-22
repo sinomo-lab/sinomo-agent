@@ -138,28 +138,34 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   While a cross-shard directory move runs, creates, writes, renames and
   unlinks under its destination return the same error until the move finishes
   or aborts; reads there are not blocked.
-- A FUSE mount or NFS export waits for an operation whose metadata-shard
-  primary is unreachable or changing. The call follows the shard to the
-  primary its record names next, under one operation id, and returns the
-  operation's own result, so a primary change shows only as latency. A call
-  waits without a timeout unless the mount has an operation budget:
+- A FUSE mount or NFS export adds no deadline of its own to a call. A path
+  lookup, an attribute read, a content read, an advisory-lock command and a
+  mutation each wait for their outcome: the answer, a definite error, the
+  network's verdict that the node they need cannot be reached, a change of
+  the shard's record, or the mount's close. A metadata-shard primary that is
+  slow, unreachable or changing does not make the mount fail the call. The
+  only bound in time is the mount's operation budget, when it has one:
   `--operation-budget <duration>` on `sinomo dfs mount`, `sinomo dfs nfs
   serve` and `sinomo dfs nfs mount`, or `operation_budget` in the supervised
   mount's configuration (`storage.sifs-mount`, `storage.sifs-nfs-mount`). The
-  duration is a whole number with a unit: `500ms`, `30s`, `5m` or `1h`. A
+  duration is a whole number with a unit: `500ms`, `30s`, `5m` or `1h`. The
+  budget covers the whole call, its waits for the mount's own locks and for
+  the local daemon included, and travels with every request the call sends. A
   call that reaches its budget without a result returns `EIO`
   (`NFS3ERR_IO`): the change was not delivered, or its outcome is unknown and
   it can still commit. A definite refusal returns its own error. No such error
   unmounts or fences the mount, which serves the next call.
-- A FUSE mount stays mounted while the local daemon does not answer. Each
-  mutation hands its work to the daemon through a durable marker; a step the
-  daemon has not acknowledged is sent again until it is, and the call waits
-  for that within the mount's operation budget. A call whose budget ends
-  first returns `EIO`, and the mount keeps sending the step. While 64 markers
-  occupy the outbox, the next mutation waits for room. Once the daemon has
-  accepted an error report and the call releases its lease, the daemon can
-  complete recovery for that operation while the mount stays live. Only an unmount or
-  the end of the mount process ends a FUSE mount.
+- A FUSE mount or NFS export keeps serving while the local daemon does not
+  answer. Each mutation hands its work to the daemon through a durable
+  marker; a step the daemon has not acknowledged is sent again until it is,
+  with no attempt limit, and the call waits for that within the mount's
+  operation budget. A call whose budget ends first returns `EIO`
+  (`NFS3ERR_IO`), and the mount keeps sending the step. A step the daemon
+  definitely refuses ends its call with the same error and is not sent again.
+  While 64 markers occupy the outbox, the next mutation waits for room. Once
+  the daemon has accepted an error report and the call releases its lease, the
+  daemon can complete recovery for that operation while the mount stays live.
+  Only an unmount or the end of the mount process ends a mount.
 - Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
   advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock
   that loses its authority epoch or expires poisons its associated handles and

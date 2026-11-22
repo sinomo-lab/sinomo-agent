@@ -25,4 +25,6 @@ fuser = { version = "0.17.0", optional = true, default-features = false, feature
 libc = { version = "0.2.186", optional = true }
 
 [dev-dependencies]
+# The handoff tests drive the real outbox against the DFS crate's test daemon.
+sinomo-runtime = { path = "../sinomo-runtime", features = ["dfs-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

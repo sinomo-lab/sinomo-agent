@@ -1128,3 +1128,56 @@ mod metadata_replica_cli_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod operation_budget_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<DfsCliCommand, CliParseError> {
+        parse_dfs_command(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    fn mount_budget(args: &[&str]) -> Option<std::time::Duration> {
+        match parse(args).expect("a valid mount command") {
+            DfsCliCommand::Mount(DfsMountOptions::Mount(options)) => options.operation_budget,
+            other => panic!("expected a mount command, got {other:?}"),
+        }
+    }
+
+    fn nfs_server_budget(args: &[&str]) -> Option<std::time::Duration> {
+        match parse(args).expect("a valid NFS command") {
+            DfsCliCommand::Nfs(DfsNfsCliCommand::Serve(options)) => options.operation_budget,
+            DfsCliCommand::Nfs(DfsNfsCliCommand::Mount(options)) => options.server.operation_budget,
+            other => panic!("expected an NFS server command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mount_parses_its_operation_budget_and_has_none_by_default() {
+        assert_eq!(mount_budget(&["mount", "/mnt/sifs"]), None);
+        assert_eq!(
+            mount_budget(&["mount", "/mnt/sifs", "--operation-budget", "30s"]),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            mount_budget(&["mount", "/mnt/sifs", "--operation-budget", "1500ms"]),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        for invalid in ["0s", "soon", "30"] {
+            assert!(
+                parse(&["mount", "/mnt/sifs", "--operation-budget", invalid]).is_err(),
+                "`{invalid}` is not an operation budget"
+            );
+        }
+    }
+
+    #[test]
+    fn an_nfs_server_parses_its_operation_budget_and_has_none_by_default() {
+        assert_eq!(nfs_server_budget(&["nfs", "serve"]), None);
+        assert_eq!(
+            nfs_server_budget(&["nfs", "serve", "--operation-budget", "2m"]),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert!(parse(&["nfs", "serve", "--operation-budget", "0ms"]).is_err());
+    }
+}

@@ -100,12 +100,26 @@ Standalone data directories execute directly. Clustered exports require the
 local daemon and open a mounted-mutation outbox session using the `Nfs`
 adapter identity. Service construction, export-root discovery, directory
 refreshes, writes, namespace mutations, and attribute changes use the same
-Prepare, Arm, capture, daemon-acknowledgement, and fencing protocol as other
-mounted adapters. An error from the operation itself, an unknown outcome
-included, is that request's answer: the adapter hands what it observed to the
-daemon and the export keeps serving. The export is fenced, and answers
-`NFS3ERR_IO` until it is restarted, only when the daemon does not acknowledge
-a handoff.
+Prepare, Arm, capture, and daemon-acknowledgement protocol as other mounted
+adapters. An error from the operation itself, an unknown outcome included, is
+that request's answer: the adapter hands what it observed to the daemon and
+the export keeps serving.
+
+A serving export is never fenced. A handoff step the daemon has not
+acknowledged is sent again until it is, with no attempt limit: a slow daemon
+is not a lost one. A step the daemon definitely refuses ends its request with
+`NFS3ERR_IO`, is not sent again, and releases what the request held. While the
+outbox is at its marker limit, the next mutation waits for room instead of
+being refused. Lookups, attribute reads, and file reads hand nothing to the
+daemon and are answered while a mutation waits for it.
+
+A request waits for its outcome without a timeout unless the export has an
+operation budget: `--operation-budget <duration>` on `sinomo dfs nfs serve`
+and `sinomo dfs nfs mount`, or `operation_budget` in the
+`storage.sifs-nfs-mount` setting, in the duration format [SIFS](sifs.md)
+describes. A request that reaches its budget returns `NFS3ERR_IO`. The export
+keeps serving and keeps sending the handoff step that request left
+unacknowledged until the daemon acknowledges it.
 
 NFS WRITE requests are bounded to 1 MiB at the adapter and are published to
 DFS immediately using a wait-for-commit write. A successful reply reports

@@ -240,7 +240,6 @@ pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS: usize =
 pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT / 2;
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
-const POSIX_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
 const POSIX_BULK_PARENT_RETRY_ATTEMPTS: usize = 3;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
@@ -255,11 +254,12 @@ pub(crate) const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 const POSIX_WRITE_SERIALIZATION_RESEND_FIRST: Duration = Duration::from_millis(10);
 const POSIX_WRITE_SERIALIZATION_RESEND_MAX: Duration =
     sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-/// Budget for an authoritative path lookup or the best-effort freshness pull
-/// used after that lookup cannot answer. These requests share the serialized
-/// namespace lane with durable mutations, so the budget must tolerate bounded
-/// WAN metadata work already ahead of them.
-const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+/// A read adds no deadline of its own: an authoritative path lookup, a stat
+/// and a content read wait for their answer, a definite error, the network's
+/// verdict or cancellation. The operation deadline its caller installed, if
+/// any, is the only bound in time, and it travels with every request the
+/// read sends.
+const POSIX_READ_NO_BUDGET: Option<Duration> = None;
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 struct PosixBulkLocalWrite<'a> {
@@ -2200,7 +2200,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id.clone(),
                 primary_node_id,
                 requested_paths.iter().cloned().collect(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
             .map_err(DfsPosixError::from)?;
         let mut lookup = PosixBulkAuthoritativeLookup::default();

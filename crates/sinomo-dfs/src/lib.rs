@@ -16,7 +16,8 @@ pub use daemon_client::{
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT, DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
-    DaemonDfsApiClientExt, DaemonDfsMountedMutationHandoffClient, DaemonDfsPeerTransport,
+    DaemonDfsApiClientExt, DaemonDfsMountedMutationHandoffClient,
+    DaemonDfsMountedMutationHandoffError, DaemonDfsPeerTransport,
 };
 
 extern crate self as sinomo_dfs;
@@ -149,6 +150,7 @@ mod metadata_tombstone;
 mod model;
 mod module_surface;
 mod mount_config;
+mod mounted_mutation_handoff;
 mod mounted_mutation_outbox;
 mod mounted_sifs;
 mod namespace;
@@ -714,6 +716,13 @@ pub use mount_config::{
     sifs_mount_settings_module_id, sifs_mount_status_config_definition,
     sifs_mount_status_config_definition_for_module,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use mounted_mutation_handoff::MountedSifsHandoffTestDaemon;
+pub use mounted_mutation_handoff::{
+    MOUNTED_SIFS_HANDOFF_RESEND_FIRST, MountedSifsHandoffDaemon, MountedSifsHandoffEnded,
+    MountedSifsHandoffStepError, MountedSifsHandoffWake, MountedSifsMutationHandoff,
+    MountedSifsUnfinishedHandoff, mounted_sifs_handoff_until_acknowledged,
+};
 pub use mounted_mutation_outbox::{
     MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS,
     MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES,
@@ -727,14 +736,16 @@ pub use mounted_mutation_outbox::{
     MountedSifsMutationOutboxCursorRecoveryGuard,
     MountedSifsMutationOutboxCursorRecoveryInspection, MountedSifsMutationOutboxMarker,
     MountedSifsMutationOutboxPhase, MountedSifsMutationOutboxStatus,
-    MountedSifsMutationOutboxStore, MountedSifsMutationRecoveryClaim,
+    MountedSifsMutationOutboxStore, MountedSifsMutationPrepareError,
+    MountedSifsMutationRecoveryClaim,
     MountedSifsMutationRecoveryKind, MountedSifsMutationRecoveryReceipt,
     inspect_mounted_sifs_mutation_outbox_for_cursor_recovery,
 };
 pub use mounted_sifs::{
     MountedSifsCall, MountedSifsContentReadContext, MountedSifsControlPlaneKvClient,
-    MountedSifsMutationReport, MountedSifsService, MountedSifsServiceGuard,
-    OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
+    MountedSifsLock, MountedSifsLockGuard, MountedSifsMutationReport, MountedSifsService,
+    MountedSifsServiceGuard, OpenedMountedSifsService,
+    discover_mounted_sifs_content_replica_candidates,
     discover_mounted_sifs_content_replica_candidates_with_control_plane, open_mounted_sifs_service,
     open_mounted_sifs_service_with_cancellation, open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,

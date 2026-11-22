@@ -20,24 +20,23 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROOT_INO: u64 = 1;
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 const LOCK_RENEW_INTERVAL: Duration = Duration::from_secs(5);
-const BLOCKING_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const FUSE_LOCK_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-const FUSE_LOCK_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// A blocking lock waiter re-sends its queued acquire on this interval. The
+/// shard primary announces no grant to a waiting requester, so the timer is
+/// what asks again; it never ends the wait.
+const BLOCKING_LOCK_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKED_IO_MIN_LEASE: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_LOCK_KEYS_PER_MOUNT: usize = 2;
 const FUSE_CREATE_RACE_RETRY_ROUNDS: usize = 4;
 const MIN_FUSE_READ_WORKERS: usize = 4;
 const MAX_FUSE_READ_WORKERS: usize = 16;
 const FUSE_READ_QUEUE_DEPTH_PER_WORKER: usize = 4;
-const FUSE_FATAL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 // Bound acknowledged-but-not-yet-published data per inode. Ordinary
 // Linux FUSE writes arrive as much smaller kernel chunks, so this keeps a
 // sequential transfer to one canonical DFS publication without allowing an
@@ -45,198 +44,11 @@ const FUSE_FATAL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DIRTY_WRITE_BYTES_PER_INODE: usize = 64 * 1024 * 1024;
 static NEXT_MOUNT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 type SifsService = dfs::MountedSifsService;
+/// A mount's lock: its waiters wait for the holder's release, within the
+/// syscall's deadline when the mount has an operation budget.
+type MountLock<T> = dfs::MountedSifsLock<T>;
+type MountLockGuard<'a, T> = dfs::MountedSifsLockGuard<'a, T>;
 type FuseReadJob = Box<dyn FnOnce() + Send + 'static>;
-
-#[derive(Debug, Default)]
-struct FuseMountHealthState {
-    fatal_error: Option<String>,
-    unmount_error: Option<String>,
-    unmount_completed: bool,
-}
-
-/// Shared fatal lifecycle edge between FUSE callbacks and the owning mount
-/// handle. A mounted-mutation handoff the daemon did not acknowledge cancels
-/// DFS work immediately and signals a pre-started helper worker, so even a
-/// foreground `mount2` cannot remain alive forever in a
-/// gated-but-reported-healthy state. An operation's own outcome, an unknown
-/// one included, never retires the mount.
-pub(crate) struct FuseMountHealth {
-    state: Arc<Mutex<FuseMountHealthState>>,
-    unmount_completed: Arc<Condvar>,
-    cancellation: dfs::DfsCancellationFlag,
-    fatal_unmount: SyncSender<()>,
-}
-
-impl std::fmt::Debug for FuseMountHealth {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FuseMountHealth")
-            .field("fatal_error", &self.fatal_error())
-            .finish_non_exhaustive()
-    }
-}
-
-impl FuseMountHealth {
-    pub(crate) fn new(
-        mount_point: PathBuf,
-        mount_helper: PathBuf,
-        cancellation: dfs::DfsCancellationFlag,
-    ) -> io::Result<Arc<Self>> {
-        let state = Arc::new(Mutex::new(FuseMountHealthState::default()));
-        let unmount_completed = Arc::new(Condvar::new());
-        let (fatal_unmount, receiver) = mpsc::sync_channel(1);
-        let worker_state = Arc::clone(&state);
-        let worker_unmount_completed = Arc::clone(&unmount_completed);
-        thread::Builder::new()
-            .name("sinomo-fuse-fatal-unmount".to_string())
-            .spawn(move || {
-                if receiver.recv().is_err() {
-                    return;
-                }
-                let result = run_fuse_fatal_unmount(&mount_helper, &mount_point);
-                let mut state = worker_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(error) = result {
-                    state.unmount_error = Some(error);
-                }
-                state.unmount_completed = true;
-                drop(state);
-                worker_unmount_completed.notify_all();
-            })?;
-        Ok(Arc::new(Self {
-            state,
-            unmount_completed,
-            cancellation,
-            fatal_unmount,
-        }))
-    }
-
-    // No filesystem callback calls this: an operation's outcome and an
-    // unacknowledged handoff both leave the mount serving.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn fail(&self, detail: impl Into<String>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.fatal_error.is_some() {
-            return;
-        }
-        state.fatal_error = Some(detail.into());
-        drop(state);
-        self.cancellation.cancel();
-        if let Err(error) = self.fatal_unmount.try_send(()) {
-            if matches!(error, mpsc::TrySendError::Full(())) {
-                return;
-            }
-            let detail = "fatal FUSE unmount worker exited before the request".to_string();
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.unmount_error.get_or_insert(detail);
-            state.unmount_completed = true;
-            drop(state);
-            self.unmount_completed.notify_all();
-        }
-    }
-
-    pub(crate) fn fatal_error(&self) -> Option<String> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.fatal_error.as_ref().map(|fatal| {
-            state
-                .unmount_error
-                .as_ref()
-                .map_or_else(|| fatal.clone(), |error| format!("{fatal}; {error}"))
-        })
-    }
-
-    pub(crate) fn wait_for_fatal_unmount(
-        &self,
-        timeout: Duration,
-    ) -> std::result::Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.fatal_error.is_none() {
-            return Err("fatal FUSE unmount was not requested".to_string());
-        }
-        while !state.unmount_completed {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "fatal FUSE unmount did not complete within {timeout:?}"
-                ));
-            }
-            let (next, timed_out) = self
-                .unmount_completed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            if timed_out.timed_out() && !state.unmount_completed {
-                return Err(format!(
-                    "fatal FUSE unmount did not complete within {timeout:?}"
-                ));
-            }
-        }
-        match state.unmount_error.as_ref() {
-            Some(error) => Err(error.clone()),
-            None => Ok(()),
-        }
-    }
-}
-
-fn run_fuse_fatal_unmount(
-    mount_helper: &Path,
-    mount_point: &Path,
-) -> std::result::Result<(), String> {
-    let mut child = Command::new(mount_helper)
-        .arg("-u")
-        .arg("-z")
-        .arg(mount_point)
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "start fatal FUSE unmount with {}: {error}",
-                mount_helper.display()
-            )
-        })?;
-    let deadline = Instant::now() + FUSE_FATAL_UNMOUNT_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                return Err(format!(
-                    "fatal FUSE unmount with {} exited with {status}",
-                    mount_helper.display()
-                ));
-            }
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                return Err(format!(
-                    "fatal FUSE unmount with {} exceeded {:?}",
-                    mount_helper.display(),
-                    FUSE_FATAL_UNMOUNT_TIMEOUT
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "observe fatal FUSE unmount with {}: {error}",
-                    mount_helper.display()
-                ));
-            }
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FuseMountedMutationOperation {
@@ -378,6 +190,15 @@ impl From<DfsPosixError> for FuseMountedMutationError {
     }
 }
 
+/// Why one attempt at a handoff step produced no acknowledgement: a definite
+/// refusal, or no answer yet.
+type FuseHandoffStepError = dfs::MountedSifsHandoffStepError;
+/// How sending a handoff step until its acknowledgement ended without one.
+type FuseHandoffEnded = dfs::MountedSifsHandoffEnded;
+/// What is left of a mounted-mutation handoff whose syscall returned before
+/// the daemon acknowledged it.
+type FuseUnfinishedHandoff = dfs::MountedSifsUnfinishedHandoff;
+
 trait FuseMountedMutationCoordinator {
     type Admission<'a>
     where
@@ -390,31 +211,53 @@ trait FuseMountedMutationCoordinator {
     fn is_gated(&self) -> bool;
     fn gate_before_mount(&self);
     fn retire_gated_session(&self) -> std::result::Result<(), ()>;
+    /// One attempt at a Prepared marker. A full outbox is not a refusal: the
+    /// attempt is made again once a marker is released.
     fn prepare(
         &self,
         operation: FuseMountedMutationOperation,
         stable_operation_id: Option<String>,
-    ) -> std::result::Result<Self::Lease<'_>, ()>;
+    ) -> std::result::Result<Self::Lease<'_>, FuseHandoffStepError>;
     fn arm(
         &self,
         lease: &mut Self::Lease<'_>,
-    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()>;
+    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, FuseHandoffStepError>;
     /// Send Arm under `arm_request_id`. Sending it again under the same id
     /// is exact; the daemon acknowledges the one transition.
     fn arm_as(
         &self,
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
-    ) -> std::result::Result<(), ()> {
+    ) -> std::result::Result<(), FuseHandoffStepError> {
         let _ = arm_request_id;
         self.arm(lease).map(drop)
     }
+    /// Abort a marker whose Arm was definitely refused: its operation never
+    /// ran.
+    fn abort_unstarted(
+        &self,
+        lease: &Self::Lease<'_>,
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        let _ = lease;
+        Ok(())
+    }
+    /// The count of this mount's handoff events, read before an attempt so
+    /// an event during it ends the following pause.
+    fn handoff_events(&self) -> u64 {
+        0
+    }
     /// Wait until a handoff step the daemon did not acknowledge is due to be
-    /// sent again. `false` ends the waiting: the syscall's deadline passed or
-    /// the mount is closing. The interval only re-sends; nothing counts
+    /// sent again: one re-send interval, ended sooner by a handoff event after
+    /// `seen_events`. `false` ends the waiting: the syscall's deadline passed
+    /// or the mount is closing. The interval only re-sends; nothing counts
     /// attempts.
-    fn pause_before_resend(&self, attempt: u32, deadline: Option<Instant>) -> bool {
-        let _ = (attempt, deadline);
+    fn pause_before_resend(
+        &self,
+        seen_events: u64,
+        attempt: u32,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let _ = (seen_events, attempt, deadline);
         false
     }
     /// Keep sending a step the daemon has not acknowledged after its syscall
@@ -422,265 +265,79 @@ trait FuseMountedMutationCoordinator {
     fn finish_later(&self, lease: Self::Lease<'_>, step: FuseUnfinishedHandoff) {
         drop((lease, step));
     }
+    /// Give up a marker whose step the daemon definitely refused. The lease
+    /// ends here; the daemon's recovery owns the marker.
+    fn release_refused(&self, lease: Self::Lease<'_>, detail: &str) {
+        let _ = detail;
+        drop(lease);
+    }
     fn persist_captured(
         &self,
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         captured_work: &dfs::MountedSifsMutationCapturedWork,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn persist_unknown(
         &self,
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         observation: &dfs::MountedSifsMutationErrorObservation,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn persist_proven_no_write(
         &self,
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn commit_captured(
         &self,
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         captured_work: &dfs::MountedSifsMutationCapturedWork,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn commit_unknown(
         &self,
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         observation: &dfs::MountedSifsMutationErrorObservation,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn commit_proven_no_write(
         &self,
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
-    ) -> std::result::Result<(), ()>;
+    ) -> std::result::Result<(), FuseHandoffStepError>;
     fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()>;
 }
 
-/// What is left of a mounted-mutation handoff whose syscall returned before
-/// the daemon acknowledged it.
-#[derive(Clone, Debug)]
-enum FuseUnfinishedHandoff {
-    /// Arm was sent and not acknowledged; the operation never entered the
-    /// service. Once Arm is acknowledged the marker is closed as no-write.
-    ArmedWithoutEntry {
-        arm_request_id: dfs::MountedSifsMutationArmRequestId,
-    },
-    Captured {
-        arm_request_id: dfs::MountedSifsMutationArmRequestId,
-        captured_work: dfs::MountedSifsMutationCapturedWork,
-    },
-    Unknown {
-        arm_request_id: dfs::MountedSifsMutationArmRequestId,
-        observation: dfs::MountedSifsMutationErrorObservation,
-    },
-    NoWrite {
-        arm_request_id: dfs::MountedSifsMutationArmRequestId,
-        proof_code: &'static str,
-    },
-}
-
-/// First interval before a handoff step is sent again; it doubles to the
-/// handoff client's per-attempt bound. The timer only re-sends.
-const FUSE_HANDOFF_RESEND_FIRST: Duration = Duration::from_millis(250);
-
-type PendingFuseHandoff = (
-    dfs::MountedSifsMutationLease<'static>,
-    FuseUnfinishedHandoff,
-);
-
+/// The FUSE mount's end of the mounted-mutation handoff. The re-send of
+/// unacknowledged steps, the outbox session and the re-sender that outlives a
+/// syscall are the shared [`dfs::MountedSifsMutationHandoff`]; this adds the
+/// mount's mutation lane and its mount-open gate.
 #[derive(Debug)]
 struct FuseMountedMutationHandoff {
-    store: dfs::MountedSifsMutationOutboxStore,
-    session: Option<dfs::MountedSifsHostMountSessionLease>,
-    client: sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient,
-    /// Ends every wait of this mount's handoff when the mount closes.
-    closing: dfs::DfsCancellationFlag,
-    resender: mpsc::Sender<PendingFuseHandoff>,
+    handoff: dfs::MountedSifsMutationHandoff,
     gated: AtomicBool,
-    mutation_lane: Mutex<()>,
+    mutation_lane: MountLock<()>,
 }
 
 impl FuseMountedMutationHandoff {
-    /// Create the worker before exposing the mount. Every queued item owns an
-    /// outbox lease, so the durable marker limit also bounds this queue.
-    fn start_resender(
-        client: sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient,
-        closing: dfs::DfsCancellationFlag,
-    ) -> io::Result<mpsc::Sender<PendingFuseHandoff>> {
-        let (sender, receiver) = mpsc::channel::<PendingFuseHandoff>();
-        thread::Builder::new()
-            .name("sinomo-fuse-handoff-resend".into())
-            .spawn(move || {
-                let mut pending: Vec<(Instant, u32, PendingFuseHandoff)> = Vec::new();
-                while !closing.is_cancelled() {
-                    let next = pending
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, item)| item.0)
-                        .map(|(i, item)| (i, item.0));
-                    let received = match next {
-                        Some((index, due)) if due <= Instant::now() => {
-                            let (_, attempt, (mut lease, mut step)) = pending.swap_remove(index);
-                            if Self::send_step(&client, &mut lease, &mut step).is_ok() {
-                                let _ = lease.release_after_daemon_ack();
-                            } else {
-                                pending.push((
-                                    Instant::now() + Self::resend_delay(attempt),
-                                    attempt.saturating_add(1),
-                                    (lease, step),
-                                ));
-                            }
-                            continue;
-                        }
-                        Some((_, due)) => match receiver
-                            .recv_timeout(due.saturating_duration_since(Instant::now()))
-                        {
-                            Ok(item) => item,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        },
-                        None => match receiver.recv() {
-                            Ok(item) => item,
-                            Err(_) => break,
-                        },
-                    };
-                    pending.push((Instant::now(), 0, received));
-                }
-            })?;
-        Ok(sender)
-    }
-
-    fn resend_delay(attempt: u32) -> Duration {
-        FUSE_HANDOFF_RESEND_FIRST
-            .saturating_mul(1 << attempt.min(16))
-            .min(sinomo_runtime::dfs::DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT)
+    fn new(handoff: dfs::MountedSifsMutationHandoff) -> Self {
+        Self {
+            handoff,
+            gated: AtomicBool::new(false),
+            mutation_lane: MountLock::new(()),
+        }
     }
 
     fn close_clean(&mut self) {
-        let Some(session) = self.session.take() else {
-            return;
-        };
-        if session.close_clean().is_err() {
+        if self.handoff.close_clean().is_err() {
             self.gated.store(true, Ordering::Release);
         }
     }
 
-    /// One attempt at a post-Arm step.
-    fn send_step(
-        client: &sinomo_runtime::dfs::DaemonDfsMountedMutationHandoffClient,
-        lease: &mut dfs::MountedSifsMutationLease<'_>,
-        step: &mut FuseUnfinishedHandoff,
-    ) -> std::result::Result<(), ()> {
-        let marker = lease.marker().clone();
-        // A syscall may leave its worker either before or after the local
-        // evidence reached disk. Persist before asking Main to accept it.
-        if matches!(
-            marker.phase,
-            dfs::MountedSifsMutationOutboxPhase::Prepared
-                | dfs::MountedSifsMutationOutboxPhase::Armed { .. }
-        ) {
-            match &*step {
-                FuseUnfinishedHandoff::Captured {
-                    arm_request_id,
-                    captured_work,
-                } => lease
-                    .record_captured_success(arm_request_id, captured_work.clone())
-                    .map_err(|_| ())?,
-                FuseUnfinishedHandoff::Unknown {
-                    arm_request_id,
-                    observation,
-                } => lease
-                    .record_unknown_after_error(arm_request_id, observation.clone())
-                    .map_err(|_| ())?,
-                FuseUnfinishedHandoff::NoWrite {
-                    arm_request_id,
-                    proof_code,
-                } => lease
-                    .record_proven_no_write(arm_request_id, *proof_code)
-                    .map_err(|_| ())?,
-                FuseUnfinishedHandoff::ArmedWithoutEntry { .. } => {}
-            }
-        }
-        match step {
-            FuseUnfinishedHandoff::ArmedWithoutEntry { arm_request_id } => {
-                client
-                    .arm(
-                        marker.marker_id.clone(),
-                        marker.marker_nonce.clone(),
-                        arm_request_id.clone(),
-                    )
-                    .map_err(|_| ())?;
-                let proof_code = "fuse-arm-acknowledged-after-its-syscall";
-                *step = FuseUnfinishedHandoff::NoWrite {
-                    arm_request_id: arm_request_id.clone(),
-                    proof_code,
-                };
-                Self::send_step(client, lease, step)
-            }
-            FuseUnfinishedHandoff::Captured {
-                arm_request_id,
-                captured_work,
-            } => client
-                .commit_applied(
-                    marker.marker_id,
-                    marker.marker_nonce,
-                    arm_request_id.clone(),
-                    captured_work.clone(),
-                )
-                .map(drop)
-                .map_err(|_| ()),
-            FuseUnfinishedHandoff::Unknown {
-                arm_request_id,
-                observation,
-            } => client
-                .commit_unknown(
-                    marker.marker_id,
-                    marker.marker_nonce,
-                    arm_request_id.clone(),
-                    observation.clone(),
-                )
-                .map(drop)
-                .map_err(|_| ()),
-            FuseUnfinishedHandoff::NoWrite {
-                arm_request_id,
-                proof_code,
-            } => client
-                .prove_no_write(
-                    marker.marker_id,
-                    marker.marker_nonce,
-                    arm_request_id.clone(),
-                    *proof_code,
-                )
-                .map(drop)
-                .map_err(|_| ()),
-        }
-    }
-
-    /// Sleep one re-send interval. `false` once the mount is closing or
-    /// `deadline` has passed.
-    fn pause(closing: &dfs::DfsCancellationFlag, attempt: u32, deadline: Option<Instant>) -> bool {
-        if closing.is_cancelled() {
-            return false;
-        }
-        let mut interval = Self::resend_delay(attempt);
-        if let Some(deadline) = deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            interval = interval.min(remaining);
-        }
-        thread::sleep(interval);
-        !closing.is_cancelled() && deadline.is_none_or(|at| Instant::now() < at)
-    }
-
     fn retire_gated_session(&self) -> std::result::Result<(), ()> {
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.handoff.session() else {
             return Ok(());
         };
         session.close_clean_shared().map_err(|_| ())
@@ -694,7 +351,7 @@ impl Drop for FuseMountedMutationHandoff {
 }
 
 impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
-    type Admission<'a> = MutexGuard<'a, ()>;
+    type Admission<'a> = MountLockGuard<'a, ()>;
     type Lease<'a> = dfs::MountedSifsMutationLease<'a>;
 
     fn admit(&self) -> std::result::Result<Self::Admission<'_>, ()> {
@@ -717,17 +374,14 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         &self,
         operation: FuseMountedMutationOperation,
         stable_operation_id: Option<String>,
-    ) -> std::result::Result<Self::Lease<'_>, ()> {
-        let session = self.session.as_ref().ok_or(())?;
-        self.store
-            .prepare(session, stable_operation_id, operation.label())
-            .map_err(|_| ())
+    ) -> std::result::Result<Self::Lease<'_>, FuseHandoffStepError> {
+        self.handoff.prepare(operation.label(), stable_operation_id)
     }
 
     fn arm(
         &self,
         lease: &mut Self::Lease<'_>,
-    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, FuseHandoffStepError> {
         let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
         self.arm_as(lease, &arm_request_id)?;
         Ok(arm_request_id)
@@ -737,29 +391,37 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         &self,
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
-    ) -> std::result::Result<(), ()> {
-        let marker = lease.marker();
-        self.client
-            .arm(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-            )
-            .map(drop)
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff.arm(lease, arm_request_id)
     }
 
-    fn pause_before_resend(&self, attempt: u32, deadline: Option<Instant>) -> bool {
-        Self::pause(&self.closing, attempt, deadline)
+    fn abort_unstarted(
+        &self,
+        lease: &Self::Lease<'_>,
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff.abort_unstarted(lease)
+    }
+
+    fn handoff_events(&self) -> u64 {
+        self.handoff.wake().events()
+    }
+
+    fn pause_before_resend(
+        &self,
+        seen_events: u64,
+        attempt: u32,
+        deadline: Option<Instant>,
+    ) -> bool {
+        self.handoff
+            .pause_before_resend(seen_events, attempt, deadline)
     }
 
     fn finish_later(&self, lease: Self::Lease<'_>, step: FuseUnfinishedHandoff) {
-        // The marker stays this mount's: only its live operation lease lets
-        // the daemon accept the step, so a re-sender keeps the lease until
-        // the daemon acknowledges or the mount closes.
-        if self.resender.send((lease.into_owned(), step)).is_err() && !self.closing.is_cancelled() {
-            eprintln!("sinomo-dfs-fuse: mounted-mutation handoff worker exited");
-        }
+        self.handoff.finish_later(lease, step);
+    }
+
+    fn release_refused(&self, lease: Self::Lease<'_>, detail: &str) {
+        self.handoff.release_refused(lease, detail);
     }
 
     fn persist_captured(
@@ -767,10 +429,9 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         captured_work: &dfs::MountedSifsMutationCapturedWork,
-    ) -> std::result::Result<(), ()> {
-        lease
-            .record_captured_success(arm_request_id, captured_work.clone())
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff
+            .persist_captured(lease, arm_request_id, captured_work)
     }
 
     fn persist_unknown(
@@ -778,10 +439,10 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         observation: &dfs::MountedSifsMutationErrorObservation,
-    ) -> std::result::Result<(), ()> {
-        let persisted = lease
-            .record_unknown_after_error(arm_request_id, observation.clone())
-            .map_err(|_| ());
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        let persisted = self
+            .handoff
+            .persist_unknown(lease, arm_request_id, observation);
         // The existing durability attempt precedes diagnostics. Keep its result
         // even when stderr is unavailable, and expose no command or nonce data.
         use std::io::Write as _;
@@ -804,10 +465,9 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &mut Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
-    ) -> std::result::Result<(), ()> {
-        lease
-            .record_proven_no_write(arm_request_id, proof_code)
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff
+            .persist_proven_no_write(lease, arm_request_id, proof_code)
     }
 
     fn commit_captured(
@@ -815,17 +475,9 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         captured_work: &dfs::MountedSifsMutationCapturedWork,
-    ) -> std::result::Result<(), ()> {
-        let marker = lease.marker();
-        self.client
-            .commit_applied(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                captured_work.clone(),
-            )
-            .map(drop)
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff
+            .commit_captured(lease, arm_request_id, captured_work)
     }
 
     fn commit_unknown(
@@ -833,17 +485,9 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         observation: &dfs::MountedSifsMutationErrorObservation,
-    ) -> std::result::Result<(), ()> {
-        let marker = lease.marker();
-        self.client
-            .commit_unknown(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                observation.clone(),
-            )
-            .map(drop)
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff
+            .commit_unknown(lease, arm_request_id, observation)
     }
 
     fn commit_proven_no_write(
@@ -851,21 +495,13 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         lease: &Self::Lease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
-    ) -> std::result::Result<(), ()> {
-        let marker = lease.marker();
-        self.client
-            .prove_no_write(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                proof_code,
-            )
-            .map(drop)
-            .map_err(|_| ())
+    ) -> std::result::Result<(), FuseHandoffStepError> {
+        self.handoff
+            .commit_proven_no_write(lease, arm_request_id, proof_code)
     }
 
     fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()> {
-        lease.release_after_daemon_ack().map_err(|_| ())
+        self.handoff.release_after_daemon_ack(lease).map_err(|_| ())
     }
 }
 
@@ -889,33 +525,29 @@ fn prepare_fuse_clustered_mount_handoff_with<C, H, E>(
     open_host_session(client)
 }
 
-/// Send one handoff step until the daemon acknowledges it. A step the daemon
-/// did not acknowledge is sent again after an interval that doubles to the
-/// handoff client's per-attempt bound; nothing counts attempts. `Err` means
-/// the syscall's deadline passed or the mount is closing first.
+/// Send one handoff step until the daemon acknowledges it. A step that got no
+/// answer is sent again after an interval that doubles to the handoff
+/// client's per-attempt bound; a handoff event on the mount ends the interval
+/// sooner, and nothing counts attempts. It ends without an acknowledgement
+/// only when the daemon definitely refused the step, or when the syscall's
+/// deadline passed or the mount is closing first.
 fn until_acknowledged<C: FuseMountedMutationCoordinator>(
     coordinator: &C,
     deadline: Option<Instant>,
-    mut step: impl FnMut() -> std::result::Result<(), ()>,
-) -> std::result::Result<(), ()> {
-    let mut attempt = 0;
-    loop {
-        if deadline.is_some_and(|at| Instant::now() >= at) {
-            return Err(());
-        }
-        if step().is_ok() {
-            return Ok(());
-        }
-        if !coordinator.pause_before_resend(attempt, deadline) {
-            return Err(());
-        }
-        attempt = attempt.saturating_add(1);
-    }
+    step: impl FnMut() -> std::result::Result<(), FuseHandoffStepError>,
+) -> std::result::Result<(), FuseHandoffEnded> {
+    dfs::mounted_sifs_handoff_until_acknowledged(
+        || coordinator.handoff_events(),
+        |seen_events, attempt| coordinator.pause_before_resend(seen_events, attempt, deadline),
+        deadline,
+        step,
+    )
 }
 
 /// Close an armed operation that never wrote. A daemon that has not
 /// acknowledged by the syscall's deadline is sent the proof again after the
-/// syscall returns; the operation's own answer does not depend on it.
+/// syscall returns; the operation's own answer does not depend on it. A
+/// refused proof stays in the outbox as the adapter recorded it.
 fn finish_proven_no_write<C: FuseMountedMutationCoordinator>(
     coordinator: &C,
     mut lease: C::Lease<'_>,
@@ -924,27 +556,52 @@ fn finish_proven_no_write<C: FuseMountedMutationCoordinator>(
     deadline: Option<Instant>,
 ) -> std::result::Result<(), libc::c_int> {
     let mut persisted = false;
-    if until_acknowledged(coordinator, deadline, || {
+    match until_acknowledged(coordinator, deadline, || {
         if !persisted {
             coordinator.persist_proven_no_write(&mut lease, arm_request_id, proof_code)?;
             persisted = true;
         }
         coordinator.commit_proven_no_write(&lease, arm_request_id, proof_code)
-    })
-    .is_err()
-    {
-        coordinator.finish_later(
-            lease,
-            FuseUnfinishedHandoff::NoWrite {
-                arm_request_id: arm_request_id.clone(),
-                proof_code,
-            },
-        );
-        return Err(libc::EIO);
+    }) {
+        Ok(()) => coordinator
+            .release_after_daemon_ack(lease)
+            .map_err(|()| libc::EIO),
+        Err(FuseHandoffEnded::Left) => {
+            coordinator.finish_later(
+                lease,
+                FuseUnfinishedHandoff::NoWrite {
+                    arm_request_id: arm_request_id.clone(),
+                    proof_code: proof_code.to_string(),
+                },
+            );
+            Err(libc::EIO)
+        }
+        Err(FuseHandoffEnded::Rejected(detail)) => {
+            coordinator.release_refused(lease, &detail);
+            Err(libc::EIO)
+        }
     }
-    coordinator
-        .release_after_daemon_ack(lease)
-        .map_err(|()| libc::EIO)
+}
+
+/// Close a marker whose Arm the daemon definitely refused. Its operation
+/// never ran, so the marker is aborted as unstarted; the abort is sent until
+/// the daemon answers, and after the syscall's deadline by the re-sender.
+fn release_unstarted<C: FuseMountedMutationCoordinator>(
+    coordinator: &C,
+    lease: C::Lease<'_>,
+    deadline: Option<Instant>,
+) {
+    match until_acknowledged(coordinator, deadline, || {
+        coordinator.abort_unstarted(&lease)
+    }) {
+        Ok(()) => {
+            let _ = coordinator.release_after_daemon_ack(lease);
+        }
+        Err(FuseHandoffEnded::Left) => {
+            coordinator.finish_later(lease, FuseUnfinishedHandoff::Unstarted);
+        }
+        Err(FuseHandoffEnded::Rejected(detail)) => coordinator.release_refused(lease, &detail),
+    }
 }
 
 #[derive(Debug)]
@@ -985,6 +642,7 @@ fn finish_fuse_mount_open_unknown<C: FuseMountedMutationCoordinator>(
     coordinator
         .persist_unknown(&mut lease, arm_request_id, &observation)
         .and_then(|_| coordinator.commit_unknown(&lease, arm_request_id, &observation))
+        .map_err(|_| ())
         .and_then(|_| coordinator.release_after_daemon_ack(lease))
 }
 
@@ -1019,7 +677,7 @@ where
     }
     let mut lease = match coordinator.prepare(FuseMountedMutationOperation::MountOpen, None) {
         Ok(lease) => lease,
-        Err(()) => {
+        Err(_) => {
             coordinator.gate_before_mount();
             let _ = coordinator.retire_gated_session();
             return Err(FuseMountOpenHandoffError::Handoff {
@@ -1030,7 +688,7 @@ where
     };
     let arm_request_id = match coordinator.arm(&mut lease) {
         Ok(arm_request_id) => arm_request_id,
-        Err(()) => {
+        Err(_) => {
             coordinator.gate_before_mount();
             let _ = coordinator.retire_gated_session();
             return Err(FuseMountOpenHandoffError::Handoff {
@@ -1066,6 +724,7 @@ where
     if coordinator
         .persist_captured(&mut lease, &arm_request_id, &captured_work)
         .and_then(|_| coordinator.commit_captured(&lease, &arm_request_id, &captured_work))
+        .map_err(|_| ())
         .and_then(|_| coordinator.release_after_daemon_ack(lease))
         .is_err()
     {
@@ -1081,7 +740,7 @@ where
 
 fn run_fuse_mounted_mutation_with<C, S, R>(
     coordinator: &C,
-    service: &Mutex<S>,
+    service: &MountLock<S>,
     operation: FuseMountedMutationOperation,
     mutation: impl FnOnce(
         &mut S,
@@ -1099,7 +758,7 @@ where
 /// bounds its waits for the daemon as well as its DFS work.
 fn run_fuse_mounted_mutation_until<C, S, R>(
     coordinator: &C,
-    service: &Mutex<S>,
+    service: &MountLock<S>,
     operation: FuseMountedMutationOperation,
     deadline: Option<Instant>,
     mutation: impl FnOnce(
@@ -1126,12 +785,12 @@ where
 
 fn run_fuse_mounted_mutation_with_lock<'service, C, S, R>(
     coordinator: &C,
-    service: &'service Mutex<S>,
+    service: &'service MountLock<S>,
     operation: FuseMountedMutationOperation,
     stable_operation_id: Option<String>,
     lock_service: impl FnOnce(
-        &'service Mutex<S>,
-    ) -> std::result::Result<MutexGuard<'service, S>, libc::c_int>,
+        &'service MountLock<S>,
+    ) -> std::result::Result<MountLockGuard<'service, S>, libc::c_int>,
     mutation: impl FnOnce(
         &mut S,
     ) -> dfs::MountedSifsMutationReport<
@@ -1156,13 +815,13 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_fuse_mounted_mutation_with_lock_and_preflight<'service, C, S, R>(
     coordinator: &C,
-    service: &'service Mutex<S>,
+    service: &'service MountLock<S>,
     operation: FuseMountedMutationOperation,
     stable_operation_id: Option<String>,
     deadline: Option<Instant>,
     lock_service: impl FnOnce(
-        &'service Mutex<S>,
-    ) -> std::result::Result<MutexGuard<'service, S>, libc::c_int>,
+        &'service MountLock<S>,
+    ) -> std::result::Result<MountLockGuard<'service, S>, libc::c_int>,
     preflight: impl FnOnce(&mut S) -> std::result::Result<(), FuseMountedMutationPreflightError>,
     mutation: impl FnOnce(
         &mut S,
@@ -1175,15 +834,16 @@ where
 {
     // Admission remains held while the service lane is deliberately dropped
     // for the daemon RPC, so mutations hand their work to the daemon in the
-    // order they ran. Nothing here retires the mount: a step the daemon did
-    // not acknowledge is sent again, and the outbox's marker limit holds the
-    // next mutation back until there is room.
+    // order they ran. Nothing here retires the mount: a step the daemon has
+    // not answered is sent again, a step it refused ends this call and
+    // releases the marker, and the outbox's marker limit holds the next
+    // mutation back until there is room.
     let _admission = coordinator.admit().map_err(|()| libc::EIO)?;
     if coordinator.is_gated() {
         return Err(libc::EIO);
     }
-    // Prepare fails while the outbox is full or being classified: wait for
-    // room instead of refusing.
+    // A full outbox, or one still being classified, is not a refusal: wait
+    // for a marker's release instead.
     let mut prepared = None;
     let mut stable_operation_id = Some(stable_operation_id);
     if until_acknowledged(coordinator, deadline, || {
@@ -1193,30 +853,37 @@ where
                 prepared = Some(lease);
                 Ok(())
             }
-            Err(()) => {
+            Err(error) => {
                 stable_operation_id = Some(id);
-                Err(())
+                Err(error)
             }
         }
     })
     .is_err()
     {
+        // Nothing is held yet: no marker was prepared.
         return Err(libc::EIO);
     }
     let mut lease = prepared.expect("an acknowledged Prepare returned its lease");
     let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
-    if until_acknowledged(coordinator, deadline, || {
+    match until_acknowledged(coordinator, deadline, || {
         coordinator.arm_as(&mut lease, &arm_request_id)
-    })
-    .is_err()
-    {
-        // The daemon may hold the Arm. The operation never enters the
-        // service; the marker is closed once the daemon answers.
-        coordinator.finish_later(
-            lease,
-            FuseUnfinishedHandoff::ArmedWithoutEntry { arm_request_id },
-        );
-        return Err(libc::EIO);
+    }) {
+        Ok(()) => {}
+        Err(FuseHandoffEnded::Left) => {
+            // The daemon may hold the Arm. The operation never enters the
+            // service; the marker is closed once the daemon answers.
+            coordinator.finish_later(
+                lease,
+                FuseUnfinishedHandoff::ArmedWithoutEntry { arm_request_id },
+            );
+            return Err(libc::EIO);
+        }
+        Err(FuseHandoffEnded::Rejected(_)) => {
+            // The daemon refused the Arm, so the operation never runs.
+            release_unstarted(coordinator, lease, deadline);
+            return Err(libc::EIO);
+        }
     }
     let mut service = match lock_service(service) {
         Ok(service) => service,
@@ -1251,32 +918,41 @@ where
     match report.outcome {
         Ok(value) => {
             let mut persisted = false;
-            if until_acknowledged(coordinator, deadline, || {
+            match until_acknowledged(coordinator, deadline, || {
                 if !persisted {
                     coordinator.persist_captured(&mut lease, &arm_request_id, &captured_work)?;
                     persisted = true;
                 }
                 coordinator.commit_captured(&lease, &arm_request_id, &captured_work)
-            })
-            .is_err()
-            {
-                // The change is made and its work is durable in the outbox;
-                // the daemon has not accepted it within the syscall's
-                // deadline. The syscall does not report success before the
-                // daemon owns the work.
-                coordinator.finish_later(
-                    lease,
-                    FuseUnfinishedHandoff::Captured {
-                        arm_request_id,
-                        captured_work,
-                    },
-                );
-                return Err(libc::EIO);
+            }) {
+                Ok(()) => {
+                    coordinator
+                        .release_after_daemon_ack(lease)
+                        .map_err(|()| libc::EIO)?;
+                    Ok(value)
+                }
+                Err(FuseHandoffEnded::Left) => {
+                    // The change is made and its work is durable in the
+                    // outbox; the daemon has not accepted it within the
+                    // syscall's deadline. The syscall does not report success
+                    // before the daemon owns the work.
+                    coordinator.finish_later(
+                        lease,
+                        FuseUnfinishedHandoff::Captured {
+                            arm_request_id,
+                            captured_work,
+                        },
+                    );
+                    Err(libc::EIO)
+                }
+                Err(FuseHandoffEnded::Rejected(detail)) => {
+                    // The change is made and its exact work is in the
+                    // outbox, which the daemon's recovery reads once this
+                    // lease ends.
+                    coordinator.release_refused(lease, &detail);
+                    Err(libc::EIO)
+                }
             }
-            coordinator
-                .release_after_daemon_ack(lease)
-                .map_err(|()| libc::EIO)?;
-            Ok(value)
         }
         Err(error) => {
             // An error after service entry may have left work behind even
@@ -1292,41 +968,51 @@ where
                 Err(_) => return Err(libc::EIO),
             };
             let mut persisted = false;
-            if until_acknowledged(coordinator, deadline, || {
+            match until_acknowledged(coordinator, deadline, || {
                 if !persisted {
                     coordinator.persist_unknown(&mut lease, &arm_request_id, &observation)?;
                     persisted = true;
                 }
                 coordinator.commit_unknown(&lease, &arm_request_id, &observation)
-            })
-            .is_err()
-            {
-                coordinator.finish_later(
-                    lease,
-                    FuseUnfinishedHandoff::Unknown {
-                        arm_request_id,
-                        observation,
-                    },
-                );
-                return Err(libc::EIO);
+            }) {
+                Ok(()) => {
+                    coordinator
+                        .release_after_daemon_ack(lease)
+                        .map_err(|()| libc::EIO)?;
+                    Err(error.errno)
+                }
+                Err(FuseHandoffEnded::Left) => {
+                    coordinator.finish_later(
+                        lease,
+                        FuseUnfinishedHandoff::Unknown {
+                            arm_request_id,
+                            observation,
+                        },
+                    );
+                    Err(libc::EIO)
+                }
+                Err(FuseHandoffEnded::Rejected(detail)) => {
+                    // The daemon refused the record of an operation whose
+                    // outcome this mount cannot vouch for. The record stays
+                    // in the outbox for the daemon's recovery, which reads it
+                    // once the mount's session ends.
+                    coordinator.release_refused(lease, &detail);
+                    Err(libc::EIO)
+                }
             }
-            coordinator
-                .release_after_daemon_ack(lease)
-                .map_err(|()| libc::EIO)?;
-            Err(error.errno)
         }
     }
 }
 
 fn run_fuse_service_mounted_mutation_with_lock_and_preflight<'service, R>(
     handoff: Option<&FuseMountedMutationHandoff>,
-    service: &'service Mutex<SifsService>,
+    service: &'service MountLock<SifsService>,
     operation: FuseMountedMutationOperation,
     stable_operation_id: Option<String>,
     lock_service: impl FnOnce(
-        &'service Mutex<SifsService>,
+        &'service MountLock<SifsService>,
     )
-        -> std::result::Result<MutexGuard<'service, SifsService>, libc::c_int>,
+        -> std::result::Result<MountLockGuard<'service, SifsService>, libc::c_int>,
     preflight: impl FnOnce(
         &mut SifsService,
     ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
@@ -1491,25 +1177,10 @@ pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
     let mount_helper = prepare_safe_fuse_mount(&mut options)?;
     let mount_point = options.mount_point.clone();
     let cancellation = dfs::DfsCancellationFlag::new();
-    let mount_health = FuseMountHealth::new(
-        mount_point.clone(),
-        mount_helper.clone(),
-        cancellation.clone(),
-    )
-    .map_err(|source| DfsFuseError::Mount {
-        mount_point: mount_point.display().to_string(),
-        detail: format!("start fatal FUSE lifecycle worker: {source}"),
-    })?;
     let fs = SifsFuseFileSystem::open(options.clone(), cancellation)?;
     let mount_config = fuse_mount_config(&options, true);
-    let result = fuser::mount2(fs, &mount_point, &mount_config);
-    if let Some(detail) = mount_health.fatal_error() {
-        return Err(DfsFuseError::Mount {
-            mount_point: mount_point.display().to_string(),
-            detail,
-        });
-    }
-    result.map_err(|source| map_mount_error(&mount_point, mount_helper.exists(), source))
+    fuser::mount2(fs, &mount_point, &mount_config)
+        .map_err(|source| map_mount_error(&mount_point, mount_helper.exists(), source))
 }
 
 pub fn mount_sifs_background(
@@ -1517,25 +1188,13 @@ pub fn mount_sifs_background(
     cancellation: dfs::DfsCancellationFlag,
 ) -> Result<DfsFuseMountHandle> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
-    let mount_helper = prepare_safe_fuse_mount(&mut options)?;
+    prepare_safe_fuse_mount(&mut options)?;
     let mount_point = options.mount_point.clone();
-    let mount_health =
-        FuseMountHealth::new(mount_point.clone(), mount_helper, cancellation.clone()).map_err(
-            |source| DfsFuseError::Mount {
-                mount_point: mount_point.display().to_string(),
-                detail: format!("start fatal FUSE lifecycle worker: {source}"),
-            },
-        )?;
     let fs = SifsFuseFileSystem::open(options.clone(), cancellation.clone())?;
     let mount_config = background_fuse_mount_config(&options, true);
     let session = fuser::spawn_mount2(fs, &mount_point, &mount_config)
         .map_err(|source| map_mount_error(&mount_point, true, source))?;
-    Ok(DfsFuseMountHandle::new(
-        mount_point,
-        session,
-        cancellation,
-        mount_health,
-    ))
+    Ok(DfsFuseMountHandle::new(mount_point, session, cancellation))
 }
 
 fn prepare_safe_fuse_mount(options: &mut DfsFuseMountOptions) -> Result<PathBuf> {
@@ -1869,12 +1528,12 @@ impl FusePresentedOwner {
 
 #[derive(Debug)]
 struct SifsFuseFileSystem {
-    dfs: Arc<Mutex<SifsService>>,
+    dfs: Arc<MountLock<SifsService>>,
     mounted_mutation_handoff: Option<Arc<FuseMountedMutationHandoff>>,
     content_reads: dfs::MountedSifsContentReadContext,
     read_cancellation: dfs::DfsCancellationFlag,
     read_executor: FuseReadExecutor,
-    state: Arc<Mutex<FuseState>>,
+    state: Arc<MountLock<FuseState>>,
     read_only: bool,
     presented_owner: Option<FusePresentedOwner>,
     attr_ttl: Duration,
@@ -1947,21 +1606,17 @@ impl SifsFuseFileSystem {
                     let session = store
                         .open_fuse_mount_session(&options.mount_point)
                         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
-                    let resender = FuseMountedMutationHandoff::start_resender(
-                        client.clone(),
-                        read_cancellation.clone(),
+                    // The mount's own cancellation closes the handoff, so
+                    // no wait for the daemon outlives the mount.
+                    dfs::MountedSifsMutationHandoff::start(
+                        store,
+                        session,
+                        Arc::new(client),
+                        Some(&read_cancellation),
                     )
+                    .map(FuseMountedMutationHandoff::new)
                     .map_err(|error| {
                         DfsFuseError::Dfs(format!("start mounted handoff worker: {error}"))
-                    })?;
-                    Ok(FuseMountedMutationHandoff {
-                        resender,
-                        store,
-                        session: Some(session),
-                        client,
-                        closing: read_cancellation.clone(),
-                        gated: AtomicBool::new(false),
-                        mutation_lane: Mutex::new(()),
                     })
                 },
             )?),
@@ -2022,8 +1677,8 @@ impl SifsFuseFileSystem {
         let content_reads = service.mounted_content_read_context();
         let read_executor = FuseReadExecutor::new(read_cancellation.clone())
             .map_err(|source| DfsFuseError::Dfs(format!("start FUSE read workers: {source}")))?;
-        let dfs = Arc::new(Mutex::new(service));
-        let state = Arc::new(Mutex::new(FuseState::new(options.root_path.clone())));
+        let dfs = Arc::new(MountLock::new(service));
+        let state = Arc::new(MountLock::new(FuseState::new(options.root_path.clone())));
         let mounted_mutation_handoff = mounted_mutation_handoff.map(Arc::new);
         let lock_request_sequence = Arc::new(AtomicU64::new(1));
         let lock_renewer_stop = Arc::new(AtomicBool::new(false));
@@ -2053,7 +1708,7 @@ impl SifsFuseFileSystem {
         })
     }
 
-    fn lock_state(&self) -> std::result::Result<MutexGuard<'_, FuseState>, libc::c_int> {
+    fn lock_state(&self) -> std::result::Result<MountLockGuard<'_, FuseState>, libc::c_int> {
         dfs::MountedSifsCall::lock(&self.state).map_err(|_| libc::EIO)
     }
 
@@ -2307,7 +1962,10 @@ impl SifsFuseFileSystem {
         self.commit_inode_ranges(fh).map(drop)
     }
 
-    fn inode_publication_gate(&self, fh: u64) -> std::result::Result<Arc<Mutex<()>>, libc::c_int> {
+    fn inode_publication_gate(
+        &self,
+        fh: u64,
+    ) -> std::result::Result<Arc<MountLock<()>>, libc::c_int> {
         Ok(self
             .lock_state()?
             .handles
@@ -4780,7 +4438,7 @@ struct OpenFileHandle {
     // peer for bytes under a size/version combination that was not committed.
     opened_stat: dfs::DfsStat,
     logical_size: u64,
-    publication_gate: Arc<Mutex<()>>,
+    publication_gate: Arc<MountLock<()>>,
     writable: bool,
     sync_mode: HandleSyncMode,
 }
@@ -4971,7 +4629,7 @@ fn upgrade_background_mounted_mutation_handoff(
 }
 
 fn preflight_blocking_lock_acquire(
-    state: &Arc<Mutex<FuseState>>,
+    state: &Arc<MountLock<FuseState>>,
     key: &(dfs::DfsObjectId, u64),
     acquire_request_id: &dfs::DfsAdvisoryLockRequestId,
 ) -> std::result::Result<(), FuseMountedMutationPreflightError> {
@@ -4997,7 +4655,7 @@ fn preflight_blocking_lock_acquire(
 
 fn run_advisory_lock_command(
     handoff: Option<&FuseMountedMutationHandoff>,
-    service: &Arc<Mutex<SifsService>>,
+    service: &Arc<MountLock<SifsService>>,
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
@@ -5007,7 +4665,7 @@ fn run_advisory_lock_command(
 
 fn run_advisory_lock_command_with_preflight(
     handoff: Option<&FuseMountedMutationHandoff>,
-    service: &Arc<Mutex<SifsService>>,
+    service: &Arc<MountLock<SifsService>>,
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
@@ -5030,7 +4688,7 @@ fn run_advisory_lock_command_with_preflight(
 #[allow(clippy::too_many_arguments)]
 fn run_advisory_lock_command_with_preflight_and_entry_timeout(
     handoff: Option<&FuseMountedMutationHandoff>,
-    service: &Arc<Mutex<SifsService>>,
+    service: &Arc<MountLock<SifsService>>,
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
@@ -5044,8 +4702,9 @@ fn run_advisory_lock_command_with_preflight_and_entry_timeout(
     // duration from this earlier instant is conservative across request,
     // response, and exact-retry delay and can never extend the server lease.
     let started_at = Instant::now();
-    let deadline = dfs::MountedSifsCall::earliest(started_at.checked_add(FUSE_LOCK_RPC_TIMEOUT))
-        .ok_or(libc::EIO)?;
+    // The command adds no deadline of its own: the caller's, if it has one,
+    // is the only bound in time.
+    let deadline = dfs::MountedSifsCall::deadline();
     let operation = fuse_advisory_lock_mutation_operation(&command);
     let stable_operation_id = Some(command.request_id().0.clone());
     run_fuse_service_mounted_mutation_with_lock_and_preflight(
@@ -5053,7 +4712,7 @@ fn run_advisory_lock_command_with_preflight_and_entry_timeout(
         service.as_ref(),
         operation,
         stable_operation_id,
-        |service| match lock_service_until(service, deadline) {
+        |service| match lock_service_within_deadline(service) {
             Err(errno) if errno == libc::ETIMEDOUT => {
                 service_entry_timed_out.store(true, Ordering::Release);
                 Err(errno)
@@ -5072,23 +4731,19 @@ fn run_advisory_lock_command_with_preflight_and_entry_timeout(
     )
 }
 
-fn lock_service_until<'a>(
-    service: &'a Mutex<SifsService>,
-    deadline: Instant,
-) -> std::result::Result<MutexGuard<'a, SifsService>, libc::c_int> {
-    loop {
-        match service.try_lock() {
-            Ok(service) => return Ok(service),
-            Err(TryLockError::Poisoned(_)) => return Err(libc::EIO),
-            Err(TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(libc::ETIMEDOUT);
-                }
-                thread::sleep(FUSE_LOCK_QUEUE_POLL_INTERVAL.min(remaining));
-            }
+/// Wait for the mount's service lane until the caller's deadline, if it has
+/// one. `ETIMEDOUT` is a positive fact that the command never entered the
+/// service.
+fn lock_service_within_deadline(
+    service: &MountLock<SifsService>,
+) -> std::result::Result<MountLockGuard<'_, SifsService>, libc::c_int> {
+    dfs::MountedSifsCall::lock(service).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            libc::ETIMEDOUT
+        } else {
+            libc::EIO
         }
-    }
+    })
 }
 
 fn run_advisory_lock_command_with_service(
@@ -5097,11 +4752,14 @@ fn run_advisory_lock_command_with_service(
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
     started_at: Instant,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> std::result::Result<FuseLockCommandResult, libc::c_int> {
     let retry_command = command.clone();
-    let first_budget = deadline.saturating_duration_since(Instant::now());
-    if first_budget.is_zero() {
+    // What is left of the caller's budget; a caller without one waits for
+    // the command's outcome.
+    let remaining = || deadline.map(|at| at.saturating_duration_since(Instant::now()));
+    let first_budget = remaining();
+    if first_budget.is_some_and(|budget| budget.is_zero()) {
         return Err(libc::ETIMEDOUT);
     }
     let first =
@@ -5112,8 +4770,8 @@ fn run_advisory_lock_command_with_service(
             if std::env::var_os("SINOMO_FUSE_LOCK_DEBUG").is_some() {
                 eprintln!("sinomo-dfs-fuse: advisory-lock first attempt failed: {first_error:?}");
             }
-            let retry_budget = deadline.saturating_duration_since(Instant::now());
-            if retry_budget.is_zero() {
+            let retry_budget = remaining();
+            if retry_budget.is_some_and(|budget| budget.is_zero()) {
                 return Err(errno_for_posix_error(first_error));
             }
             service
@@ -5140,8 +4798,8 @@ fn run_advisory_lock_command_with_service(
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_blocking_lock_waiter(
-    service: Weak<Mutex<SifsService>>,
-    state: Weak<Mutex<FuseState>>,
+    service: Weak<MountLock<SifsService>>,
+    state: Weak<MountLock<FuseState>>,
     handoff: Option<Weak<FuseMountedMutationHandoff>>,
     stop: Arc<AtomicBool>,
     key: (dfs::DfsObjectId, u64),
@@ -5151,6 +4809,8 @@ fn spawn_blocking_lock_waiter(
     let deadline = dfs::MountedSifsCall::deadline();
     thread::spawn(move || {
         let _call = dfs::MountedSifsCall::enter(deadline);
+        // The wait between two sends of the queued acquire. The mount's
+        // close and a cancel of this waiter end it at the next send.
         let pause = |interval: Duration| {
             thread::sleep(deadline.map_or(interval, |at| {
                 interval.min(at.saturating_duration_since(Instant::now()))
@@ -5239,10 +4899,10 @@ fn spawn_blocking_lock_waiter(
             if matches!(outcome, Err(errno) if errno == libc::ETIMEDOUT)
                 && service_entry_timed_out.load(Ordering::Acquire)
             {
-                // Queueing behind an unrelated service call is a positive
-                // local no-entry fact, not ambiguity in the advisory-lock RPC.
-                // Keep the bounded waiter alive and try again later.
-                pause(BLOCKING_LOCK_POLL_INTERVAL);
+                // The caller's deadline passed while this command queued for
+                // the service lane: a positive local no-entry fact, not
+                // ambiguity in the advisory-lock RPC. The loop's deadline
+                // check answers the caller.
                 continue;
             }
             match outcome {
@@ -5303,7 +4963,7 @@ fn spawn_blocking_lock_waiter(
                     outcome: dfs::DfsAdvisoryLockOutcome::Waiting { .. },
                     ..
                 }) => {
-                    pause(BLOCKING_LOCK_POLL_INTERVAL);
+                    pause(BLOCKING_LOCK_RESEND_INTERVAL);
                 }
                 Ok(FuseLockCommandResult {
                     outcome:
@@ -5314,7 +4974,7 @@ fn spawn_blocking_lock_waiter(
                 }) => {
                     let remaining = retry_after_unix_nanos
                         .saturating_sub(system_time_to_nanos(SystemTime::now()));
-                    pause(Duration::from_nanos(remaining).min(BLOCKING_LOCK_POLL_INTERVAL));
+                    pause(Duration::from_nanos(remaining).min(BLOCKING_LOCK_RESEND_INTERVAL));
                 }
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Cancelled { .. },
@@ -5364,7 +5024,7 @@ fn spawn_blocking_lock_waiter(
 }
 
 fn remove_pending_lock(
-    state: &Weak<Mutex<FuseState>>,
+    state: &Weak<MountLock<FuseState>>,
     key: &(dfs::DfsObjectId, u64),
     acquire_request_id: &dfs::DfsAdvisoryLockRequestId,
 ) {
@@ -5380,8 +5040,8 @@ fn remove_pending_lock(
 }
 
 fn spawn_lock_renewer(
-    service: Weak<Mutex<SifsService>>,
-    state: Weak<Mutex<FuseState>>,
+    service: Weak<MountLock<SifsService>>,
+    state: Weak<MountLock<FuseState>>,
     handoff: Option<Weak<FuseMountedMutationHandoff>>,
     request_sequence: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -5418,6 +5078,10 @@ fn spawn_lock_renewer(
                         return;
                     }
                 };
+                // A renewal has no syscall behind it. Its own bound is the
+                // lease it renews: past that there is nothing left to renew,
+                // and the next key must not wait behind it.
+                let _call = dfs::MountedSifsCall::enter(Some(held.local_lease_deadline));
                 match run_advisory_lock_command(
                     handoff.as_deref(),
                     &service,
@@ -5458,7 +5122,7 @@ fn spawn_lock_renewer(
 }
 
 fn mark_fuse_lock_lost(
-    state: &Arc<Mutex<FuseState>>,
+    state: &Arc<MountLock<FuseState>>,
     key: &(dfs::DfsObjectId, u64),
     expected_grant: &dfs::DfsAdvisoryLockGrant,
 ) {
@@ -5733,6 +5397,7 @@ fn time_or_now_to_nanos(time: TimeOrNow) -> u64 {
 #[cfg(test)]
 mod errno_tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
 
     #[derive(Debug, Default)]
     struct TestMountedMutationLease;
@@ -5746,7 +5411,11 @@ mod errno_tests {
         fail_commit: AtomicBool,
         /// The daemon answers again from the first re-send on.
         answers_on_resend: AtomicBool,
-        service_lock: Option<Arc<Mutex<usize>>>,
+        /// The daemon definitely refuses instead of staying silent.
+        refuses: AtomicBool,
+        /// The outbox has no room for the next Prepare.
+        outbox_full: AtomicBool,
+        service_lock: Option<Arc<MountLock<usize>>>,
         commit_saw_service_lock_free: AtomicBool,
         commit_block: Option<Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>>,
         captured_work: Mutex<Vec<dfs::MountedSifsMutationCapturedWork>>,
@@ -5758,6 +5427,23 @@ mod errno_tests {
         fn record(&self, event: &'static str) {
             self.events.lock().expect("event lock").push(event);
         }
+
+        /// What a failing step returns: the daemon's refusal, or its silence.
+        fn failure(&self) -> FuseHandoffStepError {
+            if self.refuses.load(Ordering::Acquire) {
+                FuseHandoffStepError::Rejected("the test daemon refused the step".into())
+            } else {
+                unacknowledged()
+            }
+        }
+    }
+
+    fn unacknowledged() -> FuseHandoffStepError {
+        FuseHandoffStepError::Unacknowledged("the test daemon did not answer".into())
+    }
+
+    fn rejected<E: std::fmt::Display>(error: E) -> FuseHandoffStepError {
+        FuseHandoffStepError::Rejected(error.to_string())
     }
 
     impl FuseMountedMutationCoordinator for TestMountedMutationCoordinator {
@@ -5786,8 +5472,11 @@ mod errno_tests {
             &self,
             operation: FuseMountedMutationOperation,
             stable_operation_id: Option<String>,
-        ) -> std::result::Result<Self::Lease<'_>, ()> {
+        ) -> std::result::Result<Self::Lease<'_>, FuseHandoffStepError> {
             self.record("prepare");
+            if self.outbox_full.swap(false, Ordering::AcqRel) {
+                return Err(unacknowledged());
+            }
             self.prepared_operations
                 .lock()
                 .expect("prepared operation lock")
@@ -5795,7 +5484,12 @@ mod errno_tests {
             Ok(TestMountedMutationLease)
         }
 
-        fn pause_before_resend(&self, _attempt: u32, _deadline: Option<Instant>) -> bool {
+        fn pause_before_resend(
+            &self,
+            _seen_events: u64,
+            _attempt: u32,
+            _deadline: Option<Instant>,
+        ) -> bool {
             if !self.answers_on_resend.load(Ordering::Acquire) {
                 return false;
             }
@@ -5805,6 +5499,18 @@ mod errno_tests {
             true
         }
 
+        fn abort_unstarted(
+            &self,
+            _lease: &Self::Lease<'_>,
+        ) -> std::result::Result<(), FuseHandoffStepError> {
+            self.record("abort-unstarted");
+            Ok(())
+        }
+
+        fn release_refused(&self, _lease: Self::Lease<'_>, _detail: &str) {
+            self.record("release-refused");
+        }
+
         fn finish_later(&self, _lease: Self::Lease<'_>, _step: FuseUnfinishedHandoff) {
             self.record("finish-later");
         }
@@ -5812,10 +5518,11 @@ mod errno_tests {
         fn arm(
             &self,
             _lease: &mut Self::Lease<'_>,
-        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, FuseHandoffStepError>
+        {
             self.record("arm");
             if self.fail_arm.load(Ordering::Acquire) {
-                Err(())
+                Err(self.failure())
             } else {
                 self.record("arm-ack");
                 Ok(dfs::MountedSifsMutationArmRequestId::generate())
@@ -5827,7 +5534,7 @@ mod errno_tests {
             _lease: &mut Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             captured_work: &dfs::MountedSifsMutationCapturedWork,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("persist-captured");
             self.captured_work
                 .lock()
@@ -5841,7 +5548,7 @@ mod errno_tests {
             _lease: &mut Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             observation: &dfs::MountedSifsMutationErrorObservation,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("persist-unknown");
             self.unknown_observations
                 .lock()
@@ -5855,7 +5562,7 @@ mod errno_tests {
             _lease: &mut Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             _proof_code: &'static str,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("persist-proven-no-write");
             Ok(())
         }
@@ -5865,7 +5572,7 @@ mod errno_tests {
             _lease: &Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             _captured_work: &dfs::MountedSifsMutationCapturedWork,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("commit-captured");
             if let Some(service_lock) = self.service_lock.as_ref() {
                 self.commit_saw_service_lock_free
@@ -5881,7 +5588,7 @@ mod errno_tests {
                 }
             }
             if self.fail_commit.load(Ordering::Acquire) {
-                Err(())
+                Err(self.failure())
             } else {
                 self.record("commit-ack");
                 Ok(())
@@ -5893,7 +5600,7 @@ mod errno_tests {
             _lease: &Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             _observation: &dfs::MountedSifsMutationErrorObservation,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("commit-unknown");
             self.record("commit-ack");
             Ok(())
@@ -5904,7 +5611,7 @@ mod errno_tests {
             _lease: &Self::Lease<'_>,
             _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             _proof_code: &'static str,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             self.record("commit-proven-no-write");
             self.record("commit-ack");
             Ok(())
@@ -5948,21 +5655,22 @@ mod errno_tests {
             &self,
             operation: FuseMountedMutationOperation,
             stable_operation_id: Option<String>,
-        ) -> std::result::Result<Self::Lease<'_>, ()> {
+        ) -> std::result::Result<Self::Lease<'_>, FuseHandoffStepError> {
             self.store
                 .prepare(&self.session, stable_operation_id, operation.label())
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn arm(
             &self,
             lease: &mut Self::Lease<'_>,
-        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, FuseHandoffStepError>
+        {
             let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
             let marker = lease.marker();
             self.store
                 .arm_live(&marker.marker_id, &marker.marker_nonce, &arm_request_id)
-                .map_err(|_| ())?;
+                .map_err(rejected)?;
             Ok(arm_request_id)
         }
 
@@ -5971,10 +5679,10 @@ mod errno_tests {
             lease: &mut Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             captured_work: &dfs::MountedSifsMutationCapturedWork,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             lease
                 .record_captured_success(arm_request_id, captured_work.clone())
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn persist_unknown(
@@ -5982,10 +5690,10 @@ mod errno_tests {
             lease: &mut Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             observation: &dfs::MountedSifsMutationErrorObservation,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             lease
                 .record_unknown_after_error(arm_request_id, observation.clone())
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn persist_proven_no_write(
@@ -5993,10 +5701,10 @@ mod errno_tests {
             lease: &mut Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             proof_code: &'static str,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             lease
                 .record_proven_no_write(arm_request_id, proof_code)
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn commit_captured(
@@ -6004,7 +5712,7 @@ mod errno_tests {
             lease: &Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             captured_work: &dfs::MountedSifsMutationCapturedWork,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             let marker = lease.marker();
             self.store
                 .accept_captured_live(
@@ -6014,7 +5722,7 @@ mod errno_tests {
                     captured_work,
                 )
                 .map(drop)
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn commit_unknown(
@@ -6022,7 +5730,7 @@ mod errno_tests {
             lease: &Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             observation: &dfs::MountedSifsMutationErrorObservation,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             let marker = lease.marker();
             self.store
                 .accept_unknown_live(
@@ -6032,7 +5740,7 @@ mod errno_tests {
                     observation,
                 )
                 .map(drop)
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn commit_proven_no_write(
@@ -6040,7 +5748,7 @@ mod errno_tests {
             lease: &Self::Lease<'_>,
             arm_request_id: &dfs::MountedSifsMutationArmRequestId,
             proof_code: &'static str,
-        ) -> std::result::Result<(), ()> {
+        ) -> std::result::Result<(), FuseHandoffStepError> {
             let marker = lease.marker();
             self.store
                 .prove_no_write_live(
@@ -6050,7 +5758,7 @@ mod errno_tests {
                     proof_code,
                 )
                 .map(drop)
-                .map_err(|_| ())
+                .map_err(rejected)
         }
 
         fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()> {
@@ -6413,7 +6121,7 @@ mod errno_tests {
     #[test]
     fn foreground_advisory_lock_mutation_uses_the_acknowledged_handoff() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let result = run_fuse_mounted_mutation_with_lock(
             &coordinator,
             &service,
@@ -6454,7 +6162,7 @@ mod errno_tests {
     #[test]
     fn background_renewal_and_waiter_cancel_share_the_serialized_handoff() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let renewed = run_fuse_mounted_mutation_with_lock(
             &coordinator,
             &service,
@@ -6468,7 +6176,7 @@ mod errno_tests {
         );
         assert_eq!(renewed, Ok(1));
 
-        let waiter_state = Arc::new(Mutex::new(FuseState::new("/".to_string())));
+        let waiter_state = Arc::new(MountLock::new(FuseState::new("/".to_string())));
         let waiter_key = (test_object_id("fusecancelledwaiterobject"), 77);
         let acquire_request_id =
             dfs::DfsAdvisoryLockRequestId::new("fuse-cancelled-waiter-acquire");
@@ -6528,7 +6236,7 @@ mod errno_tests {
     fn daemon_arm_ack_precedes_service_mutation() {
         let coordinator = TestMountedMutationCoordinator::default();
         coordinator.fail_arm.store(true, Ordering::Release);
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let mutation_calls = AtomicU64::new(0);
 
         let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
@@ -6575,7 +6283,7 @@ mod errno_tests {
                 "arm" => coordinator.fail_arm.store(true, Ordering::Release),
                 _ => coordinator.fail_commit.store(true, Ordering::Release),
             }
-            let service = Mutex::new(0usize);
+            let service = MountLock::new(0usize);
             let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
                 &coordinator,
                 &service,
@@ -6602,7 +6310,7 @@ mod errno_tests {
     #[test]
     fn directory_refresh_read_error_commits_captured_work_without_gating() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let committed_work = dfs::DfsCommittedWork {
             metadata_replica_progress: true,
             ..dfs::DfsCommittedWork::default()
@@ -6647,7 +6355,7 @@ mod errno_tests {
 
     #[test]
     fn daemon_commit_runs_without_the_service_lock_and_before_success_returns() {
-        let service = Arc::new(Mutex::new(0usize));
+        let service = Arc::new(MountLock::new(0usize));
         let commit_block = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
         let coordinator = Arc::new(TestMountedMutationCoordinator {
             service_lock: Some(Arc::clone(&service)),
@@ -6711,7 +6419,7 @@ mod errno_tests {
     #[test]
     fn service_error_persists_unknown_with_exact_work_and_the_mount_keeps_serving() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let committed_work = dfs::DfsCommittedWork {
             publish_metadata: true,
             ..dfs::DfsCommittedWork::default()
@@ -6769,7 +6477,7 @@ mod errno_tests {
     #[test]
     fn typed_error_returns_its_errno_and_the_mount_keeps_serving() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
             &coordinator,
             &service,
@@ -6843,7 +6551,7 @@ mod errno_tests {
     #[test]
     fn failure_before_service_entry_attests_proven_no_write() {
         let coordinator = TestMountedMutationCoordinator::default();
-        let service = Arc::new(Mutex::new(0usize));
+        let service = Arc::new(MountLock::new(0usize));
         let service_to_poison = Arc::clone(&service);
         assert!(
             thread::spawn(move || {
@@ -6874,7 +6582,7 @@ mod errno_tests {
 
     #[test]
     fn mutation_admission_stays_closed_until_the_prior_daemon_ack() {
-        let service = Arc::new(Mutex::new(0usize));
+        let service = Arc::new(MountLock::new(0usize));
         let commit_block = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
         let coordinator = Arc::new(TestMountedMutationCoordinator {
             fail_commit: AtomicBool::new(true),
@@ -6953,7 +6661,7 @@ mod errno_tests {
 
     #[test]
     fn deadline_while_waiting_for_the_service_never_enters_the_mutation() {
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let held = service.lock().unwrap();
         let coordinator = TestMountedMutationCoordinator::default();
         let result = std::thread::scope(|scope| {
@@ -6982,7 +6690,7 @@ mod errno_tests {
     fn unacknowledged_commit_never_reports_success_and_the_mount_keeps_serving() {
         let coordinator = TestMountedMutationCoordinator::default();
         coordinator.fail_commit.store(true, Ordering::Release);
-        let service = Mutex::new(0usize);
+        let service = MountLock::new(0usize);
         let first = run_fuse_mounted_mutation_with(
             &coordinator,
             &service,
@@ -7012,6 +6720,329 @@ mod errno_tests {
         );
         assert_eq!(second, Ok(()));
         assert_eq!(later_mutations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_refused_arm_ends_the_syscall_aborts_its_marker_and_frees_the_lane() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        coordinator.refuses.store(true, Ordering::Release);
+        coordinator.fail_arm.store(true, Ordering::Release);
+        // A re-send would clear the failure: a refusal must end without one.
+        coordinator.answers_on_resend.store(true, Ordering::Release);
+        let service = MountLock::new(0usize);
+        let refused: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |_| panic!("a refused Arm never enters the service"),
+        );
+        assert_eq!(refused, Err(libc::EIO));
+        {
+            let events = coordinator.events.lock().expect("event lock");
+            assert_eq!(
+                events.as_slice(),
+                ["prepare", "arm", "abort-unstarted", "release"],
+                "the refusal was not sent again and its marker was aborted"
+            );
+        }
+        assert!(!coordinator.is_gated());
+        coordinator.fail_arm.store(false, Ordering::Release);
+        let next = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(next, Ok(()), "the mutation lane was released");
+    }
+
+    #[test]
+    fn a_refused_commit_ends_the_syscall_and_gives_up_its_marker() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        coordinator.refuses.store(true, Ordering::Release);
+        coordinator.fail_commit.store(true, Ordering::Release);
+        coordinator.answers_on_resend.store(true, Ordering::Release);
+        let service = MountLock::new(0usize);
+        let refused = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::SetMode,
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(
+            refused,
+            Err(libc::EIO),
+            "the syscall does not report success before the daemon owns the work"
+        );
+        let events = coordinator.events.lock().expect("event lock").clone();
+        assert!(events.contains(&"release-refused"));
+        assert!(!events.contains(&"resend"));
+        assert!(!events.contains(&"finish-later"));
+        assert!(!coordinator.is_gated());
+    }
+
+    #[test]
+    fn a_full_outbox_is_waited_on_and_the_mutation_runs_once_there_is_room() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        coordinator.outbox_full.store(true, Ordering::Release);
+        coordinator.answers_on_resend.store(true, Ordering::Release);
+        let service = MountLock::new(0usize);
+        let result = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        let events = coordinator.events.lock().expect("event lock");
+        assert_eq!(
+            &events[..3],
+            ["prepare", "resend", "prepare"],
+            "Prepare was made again instead of the mutation being refused"
+        );
+    }
+
+    type TestDaemon = dfs::MountedSifsHandoffTestDaemon;
+
+    /// The production FUSE handoff over a real outbox, with a daemon the test
+    /// makes silent or makes refuse.
+    struct TestFuseHandoff {
+        handoff: FuseMountedMutationHandoff,
+        daemon: Arc<TestDaemon>,
+        store: dfs::MountedSifsMutationOutboxStore,
+        _root: sinomo_testdir::TestDir,
+    }
+
+    impl TestFuseHandoff {
+        fn start(name: &str) -> Self {
+            let root = sinomo_testdir::TestDir::new(name);
+            let store = dfs::MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+                .expect("open the mount's outbox");
+            let session = store
+                .open_host_mount_session(
+                    dfs::MountedSifsMutationAdapter::Fuse,
+                    format!("fuse-root:{name}"),
+                )
+                .expect("open the mount's session");
+            let daemon = TestDaemon::new(store.clone());
+            let handoff = FuseMountedMutationHandoff::new(
+                dfs::MountedSifsMutationHandoff::start(
+                    store.clone(),
+                    session,
+                    daemon.clone(),
+                    None,
+                )
+                .expect("start the mount's handoff"),
+            );
+            Self {
+                handoff,
+                daemon,
+                store,
+                _root: root,
+            }
+        }
+
+        fn unfinished(&self) -> usize {
+            self.handoff.handoff.unfinished_count()
+        }
+
+        fn status(&self) -> dfs::MountedSifsMutationOutboxStatus {
+            self.store.status().expect("outbox status")
+        }
+    }
+
+    /// Wait for `reached`, which an event the test already caused makes true.
+    fn eventually(what: &str, reached: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !reached() {
+            assert!(Instant::now() < until, "{what} did not happen");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn the_resender_finishes_a_handoff_whose_syscall_ran_out_of_budget() {
+        let mount = TestFuseHandoff::start("fuse-resender-past-budget");
+        let service = MountLock::new(0usize);
+        // The daemon falls silent once the mutation is in the service: its
+        // Arm was acknowledged, its committed work is not.
+        let result = run_fuse_mounted_mutation_until(
+            &mount.handoff,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            Some(Instant::now() + Duration::from_millis(150)),
+            |value| {
+                *value += 1;
+                mount.daemon.set_silent(true);
+                test_mutation_report(
+                    Ok(()),
+                    dfs::DfsCommittedWork {
+                        publish_metadata: true,
+                        ..dfs::DfsCommittedWork::default()
+                    },
+                )
+            },
+        );
+        assert_eq!(
+            result,
+            Err(libc::EIO),
+            "the syscall ends at its budget without reporting success"
+        );
+        assert_eq!(*service.lock().unwrap(), 1, "the mutation ran once");
+        assert!(!mount.handoff.is_gated(), "the mount keeps serving");
+        // The re-sender has the step and keeps sending it, with no cap.
+        eventually("the step reached the re-sender", || mount.unfinished() == 1);
+        let sent = mount.daemon.attempts_of(TestDaemon::COMMIT_APPLIED);
+        eventually("the re-sender sent the commit again", || {
+            mount.daemon.attempts_of(TestDaemon::COMMIT_APPLIED) >= sent + 10
+        });
+        assert_eq!(mount.status().live_marker_count, 1);
+
+        mount.daemon.set_silent(false);
+        eventually("the daemon acknowledged the commit", || {
+            mount.unfinished() == 0 && mount.status().pending_marker_count == 0
+        });
+        // The next mutation is unaffected.
+        let next = run_fuse_mounted_mutation_with(
+            &mount.handoff,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(next, Ok(()));
+        assert_eq!(*service.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_mutation_waiting_for_the_daemon_holds_neither_the_service_lane_nor_a_poll() {
+        let mount = TestFuseHandoff::start("fuse-arm-wait-frees-service");
+        mount.daemon.set_silent(true);
+        let service = MountLock::new(0usize);
+        thread::scope(|scope| {
+            let mutation = scope.spawn(|| {
+                run_fuse_mounted_mutation_with(
+                    &mount.handoff,
+                    &service,
+                    FuseMountedMutationOperation::Mkdir,
+                    |value| {
+                        *value += 1;
+                        test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+                    },
+                )
+            });
+            // No budget: Arm is sent for as long as the daemon stays silent.
+            eventually("Arm sent again", || {
+                mount.daemon.attempts_of(TestDaemon::ARM) >= 5
+            });
+            assert!(!mutation.is_finished());
+            // A read on the same mount enters the service meanwhile.
+            assert_eq!(
+                *dfs::MountedSifsCall::lock(&service).expect("the service lane is free"),
+                0
+            );
+            mount.daemon.set_silent(false);
+            assert_eq!(mutation.join().unwrap(), Ok(()));
+        });
+        assert_eq!(*service.lock().unwrap(), 1);
+        assert_eq!(mount.unfinished(), 0);
+        assert_eq!(mount.status().pending_marker_count, 0);
+    }
+
+    #[test]
+    fn a_full_outbox_holds_a_fuse_mutation_until_a_marker_is_released() {
+        let mount = TestFuseHandoff::start("fuse-outbox-full");
+        let shared = &mount.handoff.handoff;
+        let mut fillers = Vec::new();
+        for _ in 0..dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
+            fillers.push(
+                shared
+                    .prepare("fuse.test-filler", None)
+                    .expect("the outbox has room")
+                    .into_owned(),
+            );
+        }
+        let service = MountLock::new(0usize);
+        thread::scope(|scope| {
+            let mutation = scope.spawn(|| {
+                run_fuse_mounted_mutation_with(
+                    &mount.handoff,
+                    &service,
+                    FuseMountedMutationOperation::Mkdir,
+                    |value| {
+                        *value += 1;
+                        test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+                    },
+                )
+            });
+            thread::sleep(Duration::from_millis(300));
+            assert!(!mutation.is_finished(), "a full outbox is waited on");
+            assert_eq!(mount.daemon.attempts_of(TestDaemon::ARM), 0);
+
+            // Close one marker as no-write: its release makes room.
+            let mut released = fillers.pop().unwrap();
+            let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+            shared.arm(&released, &arm_request_id).unwrap();
+            shared
+                .persist_proven_no_write(&mut released, &arm_request_id, "fuse-test-filler")
+                .unwrap();
+            shared
+                .commit_proven_no_write(&released, &arm_request_id, "fuse-test-filler")
+                .unwrap();
+            shared.release_after_daemon_ack(released).unwrap();
+            assert_eq!(mutation.join().unwrap(), Ok(()));
+        });
+        assert_eq!(*service.lock().unwrap(), 1);
+        drop(fillers);
+    }
+
+    #[test]
+    fn a_refused_error_record_stays_in_the_outbox_until_the_session_ends() {
+        let mount = TestFuseHandoff::start("fuse-refused-unknown");
+        mount.daemon.refuse(TestDaemon::COMMIT_UNKNOWN);
+        let service = MountLock::new(0usize);
+        let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &mount.handoff,
+            &service,
+            FuseMountedMutationOperation::Rename,
+            |_| {
+                test_mutation_report(
+                    Err(FuseMountedMutationError::ambiguous(
+                        libc::EBUSY,
+                        "fuse-test-ambiguous-error",
+                    )),
+                    dfs::DfsCommittedWork::default(),
+                )
+            },
+        );
+        assert_eq!(result, Err(libc::EIO), "the refusal ends the syscall");
+        assert_eq!(mount.daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN), 1);
+        // The record is durable but no daemon owns it: recovery takes a
+        // marker in this phase only once its mount session has ended.
+        let status = mount.status();
+        assert_eq!(status.deferred_live_session_marker_count, 1);
+        assert_eq!(status.exact_recovery_marker_count, 0);
+        assert!(!mount.handoff.is_gated());
+
+        mount.daemon.refuse_nothing();
+        let next = run_fuse_mounted_mutation_with(
+            &mount.handoff,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |_| test_mutation_report(Ok(()), dfs::DfsCommittedWork::default()),
+        );
+        assert_eq!(next, Ok(()), "the mount keeps serving mutations");
     }
 
     #[test]
@@ -7045,100 +7076,6 @@ mod errno_tests {
             Some(helper)
         );
         assert!(fuse_mount_helper_on_path(None).is_none());
-    }
-
-    #[test]
-    fn fatal_mount_health_cancels_and_requests_one_exact_lazy_unmount() {
-        let root = sinomo_testdir::TestDir::new("sinomo-fuse-fatal-health");
-        let helper = root.join("fusermount3");
-        let invocation = root.join("invocation.txt");
-        std::fs::write(
-            &helper,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
-                invocation.display()
-            ),
-        )
-        .expect("write helper fixture");
-        sinomo_testdir::install_shell_fixture(&helper).expect("install shell fixture");
-        let mount_point = root.join("mount");
-        std::fs::create_dir(&mount_point).expect("mount point");
-        let cancellation = dfs::DfsCancellationFlag::new();
-        let health = FuseMountHealth::new(mount_point.clone(), helper, cancellation.clone())
-            .expect("health worker");
-
-        health.fail("ambiguous mounted mutation");
-        health.fail("later error must not replace the first evidence");
-        health
-            .wait_for_fatal_unmount(Duration::from_secs(2))
-            .expect("lazy unmount completion");
-
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            health.fatal_error().as_deref(),
-            Some("ambiguous mounted mutation")
-        );
-        assert_eq!(
-            std::fs::read_to_string(&invocation)
-                .expect("helper invocation")
-                .lines()
-                .collect::<Vec<_>>(),
-            vec!["-u", "-z", mount_point.to_str().expect("UTF-8 mount point")],
-            "the first fatal edge owns one exact lazy-unmount request"
-        );
-    }
-
-    #[test]
-    fn fatal_mount_retirement_waits_for_the_original_lazy_unmount_helper() {
-        let root = sinomo_testdir::TestDir::new("sinomo-fuse-fatal-health-delayed");
-        let helper = root.join("fusermount3");
-        let started = root.join("started");
-        let release = root.join("release");
-        std::fs::write(
-            &helper,
-            format!(
-                "#!/bin/sh\nprintf done > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
-                started.display(),
-                release.display()
-            ),
-        )
-        .expect("write delayed helper fixture");
-        sinomo_testdir::install_shell_fixture(&helper).expect("install shell fixture");
-        let mount_point = root.join("mount");
-        std::fs::create_dir(&mount_point).expect("mount point");
-        let cancellation = dfs::DfsCancellationFlag::new();
-        let health =
-            FuseMountHealth::new(mount_point, helper, cancellation).expect("health worker");
-
-        health.fail("ambiguous mounted mutation");
-        let started_deadline = Instant::now() + Duration::from_secs(2);
-        while !started.exists() && Instant::now() < started_deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(started.exists(), "delayed helper must have started");
-        let waiter_health = Arc::clone(&health);
-        let (waiting_sender, waiting_receiver) = mpsc::sync_channel(1);
-        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
-        let waiter = thread::spawn(move || {
-            waiting_sender.send(()).expect("report helper wait start");
-            finished_sender
-                .send(waiter_health.wait_for_fatal_unmount(Duration::from_secs(2)))
-                .expect("report helper wait result");
-        });
-
-        waiting_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("helper wait starts");
-        assert!(matches!(
-            finished_receiver.recv_timeout(Duration::from_millis(75)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        std::fs::write(&release, b"release").expect("release delayed helper");
-        finished_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("helper wait completion")
-            .expect("successful delayed helper");
-        waiter.join().expect("helper waiter");
     }
 
     #[cfg(target_os = "linux")]
@@ -7805,7 +7742,7 @@ mod errno_tests {
             BTreeSet::from([3]),
         )
         .expect("live grant");
-        let state = Arc::new(Mutex::new(FuseState::new("/".to_string())));
+        let state = Arc::new(MountLock::new(FuseState::new("/".to_string())));
         state
             .lock()
             .expect("state")

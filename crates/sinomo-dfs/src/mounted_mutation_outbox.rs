@@ -51,6 +51,11 @@ const MOUNTED_SIFS_MUTATION_OUTBOX_SESSION_SCAN_ENTRIES: usize =
 const MOUNTED_SIFS_MUTATION_OUTBOX_DIRECTORY_SCAN_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+/// How an outbox lock that another holder kept for the whole wait is
+/// reported. The handoff client reads it in the daemon's answer as the
+/// absence of an answer, not as a refusal.
+pub(crate) const MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_CONTENDED: &str =
+    "timed out acquiring mounted-mutation outbox lock";
 
 const OUTBOX_DIRECTORY: &str = "mounted-mutation-outbox";
 const SESSIONS_DIRECTORY: &str = "sessions";
@@ -287,6 +292,44 @@ impl MountedSifsMutationOutboxStatus {
 #[derive(Clone, Debug)]
 pub struct MountedSifsMutationOutboxStore {
     root: PathBuf,
+}
+
+/// Why [`MountedSifsMutationOutboxStore::prepare`] returned no lease.
+#[derive(Debug)]
+pub enum MountedSifsMutationPrepareError {
+    /// The outbox cannot take another marker yet: it is at its marker limit,
+    /// it is still classifying the markers it holds, or another process
+    /// holds its store lock. Room is made when a marker is released, so the
+    /// same operation prepared again later can succeed.
+    NoRoom(DfsError),
+    /// The outbox refused the operation: its host-mount session is not live
+    /// here, its labels are invalid, or the store failed. The same operation
+    /// prepared again is refused again.
+    Refused(DfsError),
+}
+
+impl MountedSifsMutationPrepareError {
+    pub fn into_dfs_error(self) -> DfsError {
+        match self {
+            Self::NoRoom(error) | Self::Refused(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for MountedSifsMutationPrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRoom(error) | Self::Refused(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for MountedSifsMutationPrepareError {}
+
+impl From<MountedSifsMutationPrepareError> for DfsError {
+    fn from(error: MountedSifsMutationPrepareError) -> Self {
+        error.into_dfs_error()
+    }
 }
 
 /// Raw, owner-validated evidence used only by an explicit external-provider
@@ -1045,44 +1088,66 @@ impl MountedSifsMutationOutboxStore {
     /// Fsync a Prepared ambiguity marker while the host-session and operation
     /// leases are held. The adapter must not enter its mutation before a later
     /// daemon [`Self::arm_live`] call has also been fsynced and acknowledged.
+    ///
+    /// The error says whether the same operation can be prepared later:
+    /// [`MountedSifsMutationPrepareError::NoRoom`] is the outbox's
+    /// backpressure, and a caller waits on it for a marker's release.
     pub fn prepare<'session>(
         &self,
         session: &'session MountedSifsHostMountSessionLease,
         stable_operation_id: Option<String>,
         operation: impl Into<String>,
-    ) -> Result<MountedSifsMutationLease<'session>, DfsError> {
+    ) -> Result<MountedSifsMutationLease<'session>, MountedSifsMutationPrepareError> {
+        use MountedSifsMutationPrepareError::{NoRoom, Refused};
         let session_lease_is_held = session
             .lease
             .lock()
-            .map_err(|_| outbox_error("host-mount session lease is poisoned"))?
+            .map_err(|_| Refused(outbox_error("host-mount session lease is poisoned")))?
             .as_ref()
             .is_some_and(HeldLeaseLock::is_held);
         if session.store.root != self.root
             || session.marker.phase != MountedSifsHostMountSessionPhase::Active
             || !session_lease_is_held
         {
-            return Err(outbox_error(
+            return Err(Refused(outbox_error(
                 "host-mount session is not live in this outbox",
-            ));
+            )));
         }
-        let origin = session.origin(stable_operation_id, operation)?;
-        let _store_lock = lock_file_exclusive(&self.root.join(STORE_LOCK_FILE))?;
-        let status = self.status_unlocked()?;
+        let origin = session
+            .origin(stable_operation_id, operation)
+            .map_err(Refused)?;
+        let _store_lock = try_lock_file_exclusive_with_timeout(
+            &self.root.join(STORE_LOCK_FILE),
+            MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_ACQUIRE_TIMEOUT,
+        )
+        .map_err(|error| match error {
+            // Another process is using the store; that is not a refusal.
+            OutboxLockError::Contended(error) => NoRoom(error),
+            OutboxLockError::Failed(error) => Refused(error),
+        })?;
+        let status = self.status_unlocked().map_err(Refused)?;
         if status.directory_scan_limit_exceeded
             || status.marker_limit_exceeded
             || status.malformed_marker_count != 0
         {
-            return Err(outbox_error(
+            return Err(NoRoom(outbox_error(
                 "mounted-mutation outbox classification must complete before preparing new work",
-            ));
-        }
-        if status.total_marker_count >= MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
-            return Err(outbox_error(format!(
-                "mounted-mutation outbox active marker limit {} reached",
-                MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS
             )));
         }
+        if status.total_marker_count >= MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
+            return Err(NoRoom(outbox_error(format!(
+                "mounted-mutation outbox active marker limit {} reached",
+                MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS
+            ))));
+        }
+        self.publish_prepared_marker(origin).map_err(Refused)
+    }
 
+    /// Publish one Prepared marker under the store lock its caller holds.
+    fn publish_prepared_marker<'session>(
+        &self,
+        origin: MountedSifsMutationOrigin,
+    ) -> Result<MountedSifsMutationLease<'session>, DfsError> {
         let marker_id = Id::generate();
         let marker_nonce = Id::generate();
         let directory = self.operation_directory(&marker_id);
@@ -2638,8 +2703,27 @@ fn lock_file_exclusive_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<ExclusiveFileLock, DfsError> {
+    try_lock_file_exclusive_with_timeout(path, timeout).map_err(|error| match error {
+        OutboxLockError::Contended(error) | OutboxLockError::Failed(error) => error,
+    })
+}
+
+/// Why an outbox file lock was not taken.
+#[derive(Debug)]
+enum OutboxLockError {
+    /// Another holder kept the lock for the whole wait.
+    Contended(DfsError),
+    /// The lock file could not be opened or locked.
+    Failed(DfsError),
+}
+
+#[track_caller]
+fn try_lock_file_exclusive_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<ExclusiveFileLock, OutboxLockError> {
     let caller = std::panic::Location::caller();
-    let file = open_lock_file(path)?;
+    let file = open_lock_file(path).map_err(OutboxLockError::Failed)?;
     let started = Instant::now();
     let deadline =
         crate::MountedSifsCall::earliest(started.checked_add(timeout)).unwrap_or(started);
@@ -2666,11 +2750,11 @@ fn lock_file_exclusive_with_timeout(
             Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(outbox_error(format!(
-                        "timed out acquiring mounted-mutation outbox lock {} after {} ms",
+                    return Err(OutboxLockError::Contended(outbox_error(format!(
+                        "{MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_CONTENDED} {} after {} ms",
                         path.display(),
                         timeout.as_millis()
-                    )));
+                    ))));
                 }
                 std::thread::sleep(
                     deadline
@@ -2678,7 +2762,7 @@ fn lock_file_exclusive_with_timeout(
                         .min(MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_RETRY_INTERVAL),
                 );
             }
-            Err(source) => return Err(lock_error(path, source)),
+            Err(source) => return Err(OutboxLockError::Failed(lock_error(path, source))),
         }
     }
 }

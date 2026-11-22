@@ -7,8 +7,8 @@
 
 use super::{
     POSIX_LIST_DIR_COLLECT_PAGE_SIZE, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
-    POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS,
-    POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id, now_unix_nanos,
+    POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS, POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id,
+    now_unix_nanos,
 };
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::namespace::{
@@ -31,6 +31,12 @@ use crate::{
     DfsWriteIntentStatus, NetworkedDfsService, object_version_record, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
+
+/// Bound on a read this node sends to another shard's primary while it serves
+/// a request on several shard lanes or runs a namespace job. It is a
+/// served-side bound; a caller's own read adds none.
+const POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
 
 mod closed_storage_parks;
 mod destination_reservation;
@@ -921,7 +927,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id.clone(),
                 shard.primary_node_id.clone(),
                 path.to_owned(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT,
             )?);
         }
         self.lookup_metadata_path(file_system_id, path)
@@ -1080,7 +1086,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Retain the previous source-lookup budget and the enclosing operation
         // deadline. A rejected source read never becomes a replica fallback.
         let previous = self.transport.operation_deadline();
-        let requested = std::time::Instant::now() + POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
+        let requested = std::time::Instant::now() + POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT;
         self.transport
             .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
         let response = self.query_metadata_authority_impl(

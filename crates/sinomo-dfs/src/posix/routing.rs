@@ -1,11 +1,11 @@
 //! Routed namespace helpers for the POSIX facade.
 //!
-//! These helpers keep SIFS metadata-shard routing, bounded read freshness, and
-//! routed mutation replay together. The parent `posix` module owns local
+//! These helpers keep SIFS metadata-shard routing, read freshness, and routed
+//! mutation replay together. A read adds no deadline of its own. The parent `posix` module owns local
 //! namespace operations and cross-shard sagas; this module decides when those
 //! operations should run locally or be sent to another shard primary.
 
-use super::POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
+use super::POSIX_READ_NO_BUDGET;
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::posix_model::{DfsPosixError, DfsStat, Result, posix_error_for_namespace_rejection};
 use crate::posix_path::{
@@ -90,7 +90,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             sifs_file_system_id(),
             shard.primary_node_id.clone(),
             path.to_owned(),
-            POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            POSIX_READ_NO_BUDGET,
         )?;
         Ok(Some(object.is_some_and(|object| {
             object.kind == DfsObjectKind::Directory
@@ -546,14 +546,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path.to_string(),
                 offset,
                 max_bytes,
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
         } else {
             self.route_namespace_lookup_path_to_metadata_primary(
                 sifs_file_system_id(),
                 primary_node_id,
                 path.to_string(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
             .map(|object| (object, None))
         }
@@ -677,7 +677,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id.clone(),
                 primary_node_id,
                 paths.clone(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             ) else {
                 continue;
             };
