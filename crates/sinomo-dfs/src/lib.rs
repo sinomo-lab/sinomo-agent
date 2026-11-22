@@ -268,6 +268,7 @@ pub use browser_service::{
     dfs_browser_component_host, dfs_core_component_requirement, normalize_sifs_browser_path,
     posix_error_outcome_is_unknown, register_dfs_browser_services, run_blocking_browser_task,
     run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
+    run_served_browser_route,
 };
 pub use default_projection::*;
 #[cfg(feature = "test-support")]

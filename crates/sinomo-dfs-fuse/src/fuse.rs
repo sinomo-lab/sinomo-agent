@@ -7178,7 +7178,7 @@ mod errno_tests {
     }
 
     #[test]
-    fn a_refused_error_record_stays_in_the_outbox_until_the_session_ends() {
+    fn a_refused_error_record_goes_to_recovery_while_the_mount_serves() {
         let mount = TestFuseHandoff::start("fuse-refused-unknown");
         mount.daemon.refuse(TestDaemon::COMMIT_UNKNOWN);
         let service = MountLock::new(0usize);
@@ -7198,11 +7198,14 @@ mod errno_tests {
         );
         assert_eq!(result, Err(libc::EIO), "the refusal ends the syscall");
         assert_eq!(mount.daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN), 1);
-        // The record is durable but no daemon owns it: recovery takes a
-        // marker in this phase only once its mount session has ended.
+        // The released lease hands the record to recovery while the mount's
+        // session lives, and the daemon is asked to look for it.
         let status = mount.status();
-        assert_eq!(status.deferred_live_session_marker_count, 1);
-        assert_eq!(status.exact_recovery_marker_count, 0);
+        assert_eq!(status.full_recovery_marker_count, 1);
+        assert_eq!(status.deferred_live_session_marker_count, 0);
+        eventually("the daemon was asked to look for recovery work", || {
+            mount.daemon.answered_recovery_wakes() >= 1
+        });
         assert!(!mount.handoff.is_gated());
 
         mount.daemon.refuse_nothing();

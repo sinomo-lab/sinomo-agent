@@ -273,13 +273,18 @@ async fn a_refused_commit_ends_the_request_and_leaves_its_exact_work_to_recovery
     let status = export.status();
     assert_eq!(status.exact_recovery_marker_count, 1);
     assert_eq!(status.live_marker_count, 0);
+    eventually(
+        "the daemon was asked to look for the recoverable marker",
+        || export.daemon.answered_recovery_wakes() >= 1,
+    )
+    .await;
 
     export.daemon.refuse_nothing();
     assert!(export.fs.mkdir(&root, &filename("next")).await.is_ok());
 }
 
 #[test]
-fn a_refused_error_record_stays_in_the_outbox_until_the_session_ends() {
+fn a_refused_error_record_goes_to_recovery_while_the_export_serves() {
     let export = TestExport::open("nfs-handoff-refused-unknown");
     let service = export.service();
     export.daemon.refuse(TestDaemon::COMMIT_UNKNOWN);
@@ -297,11 +302,16 @@ fn a_refused_error_record_stays_in_the_outbox_until_the_session_ends() {
         "the refusal is this request's answer: {result:?}"
     );
     assert_eq!(export.daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN), 1);
-    // The record is durable but no daemon owns it: recovery takes a marker
-    // in this phase only once its host-mount session has ended.
+    // The released lease hands the record to recovery while the export's
+    // session lives, and the daemon is asked to look for it.
     let status = export.status();
-    assert_eq!(status.deferred_live_session_marker_count, 1);
-    assert_eq!(status.exact_recovery_marker_count, 0);
+    assert_eq!(status.full_recovery_marker_count, 1);
+    assert_eq!(status.deferred_live_session_marker_count, 0);
+    let until = Instant::now() + Duration::from_secs(20);
+    while export.daemon.answered_recovery_wakes() == 0 {
+        assert!(Instant::now() < until, "the daemon was not asked to look");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 
     export.daemon.refuse_nothing();
     let next: std::result::Result<(), dfs::DfsPosixError> =

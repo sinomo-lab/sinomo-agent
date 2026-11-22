@@ -107,10 +107,13 @@ the export keeps serving.
 
 A serving export is never fenced. A handoff step the daemon has not
 acknowledged is sent again until it is, with no attempt limit: a slow daemon
-is not a lost one. A step the daemon definitely refuses ends its request with
-`NFS3ERR_IO`, is not sent again, and releases what the request held. While the
-outbox is at its marker limit, the next mutation waits for room instead of
-being refused. Lookups, attribute reads, and file reads hand nothing to the
+is not a lost one. An outbox the daemon cannot take a step into yet, because
+another holder has its lock, is answered as busy, and the step is sent again.
+A step the daemon definitely refuses ends its request with `NFS3ERR_IO`, is
+not sent again, and releases what the request held. Releasing the marker's
+lease hands the marker to the daemon's recovery at once, while the export keeps
+serving, and the export asks the daemon to look for it. While the outbox is at
+its marker limit, the next mutation waits for room instead of being refused. Lookups, attribute reads, and file reads hand nothing to the
 daemon and are answered while a mutation waits for it.
 
 A request waits for its outcome without a timeout unless the export has an

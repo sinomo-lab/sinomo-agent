@@ -8,8 +8,8 @@ use sinomo_core::service::{
 };
 use sinomo_dfs::{
     DfsBrowserBackend, DfsBrowserServiceHost, authorize_dfs_core_component_access,
-    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task, run_blocking_browser_task_unqueued,
-    run_blocking_service_task,
+    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task,
+    run_blocking_browser_task_unqueued, run_blocking_service_task, run_served_browser_route,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -215,32 +215,35 @@ impl Service for HostedFeatureService {
                     let changed_path = payload.source.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_browser_task_unqueued(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "streamed DFS attachment",
-                        move || {
-                            let _operation_owner = operation_owner;
-                            let _permit = permit;
-                            let mut spool =
-                                crate::attachment_upload::AttachmentUploadSpool::receive(
-                                    &backend_data_dir,
-                                    body,
-                                    payload.payload_bytes,
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task_unqueued(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "streamed DFS attachment",
+                            move || {
+                                let _operation_owner = operation_owner;
+                                let _permit = permit;
+                                let mut spool =
+                                    crate::attachment_upload::AttachmentUploadSpool::receive(
+                                        &backend_data_dir,
+                                        body,
+                                        payload.payload_bytes,
+                                        &backend_runtime,
+                                    )
+                                    .map_err(dfs_browser_service_error)?;
+                                timing.mark("body_spool");
+                                let backend = FeatureBackend::for_data_dir(
+                                    backend_data_dir,
                                     &backend_runtime,
-                                )
-                                .map_err(dfs_browser_service_error)?;
-                            timing.mark("body_spool");
-                            let backend = FeatureBackend::for_data_dir(
-                                backend_data_dir,
-                                &backend_runtime,
-                                Arc::clone(&backend_host),
-                            )?;
-                            timing.mark("backend_open");
-                            let result =
-                                backend.upload_attachment(&actor, payload, spool.file())?;
-                            Ok((result, backend.event_origin_node_id()?))
-                        },
+                                    Arc::clone(&backend_host),
+                                )?;
+                                timing.mark("backend_open");
+                                let result =
+                                    backend.upload_attachment(&actor, payload, spool.file())?;
+                                Ok((result, backend.event_origin_node_id()?))
+                            },
+                        ),
                     )
                     .await?;
                     effect_host.schedule_metadata_publish(
@@ -294,38 +297,44 @@ impl Service for HostedFeatureService {
                             .acquire(actor.clone(), operation_id, bytes, &limits)
                             .await
                             .map_err(dfs_browser_service_error)?;
-                        run_blocking_browser_task_unqueued(
-                            Arc::clone(&data_dir),
-                            route.clone(),
-                            "DFS attachment mutation",
-                            move || {
-                                let _operation_owner = operation_owner;
-                                let _permit = permit;
-                                let backend = FeatureBackend::for_data_dir(
-                                    backend_data_dir,
-                                    &backend_runtime,
-                                    Arc::clone(&backend_host),
-                                )?;
-                                let result = backend.file_attachment(&actor, payload)?;
-                                Ok((result, backend.event_origin_node_id()?))
-                            },
+                        run_served_browser_route(
+                            &request,
+                            run_blocking_browser_task_unqueued(
+                                Arc::clone(&data_dir),
+                                route.clone(),
+                                "DFS attachment mutation",
+                                move || {
+                                    let _operation_owner = operation_owner;
+                                    let _permit = permit;
+                                    let backend = FeatureBackend::for_data_dir(
+                                        backend_data_dir,
+                                        &backend_runtime,
+                                        Arc::clone(&backend_host),
+                                    )?;
+                                    let result = backend.file_attachment(&actor, payload)?;
+                                    Ok((result, backend.event_origin_node_id()?))
+                                },
+                            ),
                         )
                         .await?
                     } else {
-                        run_blocking_browser_task(
-                            Arc::clone(&data_dir),
-                            route.clone(),
-                            "DFS attachment read",
-                            move || {
-                                let _operation_owner = operation_owner;
-                                let backend = FeatureBackend::for_data_dir(
-                                    backend_data_dir,
-                                    &backend_runtime,
-                                    Arc::clone(&backend_host),
-                                )?;
-                                let result = backend.file_attachment(&actor, payload)?;
-                                Ok((result, backend.event_origin_node_id()?))
-                            },
+                        run_served_browser_route(
+                            &request,
+                            run_blocking_browser_task(
+                                Arc::clone(&data_dir),
+                                route.clone(),
+                                "DFS attachment read",
+                                move || {
+                                    let _operation_owner = operation_owner;
+                                    let backend = FeatureBackend::for_data_dir(
+                                        backend_data_dir,
+                                        &backend_runtime,
+                                        Arc::clone(&backend_host),
+                                    )?;
+                                    let result = backend.file_attachment(&actor, payload)?;
+                                    Ok((result, backend.event_origin_node_id()?))
+                                },
+                            ),
                         )
                         .await?
                     };

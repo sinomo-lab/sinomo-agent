@@ -10,7 +10,7 @@ use sinomo_dfs::{
     DfsBrowserBackend, DfsBrowserMutationAttempt, DfsBrowserServiceHost,
     authorize_dfs_core_component_access, dfs_browser_component_host,
     dfs_core_component_requirement, normalize_sifs_browser_path, run_blocking_browser_task,
-    run_configured_browser_task,
+    run_configured_browser_task, run_served_browser_route,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -173,18 +173,21 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE => {
                     let payload: DfsFileHistoryListRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS history list",
-                        move || {
-                            FeatureBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .list_file_history(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS history list",
+                            move || {
+                                FeatureBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .list_file_history(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE, result)?;
@@ -192,18 +195,21 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE => {
                     let payload: DfsFileHistoryReadRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS history read",
-                        move || {
-                            FeatureBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_file_history(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS history read",
+                            move || {
+                                FeatureBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_file_history(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE, result)?;
@@ -214,31 +220,36 @@ impl Service for HostedFeatureService {
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let attempt_host = Arc::clone(&backend_host);
-                    let result = run_configured_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS history restore",
-                        runtime.clone(),
-                        Arc::clone(&backend_host),
-                        payload,
-                        move |payload| {
-                            let backend = FeatureBackend::for_data_dir(
-                                Arc::clone(&backend_data_dir),
-                                &backend_runtime,
-                                Arc::clone(&attempt_host),
-                            )?;
-                            match backend.try_restore_file_history(payload)? {
-                                DfsBrowserMutationAttempt::Complete(response) => {
-                                    Ok(DfsBrowserMutationAttempt::Complete((
-                                        response,
-                                        backend.event_origin_node_id()?,
-                                    )))
+                    let result = run_served_browser_route(
+                        &request,
+                        run_configured_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS history restore",
+                            runtime.clone(),
+                            Arc::clone(&backend_host),
+                            payload,
+                            move |payload| {
+                                let backend = FeatureBackend::for_data_dir(
+                                    Arc::clone(&backend_data_dir),
+                                    &backend_runtime,
+                                    Arc::clone(&attempt_host),
+                                )?;
+                                match backend.try_restore_file_history(payload)? {
+                                    DfsBrowserMutationAttempt::Complete(response) => {
+                                        Ok(DfsBrowserMutationAttempt::Complete((
+                                            response,
+                                            backend.event_origin_node_id()?,
+                                        )))
+                                    }
+                                    DfsBrowserMutationAttempt::ConfigurationPending(original) => {
+                                        Ok(DfsBrowserMutationAttempt::ConfigurationPending(
+                                            original,
+                                        ))
+                                    }
                                 }
-                                DfsBrowserMutationAttempt::ConfigurationPending(original) => {
-                                    Ok(DfsBrowserMutationAttempt::ConfigurationPending(original))
-                                }
-                            }
-                        },
+                            },
+                        ),
                     )
                     .await?;
                     effect_host.schedule_metadata_publish(
@@ -256,18 +267,21 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE => {
                     let payload: DfsFileHistoryPolicyRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS history policy",
-                        move || {
-                            FeatureBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .file_history_policy(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS history policy",
+                            move || {
+                                FeatureBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .file_history_policy(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_ROUTE, result)?;
@@ -275,18 +289,21 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE => {
                     let payload: DfsFileHistoryPolicyUpdateRequest =
                         ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS history policy update",
-                        move || {
-                            FeatureBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .update_file_history_policy(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS history policy update",
+                            move || {
+                                FeatureBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .update_file_history_policy(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_FILE_HISTORY_POLICY_UPDATE_ROUTE, result)?;
@@ -296,18 +313,21 @@ impl Service for HostedFeatureService {
                         ctx.decode_request_body(&request).await?;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS file history pin",
-                        move || {
-                            FeatureBackend::for_data_dir(
-                                backend_data_dir,
-                                &backend_runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .file_history_pin(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS file history pin",
+                            move || {
+                                FeatureBackend::for_data_dir(
+                                    backend_data_dir,
+                                    &backend_runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .file_history_pin(payload)
+                            },
+                        ),
                     )
                     .await?;
                     effect_host.schedule_metadata_publish(

@@ -173,6 +173,11 @@ pub enum DfsError {
         cause: DfsShardStorageClosedCause,
         detail: String,
     },
+    /// Another holder kept a mounted-mutation outbox lock for the whole
+    /// bounded wait. Nothing was decided: the same request made again can
+    /// succeed.
+    #[error("timed out acquiring mounted-mutation outbox lock {lock} after {waited_millis} ms")]
+    MountedMutationOutboxBusy { lock: String, waited_millis: u64 },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
     #[error("path already exists: {path}")]

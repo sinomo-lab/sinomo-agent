@@ -32,7 +32,7 @@ impl DfsServedRequestScope {
             cancellation: cancellation.clone(),
             executing: Default::default(),
         };
-        (scope, DfsServedRequestDeparture(cancellation))
+        (scope, DfsServedRequestDeparture(Some(cancellation)))
     }
 
     /// When the requester's budget ends, measured on this node.
@@ -120,17 +120,34 @@ impl Drop for DfsServedRequestExecution {
 
 /// Owned by the served handler future; its drop is the requester's departure.
 #[derive(Debug)]
-pub struct DfsServedRequestDeparture(DfsCancellationFlag);
+pub struct DfsServedRequestDeparture(Option<DfsCancellationFlag>);
+
+impl DfsServedRequestDeparture {
+    /// The handler answered: its requester did not leave, so nothing the
+    /// request left running is cancelled.
+    pub fn answered(mut self) {
+        self.0.take();
+    }
+}
 
 impl Drop for DfsServedRequestDeparture {
     fn drop(&mut self) {
-        self.0.cancel();
+        if let Some(cancellation) = self.0.take() {
+            cancellation.cancel();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answered_request_does_not_cancel_what_it_left_running() {
+        let (scope, departure) = DfsServedRequestScope::at_arrival(None);
+        departure.answered();
+        assert!(!scope.cancellation().is_cancelled());
+    }
 
     #[test]
     fn a_dropped_handler_guard_cancels_the_served_request() {

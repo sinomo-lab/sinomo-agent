@@ -9285,9 +9285,9 @@ impl RemoteSifsBrowser {
     ) -> Result<sinomo_runtime::network::ObjectRpcResponse, sinomo_runtime::api::DaemonApiError>
     {
         let timeout = self.rpc_timeout()?;
-        let request = if self.operation_deadline.is_some()
-            && request.route == sinomo_runtime::api::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
-        {
+        // A caller with its own deadline sends what is left of it with every
+        // browser request; the daemon's route ends its work there.
+        let request = if self.operation_deadline.is_some() {
             sinomo_runtime::dfs::with_dfs_request_budget(request, timeout)
         } else {
             request

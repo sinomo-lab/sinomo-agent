@@ -12,7 +12,10 @@
 //!   same mount, and the mount's close, end the pause at once. Nothing counts
 //!   attempts, and a slow daemon is never taken for a lost one.
 //! - **A refusal ends the step.** A step the handoff owner refused, or that
-//!   the adapter's own outbox cannot record, is not sent again.
+//!   the adapter's own outbox cannot record, is not sent again. The mount
+//!   releases the marker's lease, which hands the marker to the daemon's
+//!   recovery at once, and asks the daemon to look for it. Contention on the
+//!   outbox is not a refusal: the daemon answers it as busy.
 //! - **A call's deadline ends the call, not the step.** A step still
 //!   unacknowledged when its call's deadline passes moves to the mount's
 //!   re-sender, which keeps sending it until the daemon answers or the mount
@@ -46,8 +49,13 @@ pub enum MountedSifsHandoffStepError {
 }
 
 impl MountedSifsHandoffStepError {
-    fn rejected(error: impl std::fmt::Display) -> Self {
-        Self::Rejected(error.to_string())
+    /// A failure of the adapter's own outbox: contention on its locks is the
+    /// absence of an answer, anything else a refusal.
+    fn from_outbox(error: DfsError) -> Self {
+        match error {
+            DfsError::MountedMutationOutboxBusy { .. } => Self::Unacknowledged(error.to_string()),
+            other => Self::Rejected(other.to_string()),
+        }
     }
 }
 
@@ -67,6 +75,9 @@ impl From<DaemonDfsMountedMutationHandoffError> for MountedSifsHandoffStepError 
         match error {
             DaemonDfsMountedMutationHandoffError::Rejected(error) => {
                 Self::Rejected(error.to_string())
+            }
+            DaemonDfsMountedMutationHandoffError::Busy => {
+                Self::Unacknowledged("the daemon's mounted-mutation outbox is busy".into())
             }
             DaemonDfsMountedMutationHandoffError::Unacknowledged(error) => {
                 Self::Unacknowledged(error.to_string())
@@ -170,6 +181,10 @@ pub trait MountedSifsHandoffDaemon: std::fmt::Debug + Send + Sync {
         marker_nonce: &MountedSifsMutationNonce,
     ) -> Result<(), MountedSifsHandoffStepError>;
 
+    /// Ask the daemon to look for recovery work now. Any answer from the
+    /// handoff owner acknowledges it.
+    fn wake_recovery(&self) -> Result<(), MountedSifsHandoffStepError>;
+
     /// The longest one attempt waits for its answer. The re-send interval
     /// doubles up to this bound.
     fn attempt_bound(&self) -> Duration;
@@ -258,6 +273,10 @@ impl MountedSifsHandoffDaemon for DaemonDfsMountedMutationHandoffClient {
         )
         .map(drop)
         .map_err(Into::into)
+    }
+
+    fn wake_recovery(&self) -> Result<(), MountedSifsHandoffStepError> {
+        DaemonDfsMountedMutationHandoffClient::wake_recovery(self).map_err(Into::into)
     }
 
     fn attempt_bound(&self) -> Duration {
@@ -396,6 +415,7 @@ pub struct MountedSifsMutationHandoff {
     daemon: Arc<dyn MountedSifsHandoffDaemon>,
     wake: Arc<MountedSifsHandoffWake>,
     pending: Arc<Mutex<Vec<PendingHandoff>>>,
+    recovery_wake: Arc<RecoveryWakeDue>,
     /// Steps the re-sender holds, the one it is sending included.
     unfinished: Arc<std::sync::atomic::AtomicUsize>,
     /// Closes the wake when the mount's own cancellation fires.
@@ -438,10 +458,12 @@ impl MountedSifsMutationHandoff {
         });
         let pending = Arc::new(Mutex::new(Vec::new()));
         let unfinished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_wake = Arc::new(RecoveryWakeDue::default());
         let resender = MountedSifsHandoffResender {
             daemon: Arc::clone(&daemon),
             wake: Arc::clone(&wake),
             pending: Arc::clone(&pending),
+            recovery_wake: Arc::clone(&recovery_wake),
         };
         std::thread::Builder::new()
             .name("sinomo-mount-handoff-resend".into())
@@ -452,6 +474,7 @@ impl MountedSifsMutationHandoff {
             daemon,
             wake,
             pending,
+            recovery_wake,
             unfinished,
             _closing: closing,
         })
@@ -555,7 +578,7 @@ impl MountedSifsMutationHandoff {
     ) -> Result<(), MountedSifsHandoffStepError> {
         lease
             .record_captured_success(arm_request_id, captured_work.clone())
-            .map_err(MountedSifsHandoffStepError::rejected)
+            .map_err(MountedSifsHandoffStepError::from_outbox)
     }
 
     pub fn persist_unknown(
@@ -566,7 +589,7 @@ impl MountedSifsMutationHandoff {
     ) -> Result<(), MountedSifsHandoffStepError> {
         lease
             .record_unknown_after_error(arm_request_id, observation.clone())
-            .map_err(MountedSifsHandoffStepError::rejected)
+            .map_err(MountedSifsHandoffStepError::from_outbox)
     }
 
     pub fn persist_proven_no_write(
@@ -577,7 +600,7 @@ impl MountedSifsMutationHandoff {
     ) -> Result<(), MountedSifsHandoffStepError> {
         lease
             .record_proven_no_write(arm_request_id, proof_code)
-            .map_err(MountedSifsHandoffStepError::rejected)
+            .map_err(MountedSifsHandoffStepError::from_outbox)
     }
 
     pub fn commit_captured(
@@ -637,9 +660,11 @@ impl MountedSifsMutationHandoff {
     }
 
     /// Give up a marker whose step was definitely refused. Its lease ends
-    /// here; the daemon's recovery owns the marker from its durable phase.
+    /// here, and with it the mount's custody: the daemon's recovery may claim
+    /// the marker from its durable phase at once, and the re-sender asks the
+    /// daemon to look now rather than at its next maintenance pass.
     pub fn release_refused(&self, lease: MountedSifsMutationLease<'_>, detail: &str) {
-        release_refused(&self.wake, lease, detail);
+        release_refused(&self.wake, &self.recovery_wake, lease, detail);
     }
 
     /// Keep sending a step the daemon has not acknowledged after its call
@@ -720,6 +745,7 @@ fn resend_delay(daemon: &dyn MountedSifsHandoffDaemon, attempt: u32) -> Duration
 
 fn release_refused(
     wake: &MountedSifsHandoffWake,
+    recovery_wake: &RecoveryWakeDue,
     lease: MountedSifsMutationLease<'_>,
     detail: &str,
 ) {
@@ -733,14 +759,63 @@ fn release_refused(
         detail,
         "a mounted-mutation handoff step was refused; its marker is left to recovery"
     );
+    // The released lease is the custody edge: recovery can claim the marker
+    // only once it is dead, and from then on the mount holds nothing that
+    // could send a step for it.
     drop(lease);
+    recovery_wake.request();
     wake.notify();
+}
+
+/// A request to wake the daemon's recovery, sent by the re-sender until the
+/// daemon answers it.
+#[derive(Debug, Default)]
+struct RecoveryWakeDue(Mutex<Option<(Instant, u32)>>);
+
+impl RecoveryWakeDue {
+    fn state(&self) -> std::sync::MutexGuard<'_, Option<(Instant, u32)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Ask for a wake now.
+    fn request(&self) {
+        let mut state = self.state();
+        let attempt = state.map_or(0, |(_, attempt)| attempt);
+        *state = Some((Instant::now(), attempt));
+    }
+
+    fn due(&self) -> Option<Instant> {
+        self.state().map(|(due, _)| due)
+    }
+
+    /// Take a wake that is due by `now`, with its attempt count.
+    fn take_due(&self, now: Instant) -> Option<u32> {
+        let mut state = self.state();
+        match *state {
+            Some((due, attempt)) if due <= now => {
+                *state = None;
+                Some(attempt)
+            }
+            _ => None,
+        }
+    }
+
+    /// The wake got no answer: send it again at `due`, unless a newer request
+    /// already asks for it sooner.
+    fn again_at(&self, due: Instant, attempt: u32) {
+        let mut state = self.state();
+        let due = state.map_or(due, |(requested, _)| requested.min(due));
+        *state = Some((due, attempt));
+    }
 }
 
 struct MountedSifsHandoffResender {
     daemon: Arc<dyn MountedSifsHandoffDaemon>,
     wake: Arc<MountedSifsHandoffWake>,
     pending: Arc<Mutex<Vec<PendingHandoff>>>,
+    recovery_wake: Arc<RecoveryWakeDue>,
 }
 
 impl MountedSifsHandoffResender {
@@ -751,6 +826,17 @@ impl MountedSifsHandoffResender {
                 return;
             }
             let now = Instant::now();
+            if let Some(attempt) = self.recovery_wake.take_due(now) {
+                if let Err(MountedSifsHandoffStepError::Unacknowledged(_)) =
+                    self.daemon.wake_recovery()
+                {
+                    self.recovery_wake.again_at(
+                        Instant::now() + resend_delay(self.daemon.as_ref(), attempt),
+                        attempt.saturating_add(1),
+                    );
+                }
+                continue;
+            }
             let due = {
                 let Ok(mut pending) = self.pending.lock() else {
                     return;
@@ -772,7 +858,7 @@ impl MountedSifsHandoffResender {
                         self.wake.notify();
                     }
                     Err(MountedSifsHandoffStepError::Rejected(detail)) => {
-                        release_refused(&self.wake, item.lease, &detail);
+                        release_refused(&self.wake, &self.recovery_wake, item.lease, &detail);
                     }
                     Err(MountedSifsHandoffStepError::Unacknowledged(_)) => {
                         item.due =
@@ -794,7 +880,10 @@ impl MountedSifsHandoffResender {
                 .pending
                 .lock()
                 .ok()
-                .and_then(|pending| pending.iter().map(|item| item.due).min());
+                .and_then(|pending| pending.iter().map(|item| item.due).min())
+                .into_iter()
+                .chain(self.recovery_wake.due())
+                .min();
             // With nothing queued only an event can bring work.
             let until = next_due.unwrap_or_else(|| now + Duration::from_secs(3600));
             if !self.wake.wait(seen, until) {
@@ -839,19 +928,19 @@ fn send_unfinished_step(
                 captured_work,
             } => lease
                 .record_captured_success(arm_request_id, captured_work.clone())
-                .map_err(MountedSifsHandoffStepError::rejected)?,
+                .map_err(MountedSifsHandoffStepError::from_outbox)?,
             MountedSifsUnfinishedHandoff::Unknown {
                 arm_request_id,
                 observation,
             } => lease
                 .record_unknown_after_error(arm_request_id, observation.clone())
-                .map_err(MountedSifsHandoffStepError::rejected)?,
+                .map_err(MountedSifsHandoffStepError::from_outbox)?,
             MountedSifsUnfinishedHandoff::NoWrite {
                 arm_request_id,
                 proof_code,
             } => lease
                 .record_proven_no_write(arm_request_id, proof_code.as_str())
-                .map_err(MountedSifsHandoffStepError::rejected)?,
+                .map_err(MountedSifsHandoffStepError::from_outbox)?,
             MountedSifsUnfinishedHandoff::ArmedWithoutEntry { .. }
             | MountedSifsUnfinishedHandoff::Unstarted => {}
         }
@@ -908,6 +997,7 @@ pub struct MountedSifsHandoffTestDaemon {
     silent: std::sync::atomic::AtomicBool,
     refused_steps: Mutex<std::collections::BTreeSet<&'static str>>,
     attempts: Mutex<Vec<&'static str>>,
+    answered_wakes: std::sync::atomic::AtomicUsize,
     attempt_bound: Duration,
 }
 
@@ -918,6 +1008,7 @@ impl MountedSifsHandoffTestDaemon {
     pub const COMMIT_UNKNOWN: &'static str = "commit-unknown";
     pub const PROVE_NO_WRITE: &'static str = "prove-no-write";
     pub const ABORT_UNSTARTED: &'static str = "abort-unstarted";
+    pub const WAKE_RECOVERY: &'static str = "wake-recovery";
 
     /// A daemon that answers every step. Its short per-attempt bound keeps
     /// every re-send interval short.
@@ -934,6 +1025,7 @@ impl MountedSifsHandoffTestDaemon {
             silent: std::sync::atomic::AtomicBool::new(false),
             refused_steps: Mutex::default(),
             attempts: Mutex::default(),
+            answered_wakes: std::sync::atomic::AtomicUsize::new(0),
             attempt_bound,
         })
     }
@@ -979,7 +1071,13 @@ impl MountedSifsHandoffTestDaemon {
                 "the test daemon refused the step".into(),
             ));
         }
-        apply().map_err(MountedSifsHandoffStepError::rejected)
+        apply().map_err(MountedSifsHandoffStepError::from_outbox)
+    }
+
+    /// Whether the daemon was asked to look for recovery work and answered.
+    pub fn answered_recovery_wakes(&self) -> usize {
+        self.answered_wakes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1052,6 +1150,15 @@ impl MountedSifsHandoffDaemon for MountedSifsHandoffTestDaemon {
         })
     }
 
+    fn wake_recovery(&self) -> Result<(), MountedSifsHandoffStepError> {
+        let answered = self.step(Self::WAKE_RECOVERY, || Ok(()));
+        if answered.is_ok() {
+            self.answered_wakes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        answered
+    }
+
     fn attempt_bound(&self) -> Duration {
         self.attempt_bound
     }
@@ -1069,15 +1176,27 @@ mod tests {
         handoff: MountedSifsMutationHandoff,
         daemon: Arc<TestDaemon>,
         store: MountedSifsMutationOutboxStore,
+        data_dir: SinomoDataDir,
         _root: sinomo_testdir::TestDir,
     }
 
     fn test_mount(name: &str, attempt_bound: Duration) -> TestMount {
+        test_mount_of(name, attempt_bound, MountedSifsMutationAdapter::Nfs)
+    }
+
+    fn test_mount_of(
+        name: &str,
+        attempt_bound: Duration,
+        adapter: MountedSifsMutationAdapter,
+    ) -> TestMount {
         let root = sinomo_testdir::TestDir::new(name);
-        let store = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path())).unwrap();
-        let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::Nfs, "nfs:handoff-test")
-            .unwrap();
+        let data_dir = SinomoDataDir::new(root.path());
+        let store = MountedSifsMutationOutboxStore::new(&data_dir).unwrap();
+        let identity = match adapter {
+            MountedSifsMutationAdapter::Fuse => format!("fuse-root:{name}"),
+            _ => "nfs:handoff-test".to_string(),
+        };
+        let session = store.open_host_mount_session(adapter, identity).unwrap();
         let daemon = TestDaemon::with_attempt_bound(store.clone(), attempt_bound);
         let handoff =
             MountedSifsMutationHandoff::start(store.clone(), session, daemon.clone(), None)
@@ -1086,8 +1205,278 @@ mod tests {
             handoff,
             daemon,
             store,
+            data_dir,
             _root: root,
         }
+    }
+
+    /// One mutation on the mount whose closing step the daemon acknowledges.
+    fn serve_one_mutation(mount: &TestMount) {
+        let mut lease = mount.handoff.prepare("test.next", None).unwrap();
+        let arm_request_id = MountedSifsMutationArmRequestId::generate();
+        mount.handoff.arm(&lease, &arm_request_id).unwrap();
+        let captured = MountedSifsMutationCapturedWork::default();
+        mount
+            .handoff
+            .persist_captured(&mut lease, &arm_request_id, &captured)
+            .unwrap();
+        mount
+            .handoff
+            .commit_captured(&lease, &arm_request_id, &captured)
+            .unwrap();
+        mount.handoff.release_after_daemon_ack(lease).unwrap();
+    }
+
+    #[test]
+    fn a_refused_error_record_is_claimed_by_recovery_once_while_the_mount_serves() {
+        for adapter in [
+            MountedSifsMutationAdapter::Nfs,
+            MountedSifsMutationAdapter::Fuse,
+        ] {
+            let mount = test_mount_of(
+                &format!("handoff-refused-record-{adapter:?}"),
+                Duration::from_millis(20),
+                adapter,
+            );
+            mount.daemon.refuse(TestDaemon::COMMIT_UNKNOWN);
+            let mut lease = mount.handoff.prepare("test.unknown", None).unwrap();
+            let marker = lease.marker().clone();
+            let arm_request_id = MountedSifsMutationArmRequestId::generate();
+            mount.handoff.arm(&lease, &arm_request_id).unwrap();
+            let observation = MountedSifsMutationErrorObservation::new(
+                MountedSifsMutationCapturedWork::default(),
+                "test-ambiguous-error",
+            )
+            .unwrap();
+            mount
+                .handoff
+                .persist_unknown(&mut lease, &arm_request_id, &observation)
+                .unwrap();
+            // While the mount holds the lease, recovery cannot claim it.
+            assert_eq!(
+                crate::MountedSifsMutationRecoveryBatch::prepare(&mount.data_dir)
+                    .unwrap()
+                    .claim_count(),
+                0
+            );
+            assert!(matches!(
+                mount
+                    .handoff
+                    .commit_unknown(&lease, &arm_request_id, &observation),
+                Err(MountedSifsHandoffStepError::Rejected(_))
+            ));
+            mount
+                .handoff
+                .release_refused(lease, "refused by the test daemon");
+            // The release asks the daemon to look now, not at a later pass.
+            eventually("the daemon was asked to look for recovery work", || {
+                mount.daemon.answered_recovery_wakes() >= 1
+            });
+            // The released lease hands custody to recovery although the
+            // mount's session is live.
+            let status = mount.store.status().unwrap();
+            assert_eq!(status.full_recovery_marker_count, 1);
+            assert_eq!(status.deferred_live_session_marker_count, 0);
+            let batch = crate::MountedSifsMutationRecoveryBatch::prepare(&mount.data_dir).unwrap();
+            assert_eq!(batch.claim_count(), 1);
+            assert!(batch.requires_full_recovery());
+            // The claim is the fence: a stale step for the marker is refused,
+            // and no second claim takes it.
+            assert!(
+                mount
+                    .store
+                    .accept_unknown_live(
+                        &marker.marker_id,
+                        &marker.marker_nonce,
+                        &arm_request_id,
+                        &observation,
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                crate::MountedSifsMutationRecoveryBatch::prepare(&mount.data_dir)
+                    .unwrap()
+                    .claim_count(),
+                0
+            );
+            // The mount keeps serving while recovery holds the marker.
+            mount.daemon.refuse_nothing();
+            serve_one_mutation(&mount);
+            batch.complete(true).unwrap();
+            assert!(matches!(
+                mount
+                    .store
+                    .marker(&marker.marker_id)
+                    .unwrap()
+                    .map(|marker| marker.phase),
+                None | Some(crate::MountedSifsMutationOutboxPhase::Terminal { .. })
+            ));
+            assert_eq!(
+                crate::MountedSifsMutationRecoveryBatch::prepare(&mount.data_dir)
+                    .unwrap()
+                    .claim_count(),
+                0,
+                "the marker was resolved exactly once"
+            );
+            assert_eq!(mount.store.status().unwrap().pending_marker_count, 0);
+        }
+    }
+
+    #[test]
+    fn a_refused_commit_wakes_recovery_which_claims_its_exact_work_at_once() {
+        let mount = test_mount("handoff-refused-commit-wakes", Duration::from_millis(20));
+        mount.daemon.refuse(TestDaemon::COMMIT_APPLIED);
+        let mut lease = mount.handoff.prepare("test.applied", None).unwrap();
+        let arm_request_id = MountedSifsMutationArmRequestId::generate();
+        mount.handoff.arm(&lease, &arm_request_id).unwrap();
+        let captured = MountedSifsMutationCapturedWork::new(crate::DfsCommittedWork {
+            publish_metadata: true,
+            ..crate::DfsCommittedWork::default()
+        });
+        mount
+            .handoff
+            .persist_captured(&mut lease, &arm_request_id, &captured)
+            .unwrap();
+        assert!(
+            mount
+                .handoff
+                .commit_captured(&lease, &arm_request_id, &captured)
+                .is_err()
+        );
+        mount
+            .handoff
+            .release_refused(lease, "refused by the test daemon");
+        eventually("the daemon was asked to look for recovery work", || {
+            mount.daemon.answered_recovery_wakes() >= 1
+        });
+        let batch = crate::MountedSifsMutationRecoveryBatch::prepare(&mount.data_dir).unwrap();
+        assert_eq!(batch.claim_count(), 1);
+        assert!(
+            !batch.requires_full_recovery(),
+            "the captured work is exact"
+        );
+        assert!(
+            batch
+                .committed_work()
+                .iter()
+                .any(|work| work.publish_metadata)
+        );
+        batch.complete(true).unwrap();
+        assert_eq!(mount.store.status().unwrap().pending_marker_count, 0);
+    }
+
+    #[test]
+    fn an_unanswered_recovery_wake_is_sent_again_until_the_daemon_answers() {
+        let mount = test_mount("handoff-recovery-wake-again", Duration::from_millis(20));
+        mount.daemon.refuse(TestDaemon::ARM);
+        mount.daemon.set_silent(true);
+        let lease = mount.handoff.prepare("test.refused", None).unwrap();
+        mount
+            .handoff
+            .release_refused(lease, "refused by the test daemon");
+        eventually(
+            "the wake was sent again while the daemon was silent",
+            || mount.daemon.attempts_of(TestDaemon::WAKE_RECOVERY) >= 5,
+        );
+        assert_eq!(mount.daemon.answered_recovery_wakes(), 0);
+        mount.daemon.set_silent(false);
+        eventually("the daemon answered the wake", || {
+            mount.daemon.answered_recovery_wakes() == 1
+        });
+        let sent = mount.daemon.attempts_of(TestDaemon::WAKE_RECOVERY);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            mount.daemon.attempts_of(TestDaemon::WAKE_RECOVERY),
+            sent,
+            "an answered wake is not sent again"
+        );
+    }
+
+    /// The daemon's own handoff handler: outbox contention is answered as
+    /// busy, naming the step it answers, and a probe after a mount released a
+    /// refused marker wakes the daemon's maintenance.
+    #[test]
+    fn the_daemon_answers_busy_under_contention_and_a_probe_wakes_its_recovery() {
+        #[derive(Default)]
+        struct Host {
+            maintenance: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::MountedSifsMutationHandoffHost for Host {
+            fn committed_work(&self, _committed_work: crate::DfsMessageCommittedWork) {}
+            fn maintenance_needed(&self) {
+                self.maintenance
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        use crate::{
+            MountedSifsMutationHandoffPhase as Phase, MountedSifsMutationHandoffRequest as Request,
+        };
+        let root = sinomo_testdir::TestDir::new("handoff-daemon-busy-and-wake");
+        let data_dir = SinomoDataDir::new(root.path());
+        let store = MountedSifsMutationOutboxStore::new(&data_dir).unwrap();
+        let session = store
+            .open_host_mount_session(MountedSifsMutationAdapter::Nfs, "nfs:handoff-daemon")
+            .unwrap();
+        let host = Host::default();
+        let handle =
+            |request| crate::handle_mounted_sifs_mutation_handoff(&data_dir, &host, request);
+        let mut lease = store.prepare(&session, None, "test.daemon").unwrap();
+        let marker = lease.marker().clone();
+        let arm_request_id = MountedSifsMutationArmRequestId::generate();
+        let arm = || Request::Arm {
+            marker_id: marker.marker_id.clone(),
+            marker_nonce: marker.marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+        };
+        {
+            // Another holder keeps the outbox's store lock.
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(store.root().join("outbox.lock"))
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&held).unwrap();
+            let probe = handle(Request::Probe).expect("contention is an answer");
+            assert_eq!(probe.phase, Phase::Busy);
+            let busy = handle(arm()).expect("contention is an answer");
+            assert_eq!(busy.phase, Phase::Busy);
+            assert_eq!(busy.marker_id.as_ref(), Some(&marker.marker_id));
+            assert_eq!(busy.arm_request_id.as_ref(), Some(&arm_request_id));
+            fs2::FileExt::unlock(&held).unwrap();
+        }
+        assert_eq!(handle(arm()).unwrap().phase, Phase::Armed);
+        let observation = MountedSifsMutationErrorObservation::new(
+            MountedSifsMutationCapturedWork::default(),
+            "test-ambiguous-error",
+        )
+        .unwrap();
+        lease
+            .record_unknown_after_error(&arm_request_id, observation.clone())
+            .unwrap();
+        // A record that does not match the fsynced one is definitely refused.
+        let mismatched = MountedSifsMutationErrorObservation::new(
+            MountedSifsMutationCapturedWork::default(),
+            "test-other-error",
+        )
+        .unwrap();
+        assert!(
+            handle(Request::CommitUnknown {
+                marker_id: marker.marker_id.clone(),
+                marker_nonce: marker.marker_nonce.clone(),
+                arm_request_id: arm_request_id.clone(),
+                observation: mismatched,
+            })
+            .is_err()
+        );
+        drop(lease);
+        let woken = host.maintenance.load(std::sync::atomic::Ordering::Acquire);
+        // The probe's answer is "not ready", and it wakes recovery.
+        assert!(handle(Request::Probe).is_err());
+        assert!(host.maintenance.load(std::sync::atomic::Ordering::Acquire) > woken);
+        let batch = crate::MountedSifsMutationRecoveryBatch::prepare(&data_dir).unwrap();
+        assert_eq!(batch.claim_count(), 1);
+        batch.complete(true).unwrap();
+        drop(session);
     }
 
     /// Wait for `reached`, which an event the test already caused makes true.

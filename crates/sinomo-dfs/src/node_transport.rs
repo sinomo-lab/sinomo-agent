@@ -6198,7 +6198,15 @@ impl NetworkedDfsService<DfsNodeTransport> {
     pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
         self.transport.replace_peer_nodes(peer_node_ids);
     }
+}
 
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// The operation deadline its caller installed, if any.
+    pub fn transport_operation_deadline(&self) -> Option<Instant> {
+        self.transport.operation_deadline()
+    }
+
+    /// Install the caller's operation deadline, returning the previous one.
     pub fn set_transport_operation_deadline(
         &mut self,
         deadline: Option<Instant>,

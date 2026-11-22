@@ -166,10 +166,12 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   operation budget. A call whose budget ends first returns `EIO`
   (`NFS3ERR_IO`), and the mount keeps sending the step. A step the daemon
   definitely refuses ends its call with the same error and is not sent again.
-  While 64 markers occupy the outbox, the next mutation waits for room. Once
-  the daemon has accepted an error report and the call releases its lease, the
-  daemon can complete recovery for that operation while the mount stays live.
-  Only an unmount or the end of the mount process ends a mount.
+  While 64 markers occupy the outbox, the next mutation waits for room. A
+  marker's custody follows its lease: once the call releases the lease, after
+  the daemon accepted its report or definitely refused it, the daemon's
+  recovery owns the marker and can complete it while the mount stays live; the
+  mount asks the daemon to look for it at once. Only an unmount or the end of
+  the mount process ends a mount.
 - Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
   advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock
   that loses its authority epoch or expires poisons its associated handles and

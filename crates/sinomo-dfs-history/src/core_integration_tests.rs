@@ -2428,8 +2428,12 @@ fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity
         );
         assert!(!client.content_reference_present(&source_reference).unwrap());
     } else {
+        // Main's ordinary continuation, woken by the served resume, runs this
+        // same cleanup while the test observes. It applies the checkpointed
+        // release before it records the cleanup complete, so a running job's
+        // source may be present or already released; the bounded resume below
+        // finishes either cut, and its receipt proves which request released it.
         assert_eq!(job.status, DfsNamespaceJobStatus::Running);
-        assert!(client.content_reference_present(&source_reference).unwrap());
     }
     drop(actual_primary);
     let complete = client
