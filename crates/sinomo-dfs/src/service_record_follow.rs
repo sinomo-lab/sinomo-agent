@@ -153,6 +153,17 @@ impl DfsNamespaceFollow {
     }
 }
 
+/// What a requester's projection says now about the record a held write
+/// was sent under.
+pub(crate) enum DfsHeldWriteWaitNow {
+    /// The wait is over: a message arrived, the record changed, or the
+    /// caller's budget ended.
+    Due(DfsRecordFollowed),
+    /// Nothing yet. `watch` was taken before the projection was read, so a
+    /// publication after that read ends a wait on it.
+    Waiting(Box<dyn crate::DfsConfigurationChangeWatch>),
+}
+
 /// What a requester's projection says now about the record a wait is for.
 pub(crate) enum DfsRecordChangeNow {
     /// The wait is over: the record changed, the re-send timer is due, or the
@@ -464,35 +475,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    /// [`Self::record_change_or_watch`] for a wait that has no re-send timer:
-    /// it ends at `wake_at`, when a message arrives or when the record
-    /// changes.
-    pub(crate) fn record_change_or_watch_until(
+    /// What this requester's projection says now about the record a routed
+    /// write its primary holds was sent under, for a mount that waits for the
+    /// primary's answer itself. Nothing is due on a timer: the wait is over
+    /// when a message has arrived, the record changed or the caller's budget
+    /// ended. Without a configuration watch the requester waits here, until
+    /// `wake_at` at the latest.
+    pub(crate) fn held_write_answer_or_watch(
         &mut self,
         evidence: &DfsRecordChangeEvidence,
         wake_at: Instant,
-    ) -> Result<DfsRecordChangeNow, DfsError> {
+    ) -> Result<DfsHeldWriteWaitNow, DfsError> {
         let deadline = self.transport.operation_deadline();
-        let wake = DfsRecordWaitWake {
-            on_arrival: true,
-            at: Some(wake_at),
-        };
         let watch = self
             .control_plane
             .as_ref()
             .and_then(|control_plane| control_plane.watch_configuration_changes());
         let Some(watch) = watch else {
             return self
-                .await_shard_record_change(evidence, None, wake)
-                .map(DfsRecordChangeNow::Due);
+                .await_shard_record_change(
+                    evidence,
+                    None,
+                    DfsRecordWaitWake {
+                        on_arrival: true,
+                        at: Some(wake_at),
+                    },
+                )
+                .map(DfsHeldWriteWaitNow::Due);
         };
         Ok(
-            match self.record_change_due(evidence, None, wake, deadline)? {
-                Some(followed) => DfsRecordChangeNow::Due(followed),
-                None => DfsRecordChangeNow::NotYet {
-                    watch,
-                    until: deadline.map_or(wake_at, |deadline| deadline.min(wake_at)),
+            match self.record_change_due(
+                evidence,
+                None,
+                DfsRecordWaitWake {
+                    on_arrival: true,
+                    at: None,
                 },
+                deadline,
+            )? {
+                Some(followed) => DfsHeldWriteWaitNow::Due(followed),
+                None => DfsHeldWriteWaitNow::Waiting(watch),
             },
         )
     }

@@ -1474,9 +1474,11 @@ fn pending_write_whose_primary_is_lost(
 
 /// A mounted call's write whose primary answered `Pending` hands its wait
 /// for the commit back to the mount: the mount's lock is free while the
-/// primary holds the write, and the call's next runs send nothing for it.
-/// When a member takes over from the lost primary, the same write goes under
-/// its id to that member, which answers the call.
+/// primary holds the write. Nothing is due on a timer, so through several
+/// re-send intervals the call does not run again and sends nothing. When a
+/// member takes over from the lost primary, the record change runs the call
+/// again, and the same write goes under its id to that member, which answers
+/// the call.
 #[test]
 fn native_mounted_pending_write_hands_its_wait_back_and_is_sent_once() {
     let (runtime, config) = switched_with_kv_voters("native-follow-mounted-held", Some((2, 3)));
@@ -1551,11 +1553,32 @@ fn native_mounted_pending_write_hands_its_wait_back_and_is_sent_once() {
                 }
             }
         });
+        // The primary answers that it holds the write.
+        let answered_by_the_primary = || {
+            let calls = runtime.rpc_observations();
+            calls.iter().any(|call| {
+                call.source == c
+                    && call.target == p
+                    && call.dfs_request_id.as_deref() == Some(operation)
+                    && calls.iter().any(|answer| {
+                        answer.call_id == call.call_id
+                            && answer.phase == crate::test_runtime::RpcPhase::Completed
+                    })
+            })
+        };
         let started = Instant::now();
-        while sends_to(&runtime, &c, &p, operation) == 0 && started.elapsed() < EVENT_BOUND {
+        while !answered_by_the_primary() && started.elapsed() < EVENT_BOUND {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let early = answered.recv_timeout(STILL_WAITING).ok();
+        // The run that reads that answer hands the wait back.
+        let mut early = answered.recv_timeout(Duration::from_secs(1)).ok();
+        let runs_held = runs.load(std::sync::atomic::Ordering::Acquire);
+        // Several intervals of the settle wait's former fallback timer.
+        if early.is_none() {
+            early = answered
+                .recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT * 4)
+                .ok();
+        }
         let lock_free = service
             .lock_until(Some(Instant::now() + Duration::from_secs(5)))
             .is_ok();
@@ -1588,10 +1611,13 @@ fn native_mounted_pending_write_hands_its_wait_back_and_is_sent_once() {
             lock_free,
             "the mount's lock is free while the call waits for the commit"
         );
-        assert!(runs_while_held > 1, "the call handed its wait back");
+        assert_eq!(
+            runs_while_held, runs_held,
+            "a held write's call runs again only on the answer or a record change"
+        );
         assert_eq!(
             sends_while_held, 1,
-            "the call's later runs do not send a write its primary holds"
+            "nothing sends a write its primary holds again"
         );
         let outcome = outcome.unwrap_or_else(|| {
             panic!(

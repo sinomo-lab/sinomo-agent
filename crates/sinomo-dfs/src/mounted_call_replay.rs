@@ -181,10 +181,20 @@ impl MountedSifsCallReplay {
     }
 }
 
+/// How long one wait on the configuration watch lasts while a held write
+/// waits for its primary's answer with nothing due. Its end only starts the
+/// same wait again: the call does not run and sends nothing.
+const MOUNTED_HELD_WRITE_WATCH_SLICE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// A wait for a newer shard record, handed back by a mounted call's run.
 pub struct MountedSifsRecordWait {
     watch: Box<dyn DfsConfigurationChangeWatch>,
-    until: Instant,
+    /// When the call is due to run again; `None` when nothing is due on a
+    /// timer.
+    until: Option<Instant>,
+    /// Set when a message arrives for the mount, for a wait that has no
+    /// timer.
+    arrived: Option<Arc<std::sync::atomic::AtomicBool>>,
     cancellation: Option<DfsCancellationFlag>,
 }
 
@@ -199,8 +209,8 @@ impl std::fmt::Debug for MountedSifsRecordWait {
 
 impl MountedSifsRecordWait {
     /// Wait until the configuration changes, the call's re-send timer or
-    /// budget is due, or the mount is cancelled. The caller holds none of the
-    /// mount's locks.
+    /// budget is due, a message the wait is for arrives, or the mount is
+    /// cancelled. The caller holds none of the mount's locks.
     pub fn wait(mut self) {
         let wake_watch = self.watch.waker();
         let waker: DfsCancellationWaker = Arc::new(move || wake_watch());
@@ -215,7 +225,31 @@ impl MountedSifsRecordWait {
         {
             return;
         }
-        let wait = self.until.saturating_duration_since(Instant::now());
+        let Some(until) = self.until else {
+            // Nothing is due on a timer: only an arrival, a configuration
+            // change or the mount's cancellation ends the wait.
+            loop {
+                let arrived = self
+                    .arrived
+                    .as_ref()
+                    .is_some_and(|arrived| arrived.load(std::sync::atomic::Ordering::Acquire));
+                if arrived
+                    || self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(DfsCancellationFlag::is_cancelled)
+                {
+                    return;
+                }
+                // A change, or a failed watch, ends the wait; the next run
+                // reads the record.
+                match self.watch.wait_for_change(MOUNTED_HELD_WRITE_WATCH_SLICE) {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => return,
+                }
+            }
+        };
+        let wait = until.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             // A failed watch ends the wait; the next run reads the record.
             let _ = self.watch.wait_for_change(wait);
@@ -372,7 +406,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             scope.parked = Some((key, parked));
             scope.handed_back = Some(MountedSifsRecordWait {
                 watch,
-                until,
+                until: Some(until),
+                arrived: None,
                 cancellation,
             });
         }
@@ -393,7 +428,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             scope.probe_resend = Some(resend);
             scope.handed_back = Some(MountedSifsRecordWait {
                 watch,
-                until,
+                until: Some(until),
+                arrived: None,
                 cancellation,
             });
         }
@@ -418,18 +454,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Hand the wait for the answer to a routed write its primary holds
     /// back to the mount. The write keeps its body, and the call's next run
-    /// sends nothing for it (see [`Self::mounted_held_routed_write`]). A
-    /// message that arrives for the mount, such as the primary's answer, ends
-    /// the wait. Returns the cancellation that ends this run.
+    /// sends nothing for it (see [`Self::mounted_held_routed_write`]).
+    /// Nothing is due on a timer: the primary answers when the write commits.
+    /// The wait ends when a message arrives for the mount, such as that
+    /// answer, when the configuration changes, or at the caller's deadline.
+    /// Returns the cancellation that ends this run.
     pub(crate) fn hand_back_mounted_held_write_wait(
         &mut self,
         request_id: &str,
         watch: Box<dyn DfsConfigurationChangeWatch>,
-        until: Instant,
     ) -> DfsError {
+        let arrived = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wake_watch = watch.waker();
+        let on_arrival = Arc::clone(&arrived);
         self.transport
-            .set_incoming_arrival_waker(Some(Arc::new(move || wake_watch())));
+            .set_incoming_arrival_waker(Some(Arc::new(move || {
+                on_arrival.store(true, std::sync::atomic::Ordering::Release);
+                wake_watch();
+            })));
+        let until = self.transport.operation_deadline();
         let cancellation = self.cancellation.clone();
         if let Some(scope) = self.mounted_call.as_mut() {
             if !scope.held_writes.iter().any(|held| held == request_id) {
@@ -438,6 +481,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             scope.handed_back = Some(MountedSifsRecordWait {
                 watch,
                 until,
+                arrived: Some(arrived),
                 cancellation,
             });
         }

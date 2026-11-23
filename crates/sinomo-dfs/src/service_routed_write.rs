@@ -2949,7 +2949,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// under, that primary may never answer, and the same write, under the
     /// same id and with the body the requester kept, goes to the primary the
     /// projection names. The wait ends for its caller when a message arrives
-    /// or at `wake_at`.
+    /// or at `wake_at`. A mounted call hands the wait back instead, with no
+    /// timer: it ends when a message arrives, the record changes or the
+    /// call's budget ends.
     pub(crate) fn await_pending_routed_write(
         &mut self,
         request_id: &str,
@@ -2963,12 +2965,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let followed = if self.mounted_call_hands_back_waits() {
             // The mount waits for the primary's answer with its lock
-            // released. The primary holds the write, so the call's next run
-            // does not send it again: it waits for the answer again.
-            match self.record_change_or_watch_until(&evidence, wake_at)? {
-                crate::service_record_follow::DfsRecordChangeNow::Due(followed) => followed,
-                crate::service_record_follow::DfsRecordChangeNow::NotYet { watch, until } => {
-                    return Err(self.hand_back_mounted_held_write_wait(&canonical, watch, until));
+            // released, and on no timer: the primary answers when the write
+            // commits. The call's next run does not send the write again: it
+            // waits for the answer again.
+            match self.held_write_answer_or_watch(&evidence, wake_at)? {
+                crate::service_record_follow::DfsHeldWriteWaitNow::Due(followed) => followed,
+                crate::service_record_follow::DfsHeldWriteWaitNow::Waiting(watch) => {
+                    return Err(self.hand_back_mounted_held_write_wait(&canonical, watch));
                 }
             }
         } else {
