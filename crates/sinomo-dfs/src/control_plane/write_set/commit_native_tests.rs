@@ -75,7 +75,7 @@ pub(super) fn switched_with_kv_voters(
     switch_services(runtime, config, rule)
 }
 
-fn switch_services(
+pub(super) fn switch_services(
     runtime: DfsTestRuntime,
     config: DfsMetadataShardConfig,
     rule: Option<(usize, usize)>,

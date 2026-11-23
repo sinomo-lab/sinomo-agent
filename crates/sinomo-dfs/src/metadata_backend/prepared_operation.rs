@@ -619,6 +619,17 @@ impl LocalSobjMetadataBackend {
             });
         }
         #[cfg(test)]
+        if prepared_commit_is_held(&self.root, &digest.operation_id) {
+            // Negative-only native fault: the durable prepare stays prepared.
+            return Err(MetadataBackendError::Io {
+                path: self.root.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "test holds this prepared commit",
+                ),
+            });
+        }
+        #[cfg(test)]
         crate::default_cluster::genesis::defer_native_genesis_commit_at_writer(
             &self.root,
             &record,
@@ -749,6 +760,50 @@ impl LocalSobjMetadataBackend {
             published: true,
         })
     }
+}
+
+#[cfg(test)]
+static PREPARED_COMMIT_HOLDS: std::sync::Mutex<BTreeSet<(std::path::PathBuf, String)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+/// Holds the commit of one prepared operation on the given shard roots while
+/// it lives: each attempt fails as an interrupted commit, and the prepare
+/// stays prepared.
+#[cfg(test)]
+pub(crate) struct PreparedCommitHold(Vec<(std::path::PathBuf, String)>);
+#[cfg(test)]
+impl Drop for PreparedCommitHold {
+    fn drop(&mut self) {
+        let mut holds = PREPARED_COMMIT_HOLDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for key in &self.0 {
+            holds.remove(key);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn hold_prepared_commit(
+    roots: &[std::path::PathBuf],
+    operation_id: &str,
+) -> PreparedCommitHold {
+    let keys = roots
+        .iter()
+        .map(|root| (root.clone(), operation_id.to_owned()))
+        .collect::<Vec<_>>();
+    let mut holds = PREPARED_COMMIT_HOLDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for key in &keys {
+        assert!(holds.insert(key.clone()), "one hold per prepared commit");
+    }
+    PreparedCommitHold(keys)
+}
+#[cfg(test)]
+fn prepared_commit_is_held(root: &std::path::Path, operation_id: &str) -> bool {
+    PREPARED_COMMIT_HOLDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&(root.to_owned(), operation_id.to_owned()))
 }
 
 /// A commit that creates retained or committed Current placement owners must
@@ -1309,7 +1364,8 @@ fn negative_publication_effect_shape(
             || body.file_system_id != old.file_system_id
             || body.shard_id != old.shard_id
             || body.owner_epoch <= old.owner_epoch
-            || body.operation_id != format!("recover:{}:{}", old.operation_id, body.owner_epoch)
+            || crate::metadata_records::recovered_operation_id(&body.operation_id, body.owner_epoch)
+                != Some(old.operation_id.as_str())
         {
             return false;
         }

@@ -1019,7 +1019,8 @@ pub use prepared_operation::{
     DfsPreparedOperationStatus,
 };
 pub(crate) use prepared_operation::{
-    compound_prepared_operation_id, with_prepared_payload_validation,
+    compound_prepared_operation_id, recovered_operation_id, recovery_operation_id,
+    with_prepared_payload_validation,
 };
 #[cfg(test)]
 pub(crate) use prepared_operation::{

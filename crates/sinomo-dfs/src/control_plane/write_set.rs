@@ -40,6 +40,8 @@ pub(crate) use takeover::{
 };
 
 #[cfg(test)]
+mod adoption_takeover_native_tests;
+#[cfg(test)]
 mod budget_native_tests;
 #[cfg(test)]
 mod commit_native_tests;

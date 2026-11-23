@@ -173,7 +173,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(false);
         }
         if shard.epoch != record.digest.owner_epoch {
-            let operation_id = format!("recover:{}:{}", record.digest.operation_id, shard.epoch);
+            let operation_id = crate::metadata_records::recovery_operation_id(
+                &record.digest.operation_id,
+                shard.epoch,
+            );
             if let Some(digest) = self
                 .metadata_backend
                 .as_ref()

@@ -709,7 +709,7 @@ impl DfsSourceAdoptionActor {
         )?;
         match reply.outcome {
             Some(DfsSourceAdoptionOutcome::Committed { digest, commit })
-                if digest == completed.digest =>
+                if commits_adoption(&completed.digest, &digest) =>
             {
                 commit.validate(&digest)?
             }
@@ -783,7 +783,7 @@ impl DfsSourceAdoptionActor {
         )?;
         match reply.outcome {
             Some(DfsSourceAdoptionOutcome::Committed { digest, commit })
-                if digest == completed.digest =>
+                if commits_adoption(&completed.digest, &digest) =>
             {
                 commit.validate(&digest)?
             }
