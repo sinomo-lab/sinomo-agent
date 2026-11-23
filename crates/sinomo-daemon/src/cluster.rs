@@ -3718,8 +3718,11 @@ impl ClusterNetworkMaintenance {
     ///
     /// A failure-driven first round for a peer whose every planned endpoint
     /// is already at the failure threshold settles at once: the evidence
-    /// already says what another probe would. Its recovery stays with the
-    /// unreachable retry cadence and with deliveries that contradict it.
+    /// already says what another probe would. Nothing was probed, so the
+    /// episode concludes nothing; a requester that needs the peer examined
+    /// asks with a cause that is not a failure, which always probes. Its
+    /// recovery stays with the unreachable retry cadence and with deliveries
+    /// that contradict it.
     fn select_connectivity_probe_plan_with_verification(
         &mut self,
         paths: &ClusterPaths,
@@ -3787,7 +3790,7 @@ impl ClusterNetworkMaintenance {
                 self.settle_peer_verification(
                     paths,
                     peer,
-                    sinomo_core::cluster::ClusterPeerVerificationSettlement::Exhausted,
+                    sinomo_core::cluster::ClusterPeerVerificationSettlement::AlreadyExhausted,
                 );
                 continue;
             }
@@ -3801,6 +3804,7 @@ impl ClusterNetworkMaintenance {
             {
                 // Nothing this node can dial: relayed-only peers are verified
                 // through their first hop and by the relay's own feedback.
+                // This node examined nothing.
                 self.settle_peer_verification(
                     paths,
                     peer,
@@ -3942,6 +3946,9 @@ impl ClusterNetworkMaintenance {
         }
     }
 
+    /// Ends `peer`'s episode outside a round's own result. Whether the
+    /// episode examined the peer is the settlement's: see
+    /// `ClusterPeerVerificationSettlement::outcome`.
     fn settle_peer_verification(
         &mut self,
         paths: &ClusterPaths,
@@ -3953,17 +3960,31 @@ impl ClusterNetworkMaintenance {
             target: "sinomo.daemon.cluster_network_maintenance",
             peer = %peer, ?settlement, "peer verification settled"
         );
-        sinomo_core::network::__connectivity_store::settle_peer_verification(paths, peer);
+        sinomo_core::network::__connectivity_store::settle_peer_verification(
+            paths,
+            peer,
+            settlement.outcome(),
+        );
     }
 
+    /// Ends every episode without a verdict: this node has no cluster, is
+    /// alone in it, is not yet a registered member, or the probe's own
+    /// identity was superseded. None of them examined its peer.
     fn cancel_peer_verifications(&mut self, paths: &ClusterPaths) {
+        let cancelled = sinomo_core::cluster::ClusterPeerVerificationSettlement::Cancelled;
         for peer in self.cadence.peer_verification.cancel_all() {
-            sinomo_core::network::__connectivity_store::settle_peer_verification(paths, &peer);
+            sinomo_core::network::__connectivity_store::settle_peer_verification(
+                paths,
+                &peer,
+                cancelled.outcome(),
+            );
         }
     }
 
     /// Records one verification round per planned peer from this batch's
-    /// observations and the accepted source set.
+    /// observations and the accepted source set. Without observations the
+    /// round is inconclusive: the probe did not complete, or its results
+    /// were not accepted into the source set.
     fn finish_peer_verification_rounds(
         &mut self,
         paths: &ClusterPaths,
@@ -3985,7 +4006,11 @@ impl ClusterNetworkMaintenance {
                     target: "sinomo.daemon.cluster_network_maintenance",
                     peer = %peer, ?round, ?settlement, "peer verification settled"
                 );
-                sinomo_core::network::__connectivity_store::settle_peer_verification(paths, peer);
+                sinomo_core::network::__connectivity_store::settle_peer_verification(
+                    paths,
+                    peer,
+                    settlement.outcome(),
+                );
             }
         }
     }
@@ -18400,6 +18425,496 @@ mod tests {
                 .peer_verification
                 .episode(&verified)
                 .is_none()
+        );
+    }
+
+    /// A seeded cluster under a probe owner with two peers: `lost`, whose one
+    /// endpoint refuses connections and whose recorded evidence is already
+    /// at the failure threshold, so this node's verdict for it stands at no
+    /// path; and `undialed`, which publishes no endpoint this node dials.
+    struct PeerVerificationSettlements {
+        // Dropped first, so no task of a probe's publication outlives the
+        // test directory, which is dropped last.
+        runtime: tokio::runtime::Runtime,
+        paths: ClusterPaths,
+        state: ClusterBootstrapState,
+        maintenance: ClusterNetworkMaintenance,
+        _owner: sinomo_core::network::__connectivity_store::PeerVerificationOwner,
+        lost: NodeId,
+        lost_endpoint: ClusterEndpointRecord,
+        undialed: NodeId,
+        root: sinomo_testdir::TestDir,
+    }
+
+    impl PeerVerificationSettlements {
+        fn new(name: &str) -> Self {
+            let runtime = daemon_cluster_test_runtime();
+            let (root, paths, mut state) = seeded_single_node_cluster_for_publish_cache_test(name);
+            let now = OffsetDateTime::now_utc();
+            let mut peers = Vec::new();
+            for (role, dialed) in [("lost", true), ("undialed", false)] {
+                let node = NodeId::from_legacy_named(format!("{name}_{role}")).expect("peer id");
+                let endpoint = sinomo_core::network::daemon_lan_endpoint(
+                    &node,
+                    refused_loopback_address(),
+                    10,
+                );
+                let mut member = ClusterMemberRecord::local_non_voting(
+                    state.cluster_id.clone(),
+                    node.clone(),
+                    role,
+                    "pk-peer",
+                    now,
+                );
+                member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+                member.allowed_capabilities = member.capabilities.clone();
+                if dialed {
+                    member.endpoints.push(endpoint.clone());
+                }
+                state.members.push(member);
+                peers.push((node, endpoint));
+            }
+            sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+            sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+            let (lost, lost_endpoint) = peers[0].clone();
+            let (undialed, _) = peers[1].clone();
+            let exhausted = sinomo_core::network::cluster_connectivity_record(
+                &state,
+                &lost_endpoint,
+                ClusterConnectivityState::Unreachable,
+                None,
+                sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+                None,
+                None,
+                now,
+                sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+            );
+            sinomo_core::network::write_local_cluster_connectivity_record_set(
+                &paths,
+                &state.local_node_id,
+                &[exhausted],
+            )
+            .unwrap();
+            let owner =
+                sinomo_core::network::__connectivity_store::register_peer_verification_owner(
+                    &paths,
+                );
+            let fixture = Self {
+                runtime,
+                maintenance: cluster_network_scheduler_maintenance_for_test(Instant::now()),
+                _owner: owner,
+                paths,
+                state,
+                lost,
+                lost_endpoint,
+                undialed,
+                root,
+            };
+            assert_eq!(
+                sinomo_core::network::peer_reachability_snapshot(&fixture.paths, &fixture.state)
+                    .unwrap()
+                    .verdict(&fixture.lost),
+                sinomo_core::network::PeerPathVerdict::NoPath,
+                "the verdict stands before any episode"
+            );
+            assert_eq!(fixture.generations(&fixture.lost), (0, 0));
+            assert_eq!(fixture.generations(&fixture.undialed), (0, 0));
+            fixture
+        }
+
+        /// The peer's examined and concluded generations, as published.
+        fn generations(&self, peer: &NodeId) -> (u64, u64) {
+            let snapshot =
+                sinomo_core::network::peer_reachability_snapshot(&self.paths, &self.state).unwrap();
+            let entry = snapshot.peers.get(peer).expect("the peer has an entry");
+            assert!(!entry.verifying, "no episode is running");
+            (entry.examined_generation, entry.concluded_generation)
+        }
+
+        /// One settled episode: the examined generation moved; whether the
+        /// concluded one moved with it is the settlement's outcome.
+        fn assert_settled(&self, peer: &NodeId, before: (u64, u64), concluded: bool, how: &str) {
+            assert!(
+                self.maintenance
+                    .cadence
+                    .peer_verification
+                    .episode(peer)
+                    .is_none(),
+                "{how}: the episode settled"
+            );
+            let after = self.generations(peer);
+            assert!(after.0 > before.0, "{how}: an episode settled");
+            if concluded {
+                assert_eq!(after.1, after.0, "{how}: the episode concluded");
+            } else {
+                assert_eq!(after.1, before.1, "{how}: the episode concluded nothing");
+            }
+        }
+
+        /// Starts the episodes of every pending request.
+        fn start_pending(&mut self) {
+            let requests =
+                sinomo_core::network::__connectivity_store::take_pending_peer_verifications(
+                    &self.paths,
+                );
+            self.maintenance
+                .request_peer_verifications(&self.paths, requests, Instant::now());
+        }
+
+        /// Starts an episode for `peer` as a service's request does, or as a
+        /// failed delivery does.
+        fn start(&mut self, peer: &NodeId, failed_delivery: bool) {
+            assert!(if failed_delivery {
+                sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                    &self.paths,
+                    &self.state.local_node_id,
+                    peer,
+                )
+            } else {
+                sinomo_core::network::request_peer_verification(&self.paths, &self.state, peer)
+            });
+            self.start_pending();
+            assert!(
+                self.maintenance
+                    .cadence
+                    .peer_verification
+                    .episode(peer)
+                    .is_some()
+            );
+        }
+
+        /// Plans the next verification round of every running episode.
+        fn plan(&mut self) -> ClusterConnectivityProbePlan {
+            let due = self
+                .maintenance
+                .cadence
+                .peer_verifications_due(Instant::now() + Duration::from_secs(30));
+            self.maintenance
+                .select_connectivity_probe_plan_with_verification(
+                    &self.paths,
+                    &self.state,
+                    false,
+                    &due,
+                )
+        }
+
+        fn pending_probe(
+            &self,
+            plan: ClusterConnectivityProbePlan,
+        ) -> ClusterNetworkMaintenancePendingWork {
+            let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&self.paths).unwrap();
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                    memory_only: false,
+                    paths: self.paths.clone(),
+                    source_node_id: self.state.local_node_id.clone(),
+                    state: self.state.clone(),
+                    plan,
+                    input_generation: self.maintenance.connectivity_input_generation,
+                    local_connectivity_snapshot: snapshot,
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// Runs one planned round through the real probe and its commit.
+        fn probe(&mut self, plan: ClusterConnectivityProbePlan) {
+            let pending = self.pending_probe(plan);
+            let handle = self.runtime.handle().clone();
+            self.runtime
+                .block_on(self.maintenance.run_pending_work_async(pending, handle));
+        }
+
+        fn lost_observation(
+            &self,
+            state: ClusterConnectivityState,
+            failures: u16,
+        ) -> ClusterConnectivityRecord {
+            sinomo_core::network::cluster_connectivity_record(
+                &self.state,
+                &self.lost_endpoint,
+                state,
+                None,
+                failures,
+                None,
+                None,
+                OffsetDateTime::now_utc(),
+                sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        }
+    }
+
+    #[test]
+    fn a_round_whose_probe_exhausts_or_reaches_the_peer_concludes_its_episode() {
+        let mut fixture = PeerVerificationSettlements::new("peer_verification_concluded");
+        let lost = fixture.lost.clone();
+
+        // A service's request is always probed. Against evidence already at
+        // the failure threshold one refused round exhausts the peer.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        let plan = fixture.plan();
+        assert!(
+            plan.entries
+                .iter()
+                .any(|entry| entry.endpoint.node_id == lost),
+            "a requested episode probes an exhausted peer"
+        );
+        fixture.probe(plan);
+        fixture.assert_settled(&lost, before, true, "exhausted by its own probe");
+        assert_eq!(
+            sinomo_core::network::peer_reachability_snapshot(&fixture.paths, &fixture.state)
+                .unwrap()
+                .verdict(&lost),
+            sinomo_core::network::PeerPathVerdict::NoPath
+        );
+
+        // A round that observes an endpoint answering reaches the peer.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        let plan = fixture.plan();
+        let reached = fixture.lost_observation(ClusterConnectivityState::Healthy, 0);
+        fixture.maintenance.finish_peer_verification_rounds(
+            &fixture.paths,
+            &plan.verification,
+            Some(&[reached]),
+        );
+        fixture.assert_settled(&lost, before, true, "reached by its own probe");
+    }
+
+    #[test]
+    fn an_episode_settled_without_a_probe_concludes_nothing() {
+        let mut fixture = PeerVerificationSettlements::new("peer_verification_unprobed");
+        let (lost, undialed) = (fixture.lost.clone(), fixture.undialed.clone());
+
+        // A failed delivery to a peer whose evidence is already at the
+        // failure threshold settles at once, without a probe.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, true);
+        let plan = fixture.plan();
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.endpoint.node_id != lost),
+            "no probe for an exhausted peer"
+        );
+        fixture.assert_settled(&lost, before, false, "already exhausted");
+
+        // A peer with nothing this node dials is cancelled.
+        let before = fixture.generations(&undialed);
+        fixture.start(&undialed, false);
+        let plan = fixture.plan();
+        assert!(plan.entries.is_empty(), "nothing to dial");
+        fixture.assert_settled(&undialed, before, false, "nothing to dial");
+
+        // Every episode is cancelled when this node has no cluster, is alone
+        // in it or is not yet a registered member.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        fixture
+            .maintenance
+            .cancel_peer_verifications(&fixture.paths);
+        fixture.assert_settled(&lost, before, false, "cancelled");
+
+        // A probe whose own identity was superseded while it ran cancels
+        // every episode, whatever it observed.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        let plan = fixture.plan();
+        let mut pending = fixture.pending_probe(plan);
+        pending
+            .connectivity_probe
+            .as_mut()
+            .expect("the planned probe")
+            .source_node_id = undialed.clone();
+        let handle = fixture.runtime.handle().clone();
+        fixture
+            .runtime
+            .block_on(fixture.maintenance.run_pending_work_async(pending, handle));
+        fixture.assert_settled(&lost, before, false, "superseded");
+    }
+
+    #[test]
+    fn an_episode_whose_rounds_reach_no_verdict_concludes_nothing() {
+        let mut fixture = PeerVerificationSettlements::new("peer_verification_inconclusive");
+        let lost = fixture.lost.clone();
+
+        // The maintenance budget ends before the probe runs: the round has
+        // no observation. Three such rounds end the episode.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        for round in 1..=sinomo_core::network::CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS {
+            assert!(
+                fixture
+                    .maintenance
+                    .cadence
+                    .peer_verification
+                    .episode(&lost)
+                    .is_some(),
+                "round {round} runs"
+            );
+            let plan = fixture.plan();
+            let pending = fixture.pending_probe(plan);
+            let handle = fixture.runtime.handle().clone();
+            fixture
+                .runtime
+                .block_on(fixture.maintenance.run_pending_work_until_async(
+                    pending,
+                    handle,
+                    Instant::now(),
+                ));
+        }
+        fixture.assert_settled(&lost, before, false, "inconclusive");
+
+        // A batch that observed other peers only is no observation of this
+        // one either.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        for _ in 0..sinomo_core::network::CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS {
+            let plan = fixture.plan();
+            fixture.maintenance.finish_peer_verification_rounds(
+                &fixture.paths,
+                &plan.verification,
+                Some(&[]),
+            );
+        }
+        fixture.assert_settled(&lost, before, false, "no observation of the peer");
+
+        // Failure evidence that stays below the threshold runs the episode
+        // to its round limit.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, false);
+        let degraded = fixture.lost_observation(ClusterConnectivityState::Degraded, 1);
+        for _ in 0..sinomo_core::network::CLUSTER_PEER_VERIFICATION_MAX_ROUNDS {
+            let plan = fixture.plan();
+            fixture.maintenance.finish_peer_verification_rounds(
+                &fixture.paths,
+                &plan.verification,
+                Some(std::slice::from_ref(&degraded)),
+            );
+        }
+        fixture.assert_settled(&lost, before, false, "round limit");
+    }
+
+    /// The DFS write-set roles act on a no-path verdict that already stood
+    /// when they first read a record's epoch only once the network examined
+    /// the peer since. Their gate reads this node's real verdicts and asks
+    /// this node's real registry; the episodes below settle as the daemon
+    /// settles them.
+    #[test]
+    fn a_standing_no_path_verdict_counts_for_dfs_only_after_a_concluded_episode() {
+        use sinomo_core::network::PeerVerificationCause;
+        let mut fixture = PeerVerificationSettlements::new("peer_verification_dfs_gate");
+        let lost = fixture.lost.clone();
+        let data_dir = SinomoDataDir::new(fixture.root.join("data"));
+        let mut gate = sinomo_dfs::test_support::DfsStandingVerdictGate::new(
+            &data_dir,
+            &fixture.paths,
+            &fixture.state,
+        );
+        let resend = sinomo_dfs::test_support::DfsStandingVerdictGate::RESEND_FIRST;
+        let margin = Duration::from_millis(60);
+        let pending = |fixture: &PeerVerificationSettlements| {
+            sinomo_core::network::__connectivity_store::take_pending_peer_verifications(
+                &fixture.paths,
+            )
+        };
+        let start = |fixture: &mut PeerVerificationSettlements,
+                     requests: Vec<(NodeId, PeerVerificationCause)>| {
+            fixture.maintenance.request_peer_verifications(
+                &fixture.paths,
+                requests,
+                Instant::now(),
+            );
+        };
+
+        // The verdict stood when the epoch was first read: the gate asks the
+        // network to examine the peer, as a service.
+        assert!(!gate.counts_under(7, &lost));
+        let requests = pending(&fixture);
+        assert_eq!(
+            requests,
+            vec![(lost.clone(), PeerVerificationCause::Requested)]
+        );
+
+        // The episode is cancelled. The gate stays closed and asks again
+        // only on its re-send timer.
+        let before = fixture.generations(&lost);
+        start(&mut fixture, requests);
+        fixture
+            .maintenance
+            .cancel_peer_verifications(&fixture.paths);
+        fixture.assert_settled(&lost, before, false, "cancelled");
+        assert!(
+            !gate.counts_under(7, &lost),
+            "a cancelled episode certifies nothing"
+        );
+        assert!(
+            pending(&fixture).is_empty(),
+            "nothing is asked before the re-send is due"
+        );
+        std::thread::sleep(resend + margin);
+        assert!(!gate.counts_under(7, &lost));
+        let requests = pending(&fixture);
+        assert_eq!(
+            requests,
+            vec![(lost.clone(), PeerVerificationCause::Requested)],
+            "the request is re-sent"
+        );
+
+        // The re-sent episode's rounds produce no observation.
+        let before = fixture.generations(&lost);
+        start(&mut fixture, requests);
+        for _ in 0..sinomo_core::network::CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS {
+            let plan = fixture.plan();
+            let pending = fixture.pending_probe(plan);
+            let handle = fixture.runtime.handle().clone();
+            fixture
+                .runtime
+                .block_on(fixture.maintenance.run_pending_work_until_async(
+                    pending,
+                    handle,
+                    Instant::now(),
+                ));
+        }
+        fixture.assert_settled(&lost, before, false, "inconclusive");
+        assert!(
+            !gate.counts_under(7, &lost),
+            "an inconclusive episode certifies nothing"
+        );
+
+        // A failed delivery's episode is answered from the recorded evidence.
+        let before = fixture.generations(&lost);
+        fixture.start(&lost, true);
+        let _ = fixture.plan();
+        fixture.assert_settled(&lost, before, false, "already exhausted");
+        assert!(
+            !gate.counts_under(7, &lost),
+            "an episode that probed nothing certifies nothing"
+        );
+
+        // The next re-send is served by one real probe: it exhausts the
+        // peer, and the verdict counts.
+        std::thread::sleep(resend * 2 + margin);
+        assert!(!gate.counts_under(7, &lost));
+        let requests = pending(&fixture);
+        assert!(
+            requests.contains(&(lost.clone(), PeerVerificationCause::Requested)),
+            "the request is re-sent again: {requests:?}"
+        );
+        let before = fixture.generations(&lost);
+        start(&mut fixture, requests);
+        let plan = fixture.plan();
+        fixture.probe(plan);
+        fixture.assert_settled(&lost, before, true, "exhausted by its own probe");
+        assert!(
+            gate.counts_under(7, &lost),
+            "one examination that concludes certifies the standing verdict"
+        );
+        assert!(gate.counts_under(7, &lost), "and it stays certified");
+        assert!(
+            !gate.counts_under(8, &lost),
+            "a later epoch is read with the verdict standing again"
         );
     }
 

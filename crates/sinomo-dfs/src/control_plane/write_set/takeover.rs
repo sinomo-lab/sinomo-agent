@@ -9,7 +9,8 @@
 
 use super::*;
 use crate::takeover_corroboration::{
-    DfsTakeoverAbstainReason, DfsTakeoverPrimaryReach, DfsTakeoverRank,
+    DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED, DfsTakeoverAbstainReason, DfsTakeoverPrimaryReach,
+    DfsTakeoverRank,
 };
 use std::collections::BTreeMap;
 
@@ -236,6 +237,8 @@ pub(crate) enum DfsTakeoverHandOffDecision {
 /// Whether the member asked to run the takeover does so. It ranks the
 /// asker's ranking again with its own current head; when that puts the asker
 /// first it declines in the asker's favour, so a disagreement bounces once.
+/// A member that reaches the primary declines with
+/// [`DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED`], which vetoes the attempt.
 pub(crate) fn decide_metadata_takeover_hand_off(
     local: &DfsTakeoverRank,
     own_answer: &DfsTakeoverPrimaryReach,
@@ -244,7 +247,11 @@ pub(crate) fn decide_metadata_takeover_hand_off(
 ) -> DfsTakeoverHandOffDecision {
     if own_answer != &DfsTakeoverPrimaryReach::Lost {
         return DfsTakeoverHandOffDecision::Decline {
-            reason: "primary-not-lost",
+            reason: if own_answer == &DfsTakeoverPrimaryReach::Reaches {
+                DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED
+            } else {
+                "primary-not-lost"
+            },
             prefer: None,
         };
     }
@@ -612,10 +619,26 @@ mod tests {
                 prefer: Some(asker.clone()),
             }
         );
+        // A target that reaches the primary says so: that vetoes.
         assert_eq!(
             decide_metadata_takeover_hand_off(
                 &rank("c", 9, false),
                 &DfsTakeoverPrimaryReach::Reaches,
+                &asker,
+                &ranking
+            ),
+            DfsTakeoverHandOffDecision::Decline {
+                reason: DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED,
+                prefer: None,
+            }
+        );
+        // One without evidence does not reach it, and does not veto.
+        assert_eq!(
+            decide_metadata_takeover_hand_off(
+                &rank("c", 9, false),
+                &DfsTakeoverPrimaryReach::Abstain {
+                    reason: DfsTakeoverAbstainReason::NoEvidence,
+                },
                 &asker,
                 &ranking
             ),

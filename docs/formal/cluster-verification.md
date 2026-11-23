@@ -801,10 +801,12 @@ describe a copy the member has since deleted on retirement. A submitted add
 stays a required acknowledgement, durably, until the record shows it applied or
 can no longer apply.
 
-Five deterministic traces cover the design: abrupt primary loss with a
+Six deterministic traces cover the design: abrupt primary loss with a
 successor completing a prepared change and the old primary rejoining after
 dropping its tail; a follower that holds the old primary's unacknowledged
-records dropping them at epoch start before the new primary commits with it; a
+records dropping them at epoch start before the new primary commits with it;
+two candidates promising against one record, where the one whose swap is
+rejected learns that, confirms the new record and takes over the next epoch; a
 shrink racing a takeover, with the rejected candidate releasing its promise and
 being re-added; a primary restart with a pending add, after which the added
 member takes over; and, with the W floor equal to N, a dead member held at the

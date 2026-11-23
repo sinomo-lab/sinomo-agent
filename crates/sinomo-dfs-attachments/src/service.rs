@@ -8,8 +8,8 @@ use sinomo_core::service::{
 };
 use sinomo_dfs::{
     DfsBrowserBackend, DfsBrowserServiceHost, authorize_dfs_core_component_access,
-    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task, run_blocking_browser_task_unqueued,
-    run_blocking_service_task,
+    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task,
+    run_blocking_browser_task_unqueued, run_blocking_service_task, run_served_browser_route,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -215,32 +215,35 @@ impl Service for HostedFeatureService {
                     let changed_path = payload.source.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_browser_task_unqueued(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "streamed DFS attachment",
-                        move || {
-                            let _operation_owner = operation_owner;
-                            let _permit = permit;
-                            let mut spool =
-                                crate::attachment_upload::AttachmentUploadSpool::receive(
-                                    &backend_data_dir,
-                                    body,
-                                    payload.payload_bytes,
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task_unqueued(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "streamed DFS attachment",
+                            move || {
+                                let _operation_owner = operation_owner;
+                                let _permit = permit;
+                                let mut spool =
+                                    crate::attachment_upload::AttachmentUploadSpool::receive(
+                                        &backend_data_dir,
+                                        body,
+                                        payload.payload_bytes,
+                                        &backend_runtime,
+                                    )
+                                    .map_err(dfs_browser_service_error)?;
+                                timing.mark("body_spool");
+                                let backend = FeatureBackend::for_data_dir(
+                                    backend_data_dir,
                                     &backend_runtime,
-                                )
-                                .map_err(dfs_browser_service_error)?;
-                            timing.mark("body_spool");
-                            let backend = FeatureBackend::for_data_dir(
-                                backend_data_dir,
-                                &backend_runtime,
-                                Arc::clone(&backend_host),
-                            )?;
-                            timing.mark("backend_open");
-                            let result =
-                                backend.upload_attachment(&actor, payload, spool.file())?;
-                            Ok((result, backend.event_origin_node_id()?))
-                        },
+                                    Arc::clone(&backend_host),
+                                )?;
+                                timing.mark("backend_open");
+                                let result =
+                                    backend.upload_attachment(&actor, payload, spool.file())?;
+                                Ok((result, backend.event_origin_node_id()?))
+                            },
+                        ),
                     )
                     .await?;
                     effect_host.schedule_metadata_publish(
@@ -294,38 +297,44 @@ impl Service for HostedFeatureService {
                             .acquire(actor.clone(), operation_id, bytes, &limits)
                             .await
                             .map_err(dfs_browser_service_error)?;
-                        run_blocking_browser_task_unqueued(
-                            Arc::clone(&data_dir),
-                            route.clone(),
-                            "DFS attachment mutation",
-                            move || {
-                                let _operation_owner = operation_owner;
-                                let _permit = permit;
-                                let backend = FeatureBackend::for_data_dir(
-                                    backend_data_dir,
-                                    &backend_runtime,
-                                    Arc::clone(&backend_host),
-                                )?;
-                                let result = backend.file_attachment(&actor, payload)?;
-                                Ok((result, backend.event_origin_node_id()?))
-                            },
+                        run_served_browser_route(
+                            &request,
+                            run_blocking_browser_task_unqueued(
+                                Arc::clone(&data_dir),
+                                route.clone(),
+                                "DFS attachment mutation",
+                                move || {
+                                    let _operation_owner = operation_owner;
+                                    let _permit = permit;
+                                    let backend = FeatureBackend::for_data_dir(
+                                        backend_data_dir,
+                                        &backend_runtime,
+                                        Arc::clone(&backend_host),
+                                    )?;
+                                    let result = backend.file_attachment(&actor, payload)?;
+                                    Ok((result, backend.event_origin_node_id()?))
+                                },
+                            ),
                         )
                         .await?
                     } else {
-                        run_blocking_browser_task(
-                            Arc::clone(&data_dir),
-                            route.clone(),
-                            "DFS attachment read",
-                            move || {
-                                let _operation_owner = operation_owner;
-                                let backend = FeatureBackend::for_data_dir(
-                                    backend_data_dir,
-                                    &backend_runtime,
-                                    Arc::clone(&backend_host),
-                                )?;
-                                let result = backend.file_attachment(&actor, payload)?;
-                                Ok((result, backend.event_origin_node_id()?))
-                            },
+                        run_served_browser_route(
+                            &request,
+                            run_blocking_browser_task(
+                                Arc::clone(&data_dir),
+                                route.clone(),
+                                "DFS attachment read",
+                                move || {
+                                    let _operation_owner = operation_owner;
+                                    let backend = FeatureBackend::for_data_dir(
+                                        backend_data_dir,
+                                        &backend_runtime,
+                                        Arc::clone(&backend_host),
+                                    )?;
+                                    let result = backend.file_attachment(&actor, payload)?;
+                                    Ok((result, backend.event_origin_node_id()?))
+                                },
+                            ),
                         )
                         .await?
                     };
@@ -487,7 +496,8 @@ pub fn module_registration() -> sinomo_module::ModuleRegistration {
             ),
         )
         .subscribe_event(namespace_subscription())
-        .subscribe_event(cluster_control_subscription());
+        .subscribe_event(cluster_control_subscription())
+        .subscribe_event(configuration_subscription());
     registration.component = descriptor;
     registration
 }
@@ -519,6 +529,11 @@ pub fn component_factory()
             .map_err(|error| {
                 sinomo_module::ComponentError::component(&caller.component_id, error)
             })?;
+        let configuration_events = event_client
+            .subscribe(&configuration_subscription())
+            .map_err(|error| {
+                sinomo_module::ComponentError::component(&caller.component_id, error)
+            })?;
         mount_attachment_maintenance(
             scope,
             Arc::new(context.data_dir().clone()),
@@ -528,6 +543,7 @@ pub fn component_factory()
             Arc::clone(&feature_runtime),
             namespace_events,
             cluster_events,
+            configuration_events,
         );
         let service = HostedFeatureService {
             runtime,
@@ -571,6 +587,15 @@ fn cluster_control_subscription() -> sinomo_module::ComponentEventSubscription {
         sinomo_module::COMPONENT_HOST_CLUSTER_CONTROL_CHANGED_EVENT_KIND,
         sinomo_module::COMPONENT_HOST_EVENT_SCHEMA_ID,
         sinomo_module::COMPONENT_HOST_EVENT_SCHEMA_VERSION,
+    )
+}
+/// A shard record change reaches the cleanup worker as a configuration
+/// publication: a read parked on that shard's former primary is tried again.
+fn configuration_subscription() -> sinomo_module::ComponentEventSubscription {
+    sinomo_module::ComponentEventSubscription::new(
+        DFS_CONFIGURATION_PUBLISHED_EVENT_KIND,
+        DFS_CONFIGURATION_EVENT_SCHEMA_ID,
+        DFS_CONFIGURATION_EVENT_SCHEMA_VERSION,
     )
 }
 fn namespace_subscription() -> sinomo_module::ComponentEventSubscription {
@@ -632,6 +657,7 @@ fn mount_attachment_maintenance(
     feature_runtime: Arc<AttachmentRuntime>,
     mut namespace_events: sinomo_module::ComponentEventReceiver,
     mut cluster_events: sinomo_module::ComponentEventReceiver,
+    mut configuration_events: sinomo_module::ComponentEventReceiver,
 ) {
     let mut shutdown = scope.shutdown_receiver();
     let owner_runtime = runtime.clone();
@@ -694,6 +720,14 @@ fn mount_attachment_maintenance(
                         Err(sinomo_module::ComponentEventReceiveError::Closed) => break,
                         Err(sinomo_module::ComponentEventReceiveError::Lagged { .. }) => crate::attachment_maintenance::request_reconciliation(&data_dir),
                         Ok(_) => crate::attachment_maintenance::notify(&data_dir),
+                    }
+                }
+                // A lagged stream may have dropped a publication; the pass
+                // compares parked records with the current ones either way.
+                event = configuration_events.recv() => {
+                    match event {
+                        Err(sinomo_module::ComponentEventReceiveError::Closed) => break,
+                        _ => crate::attachment_maintenance::configuration_published(&data_dir),
                     }
                 }
             }

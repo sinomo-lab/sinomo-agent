@@ -254,6 +254,26 @@ pub(crate) fn compound_prepared_operation_id(
     }
     format!("compound-operation-v7:blake3:{}", hash.finalize().to_hex())
 }
+
+/// The id under which prepared-change recovery republishes `original`, a
+/// prepare made at an older epoch, at `epoch`. The replacement keeps the
+/// original's effects and supersedes it when it commits.
+pub(crate) fn recovery_operation_id(original: &str, epoch: u64) -> String {
+    format!("recover:{original}:{epoch}")
+}
+
+/// The id under which a shard's primary aborts `original`, a row prepare of
+/// a request whose final outcome the shard already holds.
+pub(crate) fn retired_admission_operation_id(original: &str) -> String {
+    format!("retire-admission:{original}")
+}
+
+/// The id of the prepare that `replacement`, a body at `epoch`, recovers, if
+/// `replacement` is that prepare's recovery id at `epoch`.
+pub(crate) fn recovered_operation_id(replacement: &str, epoch: u64) -> Option<&str> {
+    let (original, suffix) = replacement.strip_prefix("recover:")?.rsplit_once(':')?;
+    (suffix == epoch.to_string()).then_some(original)
+}
 fn deserialize_journal_operation_id<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {

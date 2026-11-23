@@ -17,9 +17,83 @@ impl Read for PackedRanges<'_> {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Write `bytes` at `offset` of the file `object_id` names, as the
+    /// caller's operation `operation_id`. Every attempt of the operation
+    /// targets the version the id selects, so the primary answers a repeat
+    /// with what the first attempt did, and an attempt made after the write
+    /// committed finds it committed. A mount mints one id per syscall and
+    /// keeps it across the syscall's runs.
+    pub fn posix_write_file_at_for_object_with_operation_id(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        // The write reads its object like an attribute read, and plans again
+        // when a record it read changes: every attempt goes under the same
+        // id, so a repeat is answered with what the first attempt did.
+        self.replan_on_record_change(|service| {
+            service.write_file_at_for_object_as(
+                object_id,
+                offset,
+                bytes,
+                options.clone(),
+                operation_id,
+            )
+        })
+    }
+
+    fn write_file_at_for_object_as(
+        &mut self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _plan = self.namespace_execution.begin_planning();
+        let object = self.current_read_object_metadata_distributed(object_id)?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: object.path });
+        }
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
+        if object.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path: object.path });
+        }
+        if object.version
+            == stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+        {
+            return self.committed_write_stat(&object.path);
+        }
+        let base = self.stat_object(&object)?;
+        let dirty = BTreeMap::from([(offset, bytes.to_vec())]);
+        if bytes.is_empty() {
+            return Ok(base);
+        }
+        self.posix_publish_dirty_ranges(&base, &dirty, operation_id, options)
+    }
+
     /// Mounted-adapter flush of a frozen inode patch set.
     #[doc(hidden)]
     pub fn posix_publish_dirty_ranges(
+        &mut self,
+        base: &DfsStat,
+        dirty: &BTreeMap<u64, Vec<u8>>,
+        operation_id: &str,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        // Every attempt of this write goes under its caller's id, so a
+        // mounted call's next run answers it again and its record waits are
+        // handed back like any other.
+        self.with_replayable_mounted_effects(|service| {
+            service.publish_dirty_ranges(base, dirty, operation_id, options)
+        })
+    }
+
+    fn publish_dirty_ranges(
         &mut self,
         base: &DfsStat,
         dirty: &BTreeMap<u64, Vec<u8>>,
@@ -103,7 +177,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.content_hash = base.content_hash.clone();
         object.content_size_bytes = Some(base_size);
         object.version = base.version.clone();
-        self.writes.follow_next_dispatch = true;
+        self.writes
+            .follow_write(&request.object_id, &request.target_version, true);
         let outcome = self.publish_packed_range_write(
             request,
             object,

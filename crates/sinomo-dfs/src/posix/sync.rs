@@ -787,9 +787,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: DfsNamespaceOperation,
     ) -> Result<DfsPosixCoordinationResult> {
         let file_system_id = crate::sifs_file_system_id();
+        // One id for the whole sync. Its target is frozen before the call, so
+        // a repeat certifies the same object, version and content: the
+        // primary answers it as it answered the first, and nothing is written
+        // either time.
+        let operation_id = self.next_request_id();
         let followed = self
             .route_namespace_following_record(
-                None,
+                &operation_id,
                 &file_system_id,
                 primary,
                 &operation,

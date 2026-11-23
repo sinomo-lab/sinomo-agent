@@ -4677,9 +4677,13 @@ pub(crate) async fn handle_daemon_dfs_message_async(
 
 /// Dispatch the existing owned phase after service/admission release. The
 /// registered host joins its actual blocking child even when its caller leaves.
+///
+/// A read made with the request's lanes released is the request's own: when
+/// `requester` leaves, the read's call ends with it.
 pub(super) async fn dispatch_daemon_dfs_remote_namespace_phase(
     data_dir: &SinomoDataDir,
     phase: Box<crate::source_adoption::RemoteNamespacePhase>,
+    requester: Option<sinomo_dfs::DfsCancellationFlag>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Box<crate::source_adoption::CompletedRemoteNamespacePhase>, DaemonError> {
     let task_owner = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DaemonError::Parse {
@@ -4687,7 +4691,14 @@ pub(super) async fn dispatch_daemon_dfs_remote_namespace_phase(
     })?;
     let data_owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))?;
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let read_requester = requester.filter(|_| {
+        matches!(
+            *phase,
+            crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(_)
+        )
+    });
     let task = runtime.spawn_blocking(move || {
+        let _requester = crate::node_transport::DfsSendCancellationScope::enter(read_requester);
         let result = phase.dispatch().map(Box::new);
         drop(data_owner);
         let _ = result_tx.send(result);
@@ -5053,6 +5064,44 @@ async fn prepare_daemon_dfs_genesis_ingress(
     daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
 }
 
+/// Hear a hint from one of this node's own requesters against the shard
+/// record this node's Main published. A publication that is not ready hears
+/// nothing: the requester posts the hint again with its next attempt.
+/// sinomo:kv-configuration: Read the shard record this node already published, to hear a primary-verification hint only about that record.
+fn hear_daemon_dfs_primary_verification_hint(
+    cluster_paths: &ClusterPaths,
+    cluster_id: &sinomo_core::Id,
+    local_node_id: &NodeId,
+    source_node_id: &NodeId,
+    request: &sinomo_dfs::DfsPrimaryVerificationRequest,
+    runtime: &tokio::runtime::Handle,
+) {
+    let Ok(authority) = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        cluster_id,
+        local_node_id,
+        Some(runtime),
+    ) else {
+        return;
+    };
+    let projected = authority
+        .configuration_snapshot()
+        .metadata_shards(&request.file_system_id)
+        .ok()
+        .flatten()
+        .and_then(|shards| {
+            shards
+                .into_iter()
+                .find(|shard| shard.shard_id == request.shard_id)
+        });
+    crate::service_record_follow::hear_primary_verification_hint(
+        local_node_id,
+        source_node_id,
+        request,
+        projected.as_ref(),
+    );
+}
+
 pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
@@ -5065,7 +5114,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     // The requester's budget is measured from here, and this future's drop is
     // its departure. Both reach the blocking mutation through `served`.
     let (served, _departure) = sinomo_dfs::DfsServedRequestScope::at_arrival(budget);
-    served
+    let refusal = ClosedShardStorageRefusal::for_command(&command);
+    let result = served
         .until_budget(handle_served_daemon_dfs_message(
             paths,
             command,
@@ -5081,7 +5131,125 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 operation: "DFS request: its requester's budget ended before it ran",
             }
             .into())
+        });
+    match (result, refusal) {
+        (Err(error), Some(refusal)) => match closed_shard_storage_cause_of(&error) {
+            Some(cause) => Ok(refusal.reply(cause, error.to_string())),
+            None => Err(error),
+        },
+        (result, _) => result,
+    }
+}
+
+/// Why `error` is a closed shard's refusal to serve, if it is one.
+fn closed_shard_storage_cause_of(error: &DaemonError) -> Option<crate::DfsShardStorageClosedCause> {
+    match error {
+        DaemonError::StoragePreparationPending { .. } => {
+            Some(crate::DfsShardStorageClosedCause::Preparation)
+        }
+        error => crate::error::closed_shard_storage_cause_in(&error.to_string()),
+    }
+}
+
+/// The typed answer to a request whose shard has its storage closed for
+/// preparation or conversion. The shard refused before the request took any
+/// effect, so the requester receives a definite refusal, not a failed call
+/// whose effect it cannot know.
+struct ClosedShardStorageRefusal {
+    rpc_request_id: String,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    frame_id: u64,
+    message_id: u64,
+    request: ClosedShardStorageRequest,
+}
+
+enum ClosedShardStorageRequest {
+    Namespace {
+        request_id: String,
+    },
+    Write {
+        request_id: String,
+        object_id: crate::DfsObjectId,
+    },
+}
+
+impl ClosedShardStorageRefusal {
+    fn for_command(command: &DfsMessageCommand) -> Option<Self> {
+        let request = match &command.routed_message.message {
+            crate::DfsNetworkMessage::NamespaceRequest(request) => {
+                ClosedShardStorageRequest::Namespace {
+                    request_id: request.request_id.clone(),
+                }
+            }
+            crate::DfsNetworkMessage::DistributedWriteRequest(write)
+            | crate::DfsNetworkMessage::ExclusiveCreateRequest(write)
+            | crate::DfsNetworkMessage::RetainedWriteRequest(write) => {
+                ClosedShardStorageRequest::Write {
+                    request_id: write.request_id.clone(),
+                    object_id: write.request.object_id.clone(),
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            rpc_request_id: command.request_id.clone(),
+            source_node_id: command.routed_message.target_node_id.clone(),
+            target_node_id: command.routed_message.source_node_id.clone(),
+            frame_id: command.routed_message.frame_id,
+            message_id: command.routed_message.message_id,
+            request,
         })
+    }
+
+    fn reply(
+        self,
+        cause: crate::DfsShardStorageClosedCause,
+        detail: String,
+    ) -> DfsDataPlaneResponse {
+        let message = match self.request {
+            ClosedShardStorageRequest::Namespace { request_id } => {
+                crate::DfsNetworkMessage::NamespaceResponse(crate::DfsNamespaceResponse {
+                    request_id,
+                    committed_work: Default::default(),
+                    result: crate::DfsNamespaceResult::Rejected {
+                        reason: detail.clone(),
+                        posix_error: Some(crate::DfsNamespacePosixError::ShardStorageClosed {
+                            cause,
+                            detail,
+                        }),
+                        current_primary_node_id: None,
+                    },
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: false,
+                    posix_coordination_result: None,
+                })
+            }
+            ClosedShardStorageRequest::Write {
+                request_id,
+                object_id,
+            } => crate::DfsNetworkMessage::DistributedWriteResponse(
+                crate::DfsDistributedWriteResponse {
+                    request_id,
+                    object_id,
+                    result: crate::DfsDistributedWriteResult::ShardStorageClosed { cause, detail },
+                    metadata_journal_batches: Vec::new(),
+                },
+            ),
+        };
+        DfsDataPlaneResponse::value(crate::DfsMessageResponse {
+            request_id: self.rpc_request_id,
+            outbound_messages: vec![crate::DfsRoutedMessage {
+                source_node_id: self.source_node_id,
+                target_node_id: self.target_node_id,
+                frame_id: self.frame_id,
+                message_id: self.message_id,
+                message,
+            }],
+        })
+    }
 }
 
 /// The continuation of a prepared write waits for its shard's publication. The
@@ -5154,6 +5322,35 @@ async fn handle_served_daemon_dfs_message(
                 outbound_messages: Vec::new(),
             }));
         }
+    }
+    // A requester's hint that it could not reach a shard's primary reads this
+    // node's published record and leaves one flag for the keeper. It takes no
+    // admission: it neither waits behind a lane holder nor makes lane work
+    // wait behind it.
+    if attachment.is_none()
+        && let sinomo_dfs::DfsNetworkMessage::PrimaryVerificationRequest(request) =
+            &command.routed_message.message
+    {
+        let local =
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)?;
+        if command.routed_message.target_node_id != local.local_node_id {
+            return Err(DaemonError::Network {
+                address: "DFS message".into(),
+                detail: "DFS hint target differs from the actual local identity".into(),
+            });
+        }
+        hear_daemon_dfs_primary_verification_hint(
+            &cluster_paths,
+            &local.cluster_id,
+            &local.local_node_id,
+            &command.routed_message.source_node_id,
+            request,
+            runtime,
+        );
+        return Ok(DfsDataPlaneResponse::value(crate::DfsMessageResponse {
+            request_id: command.request_id,
+            outbound_messages: Vec::new(),
+        }));
     }
     let peer_snapshot_started = Instant::now();
     // Only the requester's budget bounds the authority reads before
@@ -5906,7 +6103,13 @@ async fn handle_served_daemon_dfs_message(
                 // The selected service mutex, checkout and mutation admission
                 // have all ended. Only the actual source fences/owner remain.
                 completed_remote_phase = Some(
-                    dispatch_daemon_dfs_remote_namespace_phase(&data_dir, phase, runtime).await?,
+                    dispatch_daemon_dfs_remote_namespace_phase(
+                        &data_dir,
+                        phase,
+                        Some(served.cancellation().clone()),
+                        runtime,
+                    )
+                    .await?,
                 );
                 command = original;
                 metadata_authority_preflight = Some(

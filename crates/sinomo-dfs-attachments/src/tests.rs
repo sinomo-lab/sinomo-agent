@@ -1231,6 +1231,127 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
     runtime.close().unwrap();
 }
 
+/// A cleanup read parked on an unreachable shard primary is sent again as
+/// soon as that shard's record changes, before its retry time. A
+/// configuration publication that leaves the record as it was sends nothing.
+/// The pass is given the shard records its caller read from the projection;
+/// the changed list here stands for the projection after a record change.
+#[test]
+fn a_parked_cleanup_read_is_sent_again_when_its_shard_record_changes() {
+    use sinomo_dfs::test_support::{DfsTestPartition, current_native_metadata_service};
+    let (runtime, initial, root) =
+        current_native_metadata_service("attachment-parked-record", 3, "/").unwrap();
+    drop(initial);
+    let node = &root.replica_node_ids[0];
+    let mut browser = runtime.client(node).unwrap();
+    let data = runtime.data_dir(node);
+    let checkpoint = crate::attachment_maintenance::checkpoint_path(data);
+    let shards = runtime.metadata_shards().unwrap();
+    let now = crate::dfs_now_unix_nanos();
+    runtime.partition_node(
+        &root.primary_node_id,
+        DfsTestPartition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    let calls = || {
+        runtime
+            .rpc_observations()
+            .into_iter()
+            .filter(|call| {
+                &call.source == node
+                    && call.target == root.primary_node_id
+                    && call.route == sinomo_dfs::DFS_DATA_NAMESPACE_ROUTE
+            })
+            .count()
+    };
+    let parked = |errors: &[String]| errors.iter().filter(|e| e.contains("parked")).count();
+    // A source whose managed directories live on the root shard, and the
+    // managed-directory scan, both read from the unreachable root primary.
+    crate::attachment_maintenance::wake(
+        data,
+        &DfsAttachmentSource {
+            path: String::new(),
+            file_system_id: sifs_file_system_id(),
+            object_id: sinomo_core::Id::generate(),
+        },
+    );
+    let first = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert_eq!(parked(&first.errors), 2, "{:?}", first.errors);
+    let retry = crate::attachment_maintenance::deadline(data)
+        .unwrap()
+        .unwrap();
+    assert!(retry > now);
+    let before = calls();
+    assert!(before > 0);
+
+    crate::attachment_maintenance::configuration_published(data);
+    assert_eq!(
+        crate::attachment_maintenance::deadline(data).unwrap(),
+        Some(0),
+        "a publication has the pass compare its parked records"
+    );
+    // As the worker does: the pass starts before its caller reads the records.
+    crate::attachment_maintenance::begin_pass(data);
+    let unchanged = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert!(unchanged.errors.is_empty(), "{:?}", unchanged.errors);
+    assert_eq!(calls(), before, "an unchanged record sends nothing");
+    assert_eq!(
+        crate::attachment_maintenance::deadline(data).unwrap(),
+        Some(retry)
+    );
+    // A publication after the caller read its records, while the pass runs:
+    // the pass ends with another pass due, which reads the newer records.
+    crate::attachment_maintenance::begin_pass(data);
+    crate::attachment_maintenance::configuration_published(data);
+    browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert_eq!(
+        crate::attachment_maintenance::deadline(data).unwrap(),
+        Some(0)
+    );
+    crate::attachment_maintenance::begin_pass(data);
+    browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert_eq!(calls(), before);
+    assert_eq!(
+        crate::attachment_maintenance::deadline(data).unwrap(),
+        Some(retry)
+    );
+
+    let changed = shards
+        .iter()
+        .cloned()
+        .map(|mut shard| {
+            if shard.file_system_id == root.file_system_id && shard.shard_id == root.shard_id {
+                shard.epoch += 1;
+            }
+            shard
+        })
+        .collect::<Vec<_>>();
+    crate::attachment_maintenance::configuration_published(data);
+    crate::attachment_maintenance::begin_pass(data);
+    let woken = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &changed, 8, now)
+        .unwrap();
+    assert_eq!(
+        parked(&woken.errors),
+        2,
+        "both parked reads are sent again before their retry time: {:?}",
+        woken.errors
+    );
+    assert!(calls() > before);
+    drop(browser);
+    runtime.close().unwrap();
+}
+
 #[test]
 fn ordinary_write_wakes_do_not_retry_a_disconnected_catalog_scan() {
     use sinomo_dfs::test_support::{DfsTestPartition, current_native_metadata_service};

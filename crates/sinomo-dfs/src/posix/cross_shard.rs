@@ -7,8 +7,8 @@
 
 use super::{
     POSIX_LIST_DIR_COLLECT_PAGE_SIZE, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
-    POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS,
-    POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id, now_unix_nanos,
+    POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS, POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE, namespace_job_id,
+    now_unix_nanos,
 };
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::namespace::{
@@ -31,6 +31,14 @@ use crate::{
     DfsWriteIntentStatus, NetworkedDfsService, object_version_record, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
+
+/// Bound on a read this node sends to another shard's primary and waits for
+/// while it still holds admission: a namespace job that maintenance resumes,
+/// or a request that cannot hand the read to its host. A read made with the
+/// request's lanes released has no such bound; its request's budget, or its
+/// requester's departure, ends it.
+const POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
 
 mod closed_storage_parks;
 mod destination_reservation;
@@ -917,11 +925,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && let Some(shard) = self.routed_namespace_shard_for_path(path)?
             && self.metadata_lease_omits_shard(&shard.shard_id)
         {
+            let timeout = (!self.routed_read_waits_with_lanes_released(&shard.primary_node_id))
+                .then_some(POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT);
             return Ok(self.route_namespace_lookup_path_to_metadata_primary(
                 file_system_id.clone(),
                 shard.primary_node_id.clone(),
                 path.to_owned(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                timeout,
             )?);
         }
         self.lookup_metadata_path(file_system_id, path)
@@ -1077,12 +1087,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
-        // Retain the previous source-lookup budget and the enclosing operation
-        // deadline. A rejected source read never becomes a replica fallback.
+        // A rejected source read never becomes a replica fallback. Made with
+        // the request's lanes released, the read adds no deadline to the
+        // enclosing operation's; sent while this service holds admission, it
+        // keeps its bound.
         let previous = self.transport.operation_deadline();
-        let requested = std::time::Instant::now() + POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
-        self.transport
-            .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
+        if !self.routed_read_waits_with_lanes_released(&source.primary_node_id) {
+            let requested = std::time::Instant::now() + POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT;
+            self.transport
+                .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
+        }
         let response = self.query_metadata_authority_impl(
             source,
             crate::DfsMetadataSelection::CurrentObjectForNamespaceJob {
@@ -2393,7 +2407,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if matches!(operation, DfsNamespaceOperation::AdoptHardlinkAlias { .. })
             && self.publication_execution.current().is_none()
         {
-            return self.route_namespace_operation_with_result(primary, operation);
+            // Under the job's phase id, as the owned phase sends it: a
+            // repeat is answered from the request it recorded.
+            return match job {
+                Some(job) => self.route_namespace_operation_with_request_id_and_result(
+                    Self::cross_shard_job_phase_operation_id(job, phase),
+                    primary,
+                    operation,
+                ),
+                None => self.route_namespace_operation_with_result(primary, operation),
+            };
         }
         if matches!(
             operation,

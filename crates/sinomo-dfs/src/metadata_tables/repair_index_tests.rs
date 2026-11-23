@@ -119,6 +119,7 @@ fn committed_intent(
         policy: crate::DfsReplicationPolicy::new(1, replicas).unwrap(),
         status: DfsWriteIntentStatus::Committed,
         content_hash: object.content_hash.clone(),
+        content_size_bytes: None,
         object_metadata: Some(object.clone()),
         touch_parent_on_create: false,
         create_predecessor_object_id: None,

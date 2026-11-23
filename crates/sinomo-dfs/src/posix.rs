@@ -240,7 +240,6 @@ pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_OBJECTS: usize =
 pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT / 2;
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
-const POSIX_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
 const POSIX_BULK_PARENT_RETRY_ATTEMPTS: usize = 3;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
@@ -255,11 +254,12 @@ pub(crate) const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 const POSIX_WRITE_SERIALIZATION_RESEND_FIRST: Duration = Duration::from_millis(10);
 const POSIX_WRITE_SERIALIZATION_RESEND_MAX: Duration =
     sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-/// Budget for an authoritative path lookup or the best-effort freshness pull
-/// used after that lookup cannot answer. These requests share the serialized
-/// namespace lane with durable mutations, so the budget must tolerate bounded
-/// WAN metadata work already ahead of them.
-const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+/// A read adds no deadline of its own: an authoritative path lookup, a stat
+/// and a content read wait for their answer, a definite error, the network's
+/// verdict or cancellation. The operation deadline its caller installed, if
+/// any, is the only bound in time, and it travels with every request the
+/// read sends.
+const POSIX_READ_NO_BUDGET: Option<Duration> = None;
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 struct PosixBulkLocalWrite<'a> {
@@ -429,7 +429,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         foreground_replica_repair: bool,
     ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
         // Its dispatch is done: a later dispatch belongs to another caller.
-        self.writes.follow_next_dispatch = false;
+        self.writes.followed_write = None;
         let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {
             return Ok(outcome);
         };
@@ -465,11 +465,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             // Evidence that the shard record is changing holds the write with
             // its body: this call waits for the newer record and sends the
-            // same write, under the same id, to the primary it names.
+            // same write, under the same id, to the primary it names. An
+            // answer that arrives meanwhile ends the wait and is read above.
             if !deadline_passed() {
                 match self.follow_held_routed_write(&intent_id, &mut record_resend) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
+                    Ok(
+                        crate::service_routed_write::RoutedWriteRecordFollow::Resent
+                        | crate::service_routed_write::RoutedWriteRecordFollow::Woken,
+                    ) => continue,
+                    Ok(crate::service_routed_write::RoutedWriteRecordFollow::NotFollowed) => {}
                     Err(error) => {
                         self.compact_pending_routed_write(&intent_id);
                         return Err(error);
@@ -540,9 +544,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if let Some(deadline) = caller_deadline {
                     wait = wait.min(deadline.saturating_duration_since(now));
                 }
-                if let Err(error) = self.transport.wait_for_incoming(wait) {
-                    self.compact_pending_routed_write(&intent_id);
-                    return Err(DfsError::from_network(error));
+                // A routed write its primary holds also waits on the shard's
+                // record: a record that moves past the one the write was sent
+                // under sends it to the primary the projection names.
+                match self.await_pending_routed_write(&intent_id, now + wait) {
+                    Ok(
+                        crate::service_routed_write::RoutedWriteRecordFollow::Resent
+                        | crate::service_routed_write::RoutedWriteRecordFollow::Woken,
+                    ) => {}
+                    Ok(crate::service_routed_write::RoutedWriteRecordFollow::NotFollowed) => {
+                        if let Err(error) = self.transport.wait_for_incoming(wait) {
+                            self.compact_pending_routed_write(&intent_id);
+                            return Err(DfsError::from_network(error));
+                        }
+                    }
+                    // A wait handed back to the mount keeps the write's body:
+                    // the primary holds the write, and the call's next run
+                    // waits for its answer again.
+                    Err(error) if self.mounted_call_handed_back() => return Err(error),
+                    Err(error) => {
+                        self.compact_pending_routed_write(&intent_id);
+                        return Err(error);
+                    }
                 }
                 ready_drains = 0;
             } else {
@@ -1680,6 +1703,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// [`Self::posix_write_file_with_create_attrs`] under a durable operation
+    /// identity.
+    pub fn posix_write_file_with_create_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            false,
+            false,
+            Some(operation_id.to_string()),
+        )
+    }
+
     /// Create a new regular file with its final POSIX attributes.
     ///
     /// Unlike [`Self::posix_write_file_with_create_attrs`], this operation is
@@ -2127,6 +2175,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// [`Self::posix_create_file_following_symlink_with_attrs`] under a
+    /// durable operation identity.
+    pub fn posix_create_file_following_symlink_with_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            &[],
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            true,
+            true,
+            Some(operation_id.to_string()),
+        )
+    }
+
     pub fn posix_write_file_with_known_parent(
         &mut self,
         path: &str,
@@ -2200,7 +2272,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id.clone(),
                 primary_node_id,
                 requested_paths.iter().cloned().collect(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
             .map_err(DfsPosixError::from)?;
         let mut lookup = PosixBulkAuthoritativeLookup::default();
@@ -3393,20 +3465,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        self.posix_write_file_bytes_checked_parent_attempts(
-            path,
-            bytes,
-            options,
-            check_parent,
-            touch_parent_on_create,
-            replay_response_journal,
-            create_attrs,
-            exclusive_create,
-            follow_final_for_exclusive_create,
-            operation_id,
-            true,
-        )?
-        .ok_or_else(|| DfsPosixError::Conflict {
+        let write = |service: &mut Self, operation_id| {
+            service.posix_write_file_bytes_checked_parent_attempts(
+                path,
+                bytes,
+                options,
+                check_parent,
+                touch_parent_on_create,
+                replay_response_journal,
+                create_attrs,
+                exclusive_create,
+                follow_final_for_exclusive_create,
+                operation_id,
+                true,
+            )
+        };
+        let written = if operation_id.is_some() {
+            // Every change goes under the caller's id: a mounted call's next
+            // run answers it again, and its record waits are handed back.
+            self.with_replayable_mounted_effects(|service| write(service, operation_id))
+        } else {
+            write(self, operation_id)
+        };
+        written?.ok_or_else(|| DfsPosixError::Conflict {
             path: path.to_string(),
             reason: "committed write did not report its stat".into(),
         })
@@ -3943,7 +4024,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_version: target_version.clone(),
             requesting_node_id: write_requester,
         };
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = if streamed_remote_primary_write {
             self.write_distributed_bytes_with_base(
                 request,
@@ -4335,7 +4420,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .put_object_version_from_reader(object_id.as_str(), target_version.as_str(), reader)
                 .map_err(DfsError::from)?;
             phase.mark("internal_cas_staging");
-            self.writes.follow_next_dispatch = true;
+            self.writes.follow_write(object_id, &target_version, true);
             let outcome = self.route_distributed_manifest(
                 DfsWriteRequest {
                     file_system_id: object.file_system_id.clone(),
@@ -4714,7 +4799,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requesting_node_id: write_requester.clone(),
         };
         timing.mark("reader_planning");
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = if let Some(input) = restore_input {
             let operation_id = operation_id.ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
@@ -5020,7 +5109,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let patch_outcome = if let Some(current_size) = object.content_size_bytes {
             if offset <= current_size {
                 self.write_distributed_eventual_patch_from_reader_with_base(
@@ -5099,7 +5192,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
         };
         let mut overlay = RangedWriteOverlayReader::new(current, offset, reader);
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_reader_with_base(
             request,
             Some(base_version),
@@ -5238,7 +5335,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsPosixError::InvalidPath {
                     path: format!("{path}@{offset}+{}", bytes.len()),
                 })?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         if object
             .content_size_bytes
             .is_some_and(|current_size| offset <= current_size)
@@ -5310,7 +5411,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         current[start..end].copy_from_slice(bytes);
         let result_size = current.len() as u64;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),
@@ -5371,7 +5476,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        self.posix_truncate_file_expected_object(path, None, len, options)
+        self.posix_truncate_file_expected_object(path, None, len, options, None)
     }
 
     /// Truncate through a stable opened-object identity, rejecting a path
@@ -5383,13 +5488,81 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        self.truncate_file_for_object_as(object_id, len, options, None)
+    }
+
+    /// [`Self::posix_truncate_file`] as the caller's operation
+    /// `operation_id`. Every attempt targets the version the id selects, so
+    /// the primary answers a repeat with what the first attempt did, and an
+    /// attempt made after the truncate committed finds it committed. A mount
+    /// mints one id per syscall and keeps it across the syscall's runs.
+    pub fn posix_truncate_file_with_operation_id(
+        &mut self,
+        path: &str,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        self.replan_on_record_change(|service| {
+            service.with_replayable_mounted_effects(|service| {
+                let _namespace_plan = service.namespace_execution.begin_planning();
+                service.posix_truncate_file_expected_object(
+                    path,
+                    None,
+                    len,
+                    options.clone(),
+                    Some(operation_id),
+                )
+            })
+        })
+    }
+
+    /// [`Self::posix_truncate_file_for_object`] as the caller's operation
+    /// `operation_id` (see [`Self::posix_truncate_file_with_operation_id`]).
+    pub fn posix_truncate_file_for_object_with_operation_id(
+        &mut self,
+        object_id: &DfsObjectId,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        // The truncate reads its object like an attribute read, and plans
+        // again when a record it read changes.
+        self.replan_on_record_change(|service| {
+            service.with_replayable_mounted_effects(|service| {
+                let _namespace_plan = service.namespace_execution.begin_planning();
+                service.truncate_file_for_object_as(
+                    object_id,
+                    len,
+                    options.clone(),
+                    Some(operation_id),
+                )
+            })
+        })
+    }
+
+    fn truncate_file_for_object_as(
+        &mut self,
+        object_id: &DfsObjectId,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: Option<&str>,
+    ) -> Result<DfsStat> {
         let object = self
             .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });
         }
-        self.posix_truncate_file_expected_object(&object.path, Some(object_id), len, options)
+        self.posix_truncate_file_expected_object(
+            &object.path,
+            Some(object_id),
+            len,
+            options,
+            operation_id,
+        )
     }
 
     fn posix_truncate_file_expected_object(
@@ -5398,6 +5571,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_object_id: Option<&DfsObjectId>,
         len: u64,
         options: DfsWriteOptions,
+        operation_id: Option<&str>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -5418,6 +5592,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
+        let stable_target = operation_id.map(|operation_id| {
+            stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+        });
+        if stable_target.as_ref() == Some(&object.version) {
+            // A repeat of a truncate that committed.
+            return self.committed_write_stat(&path);
+        }
         let base_version = object.version.clone();
         let mut current = match self.posix_patch_current_bytes(&path, &object)? {
             NetworkedDfsReadOutcome::Found {
@@ -5434,7 +5615,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             path: format!("{path}@len={len}"),
         })?;
         current.resize(len, 0);
-        let target_version = next_version(&object.version);
+        let target_version = stable_target.unwrap_or_else(|| next_version(&object.version));
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
@@ -5444,7 +5625,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        self.writes.follow_next_dispatch = options.wait_for_commit;
+        self.writes.follow_write(
+            &request.object_id,
+            &request.target_version,
+            options.wait_for_commit,
+        );
         let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),
@@ -5462,7 +5647,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 dispatch: DfsWriteDispatch::AwaitResponse,
                 replay_response_journal: true,
-                operation_id: None,
+                operation_id: operation_id.map(str::to_owned),
             },
         )?;
         let outcome = if options.wait_for_commit {

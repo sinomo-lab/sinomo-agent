@@ -100,6 +100,22 @@ impl DfsSourcePhasePause {
     pub fn release(&self) {
         self.inner.gate.add_permits(1);
     }
+    /// Release the paused phase when the returned guard drops. A test that
+    /// joins the paused call's thread in a scope takes the guard inside that
+    /// scope: a step that fails while the call is paused then ends the call
+    /// and is reported, where the scope would otherwise wait for a thread
+    /// nothing releases.
+    pub fn release_on_drop(&self) -> DfsSourcePhaseRelease<'_> {
+        DfsSourcePhaseRelease(self)
+    }
+}
+/// Releases its paused phase when dropped.
+#[derive(Debug)]
+pub struct DfsSourcePhaseRelease<'a>(&'a DfsSourcePhasePause);
+impl Drop for DfsSourcePhaseRelease<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 impl Drop for DfsSourcePhasePause {
     fn drop(&mut self) {

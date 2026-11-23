@@ -3577,6 +3577,10 @@ fn read_sifs_materialized_cluster_kv_snapshot(
 /// mutation methods are hard failures. The daemon owns reactive publication of
 /// the local snapshot; an observer consumes that state without becoming a new
 /// scheduling edge.
+///
+/// It answers one shard-selection read from one snapshot and is never a
+/// service's control plane, so no request is routed by it and it has no
+/// record change to wait for: it offers no configuration watch.
 #[derive(Clone, Debug)]
 struct SifsSnapshotControlPlaneKvClient {
     cluster_paths: ClusterPaths,
@@ -3684,11 +3688,20 @@ enum SifsFetchedConfiguration {
 /// `refresh_latest`; the next scope read then fetches once again. Every other
 /// read is one bounded ReadIndex request and nothing it returns is retained;
 /// operation-bound fence reads always cross ReadIndex.
+///
+/// An operation that has to wait for a shard record to change subscribes to
+/// the daemon's configuration announcements, as a mounted client does for its
+/// whole life, and from then on answers the published scopes from the
+/// announced publication. An operation that never waits subscribes to
+/// nothing.
 #[derive(Clone)]
 pub(crate) struct SifsControlPlaneKvClient {
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     configuration: Arc<Mutex<Option<SifsFetchedConfiguration>>>,
+    /// The daemon's announced publications, once this operation waits on
+    /// them. Dropping the operation's last client ends the subscription.
+    followed: Arc<Mutex<Option<sinomo_runtime::dfs::MountedSifsControlPlaneKvClient>>>,
     /// Highest revision read or committed through the daemon; a ReadIndex
     /// reply below it is rejected.
     observed_revision: Arc<AtomicU64>,
@@ -3715,11 +3728,40 @@ impl SifsControlPlaneKvClient {
             data_dir: data_dir.clone(),
             cluster_paths: cluster_paths.clone(),
             configuration: Arc::new(Mutex::new(None)),
+            followed: Arc::new(Mutex::new(None)),
             observed_revision: Arc::new(AtomicU64::new(0)),
             scope_write_revision: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             peer_transport: crate::native_test_fixture::peer_transports(data_dir).map(|peers| peers.0),
         }
+    }
+
+    /// The daemon's announced publications this operation follows, if it
+    /// does. With `subscribe`, an operation that does not follow them yet
+    /// starts to: the subscription is the daemon's own event stream, held by
+    /// the same feed a mounted client uses.
+    fn followed_configuration(
+        &self,
+        subscribe: bool,
+    ) -> Option<sinomo_runtime::dfs::MountedSifsControlPlaneKvClient> {
+        let mut followed = self.followed.lock().ok()?;
+        if followed.is_none() && subscribe {
+            let peer = sinomo_runtime::dfs::DaemonDfsPeerTransport::deferred(self.data_dir.clone())
+                .ok()?;
+            let (sync_peer, async_peer) = shared_sifs_peer_transports(peer);
+            #[cfg(test)]
+            let (sync_peer, async_peer) =
+                crate::native_test_fixture::peer_transports(&self.data_dir)
+                    .unwrap_or((sync_peer, async_peer));
+            *followed = Some(
+                sinomo_runtime::dfs::MountedSifsControlPlaneKvClient::new_authoritative(
+                    &self.data_dir,
+                    sync_peer,
+                    async_peer,
+                ),
+            );
+        }
+        followed.clone()
     }
 
     #[cfg(test)]
@@ -3866,12 +3908,21 @@ impl SifsControlPlaneKvClient {
     fn published_configuration(
         &self,
     ) -> Result<Option<Arc<sinomo_runtime::dfs::DfsConfigurationSnapshot>>, KvError> {
-        let fetched = {
-            let mut held = self
-                .configuration
-                .lock()
-                .map_err(|_| self.kv_error("SIFS configuration lock is poisoned"))?;
-            held.get_or_insert_with(|| self.fetch_configuration()).clone()
+        let fetched = match self.followed_configuration(false) {
+            // A publication the feed does not hold yet answers nothing: the
+            // read is a ReadIndex request until the feed has it.
+            Some(followed) => match DfsControlPlaneKvClient::configuration_snapshot(&followed)? {
+                Some(snapshot) => SifsFetchedConfiguration::Published(snapshot),
+                None => SifsFetchedConfiguration::Unavailable,
+            },
+            None => {
+                let mut held = self
+                    .configuration
+                    .lock()
+                    .map_err(|_| self.kv_error("SIFS configuration lock is poisoned"))?;
+                held.get_or_insert_with(|| self.fetch_configuration())
+                    .clone()
+            }
         };
         let snapshot = match fetched {
             SifsFetchedConfiguration::Published(snapshot) => snapshot,
@@ -4110,6 +4161,16 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
             .lock()
             .map_err(|_| self.kv_error("SIFS configuration lock is poisoned"))? = None;
         Ok(())
+    }
+
+    /// A CLI operation is its own requester: it routes its requests itself
+    /// and follows its shard's record itself, so it waits on the daemon's
+    /// configuration announcements for that record to change.
+    /// sinomo:kv-configuration: Observe replacements of the snapshot the local daemon publishes, on its event stream.
+    fn watch_configuration_changes(
+        &self,
+    ) -> Option<Box<dyn sinomo_runtime::dfs::DfsConfigurationChangeWatch>> {
+        DfsControlPlaneKvClient::watch_configuration_changes(&self.followed_configuration(true)?)
     }
 
     fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
@@ -4354,6 +4415,14 @@ impl DfsControlPlaneKvClient for SifsOneShotBulkWriteControlPlaneKvClient {
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         self.inner.refresh_latest()?;
         self.validate_cached_catalog()
+    }
+
+    /// The bulk requester follows its shard's record like any CLI operation;
+    /// every catalog it then reads is validated as before.
+    fn watch_configuration_changes(
+        &self,
+    ) -> Option<Box<dyn sinomo_runtime::dfs::DfsConfigurationChangeWatch>> {
+        self.inner.watch_configuration_changes()
     }
 
     fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
@@ -7085,6 +7154,65 @@ mod tests {
             before_checkpoint
         );
         assert_eq!(metadata_journal_heads(&data_dir, &current), before);
+    }
+
+    /// A CLI operation is its own requester: its control plane watches the
+    /// daemon's configuration announcements, so a shard record that changes
+    /// while the operation waits reaches it as an event.
+    #[test]
+    fn cli_control_plane_client_watches_its_daemons_configuration_for_a_record_change() {
+        let (fixture, data_dir, caller, _old, shards) =
+            live_replica_cli_fixture("cli-configuration-watch");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut client = SifsControlPlaneKvClient::new(&data_dir, &paths);
+        let shard = shards.first().cloned().expect("the fixture has a shard");
+        let read = |client: &mut SifsControlPlaneKvClient| {
+            DfsControlPlaneStore::new(client)
+                .get_metadata_shard(&shard.file_system_id, &shard.shard_id)
+                .unwrap()
+                .expect("the shard has a record")
+        };
+        assert_eq!(read(&mut client), shard);
+        // A requester creates its watch before it reads the record it waits on.
+        let mut watch = DfsControlPlaneKvClient::watch_configuration_changes(&client)
+            .expect("a CLI operation watches its daemon's configuration");
+        assert_eq!(read(&mut client), shard);
+        let moved = fixture.with_native(|native, _| {
+            let state = cluster::read_cluster_state_without_kv(&paths).unwrap();
+            native
+                .reassign_metadata_shard(
+                    &sifs_file_system_id(),
+                    &shard.shard_id,
+                    caller.clone(),
+                    state
+                        .members
+                        .iter()
+                        .map(|member| member.node_id.clone())
+                        .filter(|node| *node != caller)
+                        .collect(),
+                )
+                .unwrap()
+        });
+        assert!(moved.epoch > shard.epoch);
+        let deadline = Instant::now() + sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT * 8;
+        let mut announced = false;
+        loop {
+            if read(&mut client) == moved {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the operation's projection shows the record its daemon published"
+            );
+            announced |= watch
+                .wait_for_change(sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT)
+                .unwrap();
+        }
+        // A publication announced before the first wait is still this watch's.
+        assert!(
+            announced || watch.wait_for_change(Duration::ZERO).unwrap(),
+            "an announced publication, not a timer, showed the record"
+        );
     }
 
     #[test]

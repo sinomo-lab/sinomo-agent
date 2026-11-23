@@ -4,8 +4,9 @@
 //!
 //! The route is direct object RPC between write-set members. A member answers
 //! from its own retained record and its own network verdict for the named
-//! primary, and asks the network to verify the primary first unless its
-//! verdict is already a settled `NoPath`. A member that still reaches the
+//! primary. It answers that the primary is lost only by the candidate's own
+//! rule, a no-path verdict that counts under its record's epoch; otherwise it
+//! has the network examine the primary first. A member that still reaches the
 //! primary vetoes the attempt. A hand-off request asks the member the asker
 //! ranked first to run the takeover itself.
 //!
@@ -22,6 +23,11 @@ use sinomo_core::node::NodeId;
 
 /// Wire format of the corroboration request and reply.
 pub const DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT: u16 = 1;
+
+/// The decline of a hand-off target that reaches the primary: from the
+/// verification it ran when asked, or from the examination it waited for
+/// while it held the hand-off. Like a `reaches` answer, it vetoes the attempt.
+pub(crate) const DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED: &str = "primary-reached";
 
 /// One question from a takeover candidate to another write-set member.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -97,7 +103,10 @@ pub enum DfsTakeoverAbstainReason {
     NotAMember,
     /// This node's record names a later epoch than the asker's.
     NewerRecord,
-    /// This node's network has no verdict for the primary.
+    /// This node has no verdict for the primary that counts under its
+    /// record: the network has none, or a no-path verdict that already stood
+    /// when this node first read the epoch was examined without a conclusion,
+    /// or could not be examined.
     NoEvidence,
     /// The request is not a well-formed request from the asker.
     Malformed,
@@ -131,6 +140,18 @@ pub struct DfsTakeoverVerdictEvidence {
 }
 
 impl DfsMetadataTakeoverCorroborationReply {
+    /// Whether this member reaches the primary, which vetoes the attempt: it
+    /// answered `reaches`, or, asked to run the attempt, declined because its
+    /// own examination found a path.
+    pub(crate) fn reaches_primary(&self) -> bool {
+        self.answer == DfsTakeoverPrimaryReach::Reaches
+            || matches!(
+                &self.hand_off,
+                Some(DfsTakeoverHandOffOutcome::Declined { reason, .. })
+                    if reason == DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED
+            )
+    }
+
     pub(crate) fn abstain(
         request: &DfsMetadataTakeoverCorroborationRequest,
         member: &NodeId,
@@ -322,6 +343,50 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<DfsMetadataTakeoverCorroborationReply>(&encoded).unwrap(),
                 reply
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_reaches_the_primary_by_its_answer_or_its_hand_off_decline() {
+        let reply = |answer, reason: Option<&str>| DfsMetadataTakeoverCorroborationReply {
+            attempt_id: "attempt".into(),
+            member_node_id: node("corroborate-c"),
+            record_view: None,
+            answer,
+            durable_sequence: Some(9),
+            hand_off: reason.map(|reason| DfsTakeoverHandOffOutcome::Declined {
+                reason: reason.into(),
+                prefer: None,
+            }),
+            verdict_evidence: None,
+        };
+        let no_evidence = DfsTakeoverPrimaryReach::Abstain {
+            reason: DfsTakeoverAbstainReason::NoEvidence,
+        };
+        assert!(reply(DfsTakeoverPrimaryReach::Reaches, None).reaches_primary());
+        assert!(
+            reply(DfsTakeoverPrimaryReach::Reaches, Some("primary-not-lost")).reaches_primary(),
+            "a target that declines with a reaching answer reaches the primary"
+        );
+        assert!(
+            reply(
+                DfsTakeoverPrimaryReach::Lost,
+                Some(DFS_TAKEOVER_HAND_OFF_PRIMARY_REACHED)
+            )
+            .reaches_primary(),
+            "a target that answered lost and then found a path reaches it"
+        );
+        for (answer, reason) in [
+            (DfsTakeoverPrimaryReach::Lost, None),
+            (DfsTakeoverPrimaryReach::Lost, Some("primary-unexamined")),
+            (DfsTakeoverPrimaryReach::Lost, Some("prefer-asker")),
+            (no_evidence.clone(), Some("primary-not-lost")),
+            (no_evidence, None),
+        ] {
+            assert!(
+                !reply(answer.clone(), reason).reaches_primary(),
+                "{answer:?} {reason:?}"
             );
         }
     }

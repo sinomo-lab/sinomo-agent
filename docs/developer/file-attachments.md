@@ -129,7 +129,9 @@ managed-directory reconciliation, which pages only the managed attachment roots
 and never scans the ordinary user namespace. Productive passes continue
 immediately; once caught up the worker parks with no feed poll or periodic
 rescan. Only payload grace or lease expiry and a ten-second retry after an
-error set deadlines. Each pass processes at most eight sources with bounded
+error set deadlines. A source or managed-directory page whose read could not
+reach its shard's primary is tried again as soon as a `dfs.configuration.published`
+event shows that shard's record changed; the retry is only its fallback. Each pass processes at most eight sources with bounded
 directory pages, and incomplete work resumes from checkpoints. A true feed gap
 reconciles all managed attachment namespaces because source and catalog
 placement can belong to different shards. Only nodes that are primary for a

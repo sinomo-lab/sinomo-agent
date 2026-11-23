@@ -953,6 +953,98 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
     runtime.close().unwrap();
 }
 
+/// A content read adds no deadline of its own. The request it sends to a
+/// replica carries no whole-call deadline when its caller set no budget, so
+/// only the replica's answer, the network's verdict or cancellation ends it;
+/// a caller's budget is the deadline the request carries.
+#[test]
+fn a_content_read_without_a_budget_carries_no_deadline_and_waits_for_a_slowed_peer() {
+    use crate::test_runtime::{FaultAction, FaultRule, RpcPhase};
+    let (runtime, _, _, reader_node, stat, bytes) =
+        native_current_read_fixture("native-read-no-budget-slowed-peer");
+    let mut reader = runtime.client(&reader_node).unwrap();
+    assert_eq!(reader.transport.operation_deadline(), None);
+    // The fixture holds the replica's answer for as long as the test says.
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(FaultRule {
+        source: Some(reader_node.clone()),
+        target: None,
+        route: Some(DFS_DIRECT_READ_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        // Every send of the read is held, a re-send included.
+        remaining_hits: 16,
+        action: FaultAction::PauseBeforeDispatch(std::sync::Arc::clone(&gate)),
+    });
+    let content_reads = |runtime: &crate::test_runtime::DfsTestRuntime, start: usize| {
+        runtime.rpc_observations()[start..]
+            .iter()
+            .filter(|event| {
+                event.source == reader_node
+                    && event.route == DFS_DIRECT_READ_ROUTE
+                    && event.phase == RpcPhase::BeforeDispatch
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let start = runtime.rpc_observations().len();
+    let read = std::thread::scope(|scope| {
+        let reading = scope
+            .spawn(|| reader.posix_read_file_range_for_opened_stat(&stat.path, &stat, 0, 4096));
+        let held = Instant::now() + Duration::from_secs(10);
+        while content_reads(&runtime, start).is_empty() {
+            assert!(Instant::now() < held, "the read reached its replica");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            !reading.is_finished(),
+            "the read waits for as long as its replica takes"
+        );
+        let sent = content_reads(&runtime, start);
+        assert!(
+            sent.iter()
+                .all(|call| call.options.overall_timeout().is_none()),
+            "a read without a caller's budget carries no deadline: {sent:?}"
+        );
+        gate.add_permits(16);
+        reading.join().unwrap()
+    });
+    assert_eq!(read.unwrap(), bytes[..4096]);
+    assert_eq!(
+        runtime.remove_faults_matching(|rule| matches!(
+            rule.action,
+            FaultAction::PauseBeforeDispatch(_)
+        )),
+        1
+    );
+
+    // A caller's own budget is the deadline the read's request carries.
+    let budget = Duration::from_secs(20);
+    reader.set_transport_operation_deadline(Some(Instant::now() + budget));
+    let start = runtime.rpc_observations().len();
+    assert_eq!(
+        reader
+            .posix_read_file_range_for_opened_stat(&stat.path, &stat, 4096, 4096)
+            .unwrap(),
+        bytes[4096..8192]
+    );
+    let sent = content_reads(&runtime, start);
+    assert!(
+        !sent.is_empty(),
+        "the second range was read from the replica"
+    );
+    assert!(
+        sent.iter().all(|call| call
+            .options
+            .overall_timeout()
+            .is_some_and(|remaining| remaining <= budget)),
+        "a budgeted read carries what is left of its caller's budget: {sent:?}"
+    );
+    drop(reader);
+    runtime.close().unwrap();
+}
+
 #[test]
 fn uncached_remote_read_arbitrary_size_uses_reader_response() {
     let (runtime, _, _, reader_node, stat, bytes) =

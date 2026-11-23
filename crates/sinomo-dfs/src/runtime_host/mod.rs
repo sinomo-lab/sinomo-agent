@@ -3897,6 +3897,8 @@ pub(crate) use maintenance_runtime::{
     run_daemon_dfs_repair_executor_turn_in_blocking_task,
 };
 mod peer_verdicts;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer_verdicts::DfsStandingVerdictGate;
 mod write_set_keeping;
 mod write_set_takeover;
 pub(crate) use write_set_takeover::{
@@ -3913,8 +3915,9 @@ pub(crate) use write_set_takeover::ask_dfs_takeover_corroboration_for_test;
 pub(crate) use write_set_keeping::{JoinRendezvousGuard, hold_joins_until_all_admitted_for_test};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use write_set_keeping::{
-    keeping_events_for_test, keeping_failures_for_test, keeping_reachability_interest_for_test,
-    set_test_peer_verdict, set_test_probe_owner, settle_test_peer_verification,
+    end_test_peer_verification_unconcluded, keeping_events_for_test, keeping_failures_for_test,
+    keeping_reachability_interest_for_test, set_test_peer_verdict, set_test_probe_owner,
+    settle_test_peer_verification,
     set_write_set_keeping_suspended, suspend_write_set_keeping_unless_enabled,
     test_verification_requests,
 };

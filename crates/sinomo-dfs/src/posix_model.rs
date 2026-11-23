@@ -447,11 +447,29 @@ pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsName
             cause: cause.clone(),
             current_primary_node_id: current_primary_node_id.clone(),
         }),
-        DfsPosixError::Dfs(_)
-        | DfsPosixError::Metadata(_)
-        | DfsPosixError::PendingWrite { .. }
-        | DfsPosixError::PartialBulkCommit { .. } => None,
+        error @ (DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_)) => {
+            closed_shard_storage_refusal(error)
+        }
+        DfsPosixError::PendingWrite { .. } | DfsPosixError::PartialBulkCommit { .. } => None,
     }
+}
+
+/// The wire refusal of a shard whose storage is closed, when `error` is one.
+fn closed_shard_storage_refusal(error: &DfsPosixError) -> Option<DfsNamespacePosixError> {
+    let cause = match error {
+        DfsPosixError::Dfs(error) => crate::error::closed_shard_storage_cause(error),
+        DfsPosixError::Metadata(MetadataBackendError::StoragePreparationPending { .. }) => {
+            Some(crate::DfsShardStorageClosedCause::Preparation)
+        }
+        DfsPosixError::Metadata(MetadataBackendError::StorageConverting) => {
+            Some(crate::DfsShardStorageClosedCause::Conversion)
+        }
+        error => crate::error::closed_shard_storage_cause_in(&error.to_string()),
+    }?;
+    Some(DfsNamespacePosixError::ShardStorageClosed {
+        cause,
+        detail: error.to_string(),
+    })
 }
 
 pub(crate) fn posix_error_for_namespace_rejection(
@@ -486,6 +504,9 @@ pub(crate) fn posix_error_for_namespace_rejection(
             detail,
         },
         Some(DfsNamespacePosixError::Busy { path }) => DfsPosixError::Dfs(DfsError::Busy { path }),
+        Some(DfsNamespacePosixError::ShardStorageClosed { cause, detail }) => {
+            DfsPosixError::Dfs(DfsError::ShardStorageClosed { cause, detail })
+        }
         Some(DfsNamespacePosixError::CommitOutcomeUnknown {
             file_system_id,
             shard_id,
@@ -566,5 +587,50 @@ mod commit_outcome_unknown_tests {
             },
         }
         assert!(serde_json::from_slice::<PreChangeError>(&encoded).is_ok());
+    }
+
+    #[test]
+    fn a_closed_shard_storage_refusal_is_typed_on_the_wire() {
+        use crate::DfsShardStorageClosedCause::{Conversion, Preparation};
+        let cases = [
+            (
+                DfsPosixError::Metadata(MetadataBackendError::StorageConverting),
+                Conversion,
+            ),
+            (
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: MetadataBackendError::StorageConverting.to_string(),
+                }),
+                Conversion,
+            ),
+            (
+                DfsPosixError::Dfs(DfsError::StoragePreparationPending {
+                    root: "/data/metadata".into(),
+                    processed_records: 3,
+                }),
+                Preparation,
+            ),
+        ];
+        for (closed, expected) in cases {
+            let wire = namespace_posix_error_for(&closed).expect("typed on the wire");
+            assert!(
+                matches!(
+                    &wire,
+                    DfsNamespacePosixError::ShardStorageClosed { cause, .. } if *cause == expected
+                ),
+                "{wire:?}"
+            );
+            assert!(matches!(
+                posix_error_for_namespace_rejection(closed.to_string(), Some(wire)),
+                DfsPosixError::Dfs(DfsError::ShardStorageClosed { cause, .. }) if cause == expected
+            ));
+        }
+        // Another internal failure still travels as its text alone.
+        assert_eq!(
+            namespace_posix_error_for(&DfsPosixError::Dfs(DfsError::Metadata {
+                message: "metadata shard is unreadable".into(),
+            })),
+            None
+        );
     }
 }

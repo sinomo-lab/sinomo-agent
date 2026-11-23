@@ -73,7 +73,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         // Without a live record, a closed authority could hold the object or
         // a reference to it: reclaimability is undecided until it answers.
-        fan_out.undecided(
+        self.fan_out_undecided(
+            &fan_out,
             format!("object {object_id}"),
             DfsObjectLifecycle {
                 reclaimable: deleted.is_some() && !retained,
@@ -675,6 +676,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        fan_out.undecided(format!("object {}", request.identity.object_id), false)
+        self.fan_out_undecided(
+            &fan_out,
+            format!("object {}", request.identity.object_id),
+            false,
+        )
     }
 }

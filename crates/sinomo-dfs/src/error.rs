@@ -166,6 +166,49 @@ pub enum DfsError {
     /// boundary.
     #[error("path {path} is moving between metadata shards; retry the operation")]
     Busy { path: String },
+    /// The shard's storage is closed for preparation or conversion. It
+    /// refused the request before any effect; the caller tries again later.
+    #[error("metadata shard storage is {cause}; retry the operation: {detail}")]
+    ShardStorageClosed {
+        cause: DfsShardStorageClosedCause,
+        detail: String,
+    },
+    /// Another holder kept a mounted-mutation outbox lock for the whole
+    /// bounded wait. Nothing was decided: the same request made again can
+    /// succeed.
+    #[error("timed out acquiring mounted-mutation outbox lock {lock} after {waited_millis} ms")]
+    MountedMutationOutboxBusy { lock: String, waited_millis: u64 },
+    /// A background pass parked a read whose shard primary it could not
+    /// reach, instead of waiting for the shard's record. Nothing was read;
+    /// the pass tries the read again later.
+    #[error(
+        "read of metadata shard {shard_id} at epoch {epoch} parked: its primary {primary_node_id} was not reached"
+    )]
+    RecordWaitParked {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+        primary_node_id: NodeId,
+    },
+    /// A read named one exact shard record, and that record changed while
+    /// the read followed it. The read plans again at the current record.
+    #[error("metadata shard {shard_id} record changed past epoch {epoch}; the read plans again")]
+    ShardRecordChanged {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+    },
+    /// A read that asked every shard found no deciding answer and needs the
+    /// answer of a shard whose primary it did not reach. That shard's record
+    /// stands and its re-send time came: the read asks every shard again.
+    #[error(
+        "metadata shard {shard_id} at epoch {epoch} is due to be asked again; the read plans again"
+    )]
+    ShardAnswerDue {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+    },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
     #[error("path already exists: {path}")]
@@ -184,6 +227,26 @@ pub enum DfsError {
     /// and retry loops return this instead of running out their full timeouts.
     #[error("DFS operation cancelled: {operation}")]
     Cancelled { operation: &'static str },
+}
+
+/// Why a metadata shard's storage is closed, so the shard refuses a request
+/// before any effect.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsShardStorageClosedCause {
+    /// The shard's storage root still awaits its preparation.
+    Preparation,
+    /// The shard's storage record names a conversion in progress.
+    Conversion,
+}
+
+impl std::fmt::Display for DfsShardStorageClosedCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Preparation => "awaiting preparation",
+            Self::Conversion => "converting",
+        })
+    }
 }
 
 /// Why a durably prepared metadata change did not commit in one attempt.
@@ -490,13 +553,29 @@ mod tests {
 
 /// Whether `error` is a shard's refusal to open because its storage is closed:
 /// its root awaits storage preparation, or its storage record names a
-/// conversion. The refusal arrives typed from a local copy and by its wording
-/// from a remote one; either way the shard's state is unknown, not absent.
+/// conversion. Either way the shard's state is unknown, not absent.
 pub(crate) fn dfs_error_is_closed_shard_storage(error: &DfsError) -> bool {
-    if matches!(error, DfsError::StoragePreparationPending { .. }) {
-        return true;
+    closed_shard_storage_cause(error).is_some()
+}
+
+/// Why `error` is a closed shard's refusal, if it is one. The refusal is
+/// typed once it has crossed a node boundary; a local copy reports it typed
+/// as a pending preparation or through the wording of its storage error.
+pub(crate) fn closed_shard_storage_cause(error: &DfsError) -> Option<DfsShardStorageClosedCause> {
+    match error {
+        DfsError::ShardStorageClosed { cause, .. } => Some(*cause),
+        DfsError::StoragePreparationPending { .. } => Some(DfsShardStorageClosedCause::Preparation),
+        error => closed_shard_storage_cause_in(&error.to_string()),
     }
-    let message = error.to_string();
-    message.contains(crate::METADATA_SHARD_STORAGE_CONVERTING_REFUSAL)
-        || message.contains(crate::METADATA_STORAGE_PREPARATION_PENDING_REFUSAL)
+}
+
+/// The closed-storage cause a storage error's wording names, if any.
+pub(crate) fn closed_shard_storage_cause_in(message: &str) -> Option<DfsShardStorageClosedCause> {
+    if message.contains(crate::METADATA_SHARD_STORAGE_CONVERTING_REFUSAL) {
+        Some(DfsShardStorageClosedCause::Conversion)
+    } else if message.contains(crate::METADATA_STORAGE_PREPARATION_PENDING_REFUSAL) {
+        Some(DfsShardStorageClosedCause::Preparation)
+    } else {
+        None
+    }
 }

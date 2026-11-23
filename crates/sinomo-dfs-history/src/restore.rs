@@ -1,7 +1,6 @@
 //! Durable restore execution and source-pin release, owned by namespace jobs.
 
 use crate::*;
-use std::time::Duration;
 
 fn restore_error(message: impl Into<String>) -> DfsError {
     DfsError::Metadata {
@@ -198,7 +197,7 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                         sifs_file_system_id(),
                         shard.primary_node_id.clone(),
                         operation,
-                        Duration::from_secs(60),
+                        sinomo_dfs::DFS_NO_CALLER_BUDGET,
                         false,
                         false,
                     )?;
@@ -240,7 +239,7 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                         path: job.root_path.clone(),
                         max_steps: 4,
                     },
-                    Duration::from_secs(60),
+                    sinomo_dfs::DFS_NO_CALLER_BUDGET,
                     false,
                     false,
                 )?;

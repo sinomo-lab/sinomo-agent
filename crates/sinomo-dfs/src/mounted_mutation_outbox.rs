@@ -289,6 +289,44 @@ pub struct MountedSifsMutationOutboxStore {
     root: PathBuf,
 }
 
+/// Why [`MountedSifsMutationOutboxStore::prepare`] returned no lease.
+#[derive(Debug)]
+pub enum MountedSifsMutationPrepareError {
+    /// The outbox cannot take another marker yet: it is at its marker limit,
+    /// it is still classifying the markers it holds, or another process
+    /// holds its store lock. Room is made when a marker is released, so the
+    /// same operation prepared again later can succeed.
+    NoRoom(DfsError),
+    /// The outbox refused the operation: its host-mount session is not live
+    /// here, its labels are invalid, or the store failed. The same operation
+    /// prepared again is refused again.
+    Refused(DfsError),
+}
+
+impl MountedSifsMutationPrepareError {
+    pub fn into_dfs_error(self) -> DfsError {
+        match self {
+            Self::NoRoom(error) | Self::Refused(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for MountedSifsMutationPrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRoom(error) | Self::Refused(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for MountedSifsMutationPrepareError {}
+
+impl From<MountedSifsMutationPrepareError> for DfsError {
+    fn from(error: MountedSifsMutationPrepareError) -> Self {
+        error.into_dfs_error()
+    }
+}
+
 /// Raw, owner-validated evidence used only by an explicit external-provider
 /// cursor-only recovery token. Constructing this value never creates a path,
 /// opens the normal self-healing store, repairs state, prunes history, or
@@ -785,6 +823,7 @@ pub struct MountedSifsMutationRecoveryClaim {
     store: MountedSifsMutationOutboxStore,
     marker: MountedSifsMutationOutboxMarker,
     recovery_kind: MountedSifsMutationRecoveryKind,
+    _fence: RecoveryClaimFence,
     _lease: HeldLeaseLock,
 }
 
@@ -792,6 +831,7 @@ pub struct MountedSifsMutationRecoveryClaim {
 pub struct MountedSifsMutationCorruptRecoveryClaim {
     store: MountedSifsMutationOutboxStore,
     marker_id: MountedSifsMutationMarkerId,
+    _fence: RecoveryClaimFence,
     _lease: HeldLeaseLock,
 }
 
@@ -1045,44 +1085,63 @@ impl MountedSifsMutationOutboxStore {
     /// Fsync a Prepared ambiguity marker while the host-session and operation
     /// leases are held. The adapter must not enter its mutation before a later
     /// daemon [`Self::arm_live`] call has also been fsynced and acknowledged.
+    ///
+    /// The error says whether the same operation can be prepared later:
+    /// [`MountedSifsMutationPrepareError::NoRoom`] is the outbox's
+    /// backpressure, and a caller waits on it for a marker's release.
     pub fn prepare<'session>(
         &self,
         session: &'session MountedSifsHostMountSessionLease,
         stable_operation_id: Option<String>,
         operation: impl Into<String>,
-    ) -> Result<MountedSifsMutationLease<'session>, DfsError> {
+    ) -> Result<MountedSifsMutationLease<'session>, MountedSifsMutationPrepareError> {
+        use MountedSifsMutationPrepareError::{NoRoom, Refused};
         let session_lease_is_held = session
             .lease
             .lock()
-            .map_err(|_| outbox_error("host-mount session lease is poisoned"))?
+            .map_err(|_| Refused(outbox_error("host-mount session lease is poisoned")))?
             .as_ref()
             .is_some_and(HeldLeaseLock::is_held);
         if session.store.root != self.root
             || session.marker.phase != MountedSifsHostMountSessionPhase::Active
             || !session_lease_is_held
         {
-            return Err(outbox_error(
+            return Err(Refused(outbox_error(
                 "host-mount session is not live in this outbox",
-            ));
+            )));
         }
-        let origin = session.origin(stable_operation_id, operation)?;
-        let _store_lock = lock_file_exclusive(&self.root.join(STORE_LOCK_FILE))?;
-        let status = self.status_unlocked()?;
+        let origin = session
+            .origin(stable_operation_id, operation)
+            .map_err(Refused)?;
+        let _store_lock =
+            lock_file_exclusive(&self.root.join(STORE_LOCK_FILE)).map_err(|error| match error {
+                // Another process is using the store; that is not a refusal.
+                DfsError::MountedMutationOutboxBusy { .. } => NoRoom(error),
+                other => Refused(other),
+            })?;
+        let status = self.status_unlocked().map_err(Refused)?;
         if status.directory_scan_limit_exceeded
             || status.marker_limit_exceeded
             || status.malformed_marker_count != 0
         {
-            return Err(outbox_error(
+            return Err(NoRoom(outbox_error(
                 "mounted-mutation outbox classification must complete before preparing new work",
-            ));
-        }
-        if status.total_marker_count >= MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
-            return Err(outbox_error(format!(
-                "mounted-mutation outbox active marker limit {} reached",
-                MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS
             )));
         }
+        if status.total_marker_count >= MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
+            return Err(NoRoom(outbox_error(format!(
+                "mounted-mutation outbox active marker limit {} reached",
+                MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS
+            ))));
+        }
+        self.publish_prepared_marker(origin).map_err(Refused)
+    }
 
+    /// Publish one Prepared marker under the store lock its caller holds.
+    fn publish_prepared_marker<'session>(
+        &self,
+        origin: MountedSifsMutationOrigin,
+    ) -> Result<MountedSifsMutationLease<'session>, DfsError> {
         let marker_id = Id::generate();
         let marker_nonce = Id::generate();
         let directory = self.operation_directory(&marker_id);
@@ -1356,7 +1415,7 @@ impl MountedSifsMutationOutboxStore {
         let recovery_kind = match marker_recovery_kind(&marker.phase) {
             Some(MountedSifsMutationRecoveryKind::Exact) => MountedSifsMutationRecoveryKind::Exact,
             Some(MountedSifsMutationRecoveryKind::Full) => {
-                if !daemon_owns_finished_mount_error(&marker)
+                if !mount_released_finished_error(&marker)
                     && !self.recovery_sessions_released(Some(&marker.origin))?
                 {
                     return Ok(None);
@@ -1379,6 +1438,7 @@ impl MountedSifsMutationOutboxStore {
             store: self.clone(),
             marker,
             recovery_kind,
+            _fence: RecoveryClaimFence::hold(&self.operation_directory(marker_id).join(LEASE_FILE)),
             _lease: lease,
         }))
     }
@@ -1432,6 +1492,7 @@ impl MountedSifsMutationOutboxStore {
         Ok(Some(MountedSifsMutationCorruptRecoveryClaim {
             store: self.clone(),
             marker_id: marker_id.clone(),
+            _fence: RecoveryClaimFence::hold(&directory.join(LEASE_FILE)),
             _lease: lease,
         }))
     }
@@ -1617,7 +1678,7 @@ impl MountedSifsMutationOutboxStore {
                         recovery_candidate_marker_ids.push(marker.marker_id.clone());
                     }
                     Some(MountedSifsMutationRecoveryKind::Full)
-                        if daemon_owns_finished_mount_error(&marker) =>
+                        if mount_released_finished_error(&marker) =>
                     {
                         status.full_recovery_marker_count += 1;
                         recovery_candidate_marker_ids.push(marker.marker_id.clone());
@@ -1696,6 +1757,7 @@ impl MountedSifsMutationOutboxStore {
         marker_id: &MountedSifsMutationMarkerId,
         marker_nonce: &MountedSifsMutationNonce,
     ) -> Result<MountedSifsMutationOutboxMarker, DfsError> {
+        refuse_recovery_claimed(&self.operation_directory(marker_id).join(LEASE_FILE))?;
         let marker = self
             .marker(marker_id)?
             .ok_or_else(|| outbox_error(format!("unknown mounted-mutation marker {marker_id}")))?;
@@ -2262,6 +2324,7 @@ impl MountedSifsMutationOutboxStore {
     ) -> Result<MountedSifsMutationOutboxMarker, DfsError> {
         let _store_lock = lock_file_exclusive(&self.root.join(STORE_LOCK_FILE))?;
         let directory = self.operation_directory(marker_id);
+        refuse_recovery_claimed(&directory.join(LEASE_FILE))?;
         if lock_liveness(&directory.join(LEASE_FILE))? != LeaseLiveness::Live {
             return Err(outbox_error("mounted-mutation operation lease is not live"));
         }
@@ -2558,6 +2621,52 @@ impl Drop for HeldLeaseLock {
     }
 }
 
+/// Operation leases a recovery claim of this process holds. A claim takes
+/// the lease the mount released, so the lease's liveness alone no longer says
+/// the mount owns the marker; this set says recovery does.
+fn recovery_claimed_leases() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static CLAIMED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    CLAIMED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Marks one operation lease as held by recovery while the claim lives.
+#[derive(Debug)]
+struct RecoveryClaimFence(PathBuf);
+
+impl RecoveryClaimFence {
+    fn hold(lease_path: &Path) -> Self {
+        recovery_claimed_leases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(lease_path.to_path_buf());
+        Self(lease_path.to_path_buf())
+    }
+}
+
+impl Drop for RecoveryClaimFence {
+    fn drop(&mut self) {
+        recovery_claimed_leases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// A live mount transition never applies to a marker recovery has claimed:
+/// the mount released that marker's lease and owns it no longer.
+fn refuse_recovery_claimed(lease_path: &Path) -> Result<(), DfsError> {
+    let claimed = recovery_claimed_leases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(lease_path);
+    if claimed {
+        return Err(outbox_error(
+            "mounted-mutation marker belongs to recovery: its mount released the lease",
+        ));
+    }
+    Ok(())
+}
+
 fn process_locks() -> &'static Mutex<BTreeSet<PathBuf>> {
     static LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
     LOCKS.get_or_init(|| Mutex::new(BTreeSet::new()))
@@ -2666,11 +2775,11 @@ fn lock_file_exclusive_with_timeout(
             Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(outbox_error(format!(
-                        "timed out acquiring mounted-mutation outbox lock {} after {} ms",
-                        path.display(),
-                        timeout.as_millis()
-                    )));
+                    // Typed, so the daemon answers it as "busy, send again".
+                    return Err(DfsError::MountedMutationOutboxBusy {
+                        lock: path.display().to_string(),
+                        waited_millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    });
                 }
                 std::thread::sleep(
                     deadline
@@ -3021,9 +3130,13 @@ fn verify_marker_identity(
     Ok(())
 }
 
-/// The adapter recorded the end of service entry and Main fsynced acceptance.
-/// The operation lease must also have been released before a claim can start.
-fn daemon_owns_finished_mount_error(marker: &MountedSifsMutationOutboxMarker) -> bool {
+/// The mount finished with this marker's error: it durably recorded what the
+/// operation observed, Main accepted that record or definitely refused it,
+/// and the mount then released the operation lease. Custody follows the
+/// lease, not the host-mount session: recovery may claim such a marker at once
+/// while the mount keeps serving. The caller still requires the dead lease,
+/// and a claim holds it, so the mount cannot touch the marker again.
+fn mount_released_finished_error(marker: &MountedSifsMutationOutboxMarker) -> bool {
     matches!(
         marker.origin.adapter,
         MountedSifsMutationAdapter::Fuse | MountedSifsMutationAdapter::Nfs
@@ -3033,7 +3146,7 @@ fn daemon_owns_finished_mount_error(marker: &MountedSifsMutationOutboxMarker) ->
             requires_full_recovery: true,
             error_observation: Some(_),
             ..
-        }
+        } | MountedSifsMutationOutboxPhase::UnknownAfterError { .. }
     )
 }
 
@@ -3581,10 +3694,8 @@ mod tests {
         let timeout = lock_file_exclusive_with_timeout(&lock_path, Duration::ZERO)
             .expect_err("contended lock must time out");
         assert!(
-            timeout
-                .to_string()
-                .contains("timed out acquiring mounted-mutation outbox lock"),
-            "contention must take the bounded retry path: {timeout}"
+            matches!(timeout, DfsError::MountedMutationOutboxBusy { .. }),
+            "contention must take the typed retry path: {timeout}"
         );
 
         drop(probe);

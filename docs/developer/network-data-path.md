@@ -273,7 +273,8 @@ verification generations with its memoized inputs. It recomputes, once per
 process for all subscribers, only when one of them moved or the earliest edge
 expiry the memo used has passed. Expiry alone schedules nothing; the next hint
 or point read reflects it. `changed()` returns
-the peers whose entry (verdict, `verifying`, `relayed_only`) differs from that
+the peers whose entry (verdict, `verifying`, `relayed_only`,
+`examined_generation`, `concluded_generation`) differs from that
 subscriber's previous snapshot, so a lagged hint loses nothing. Without a
 subscriber nothing is computed, and `peer_reachability_snapshot` computes on
 demand without retaining a view.
@@ -281,9 +282,11 @@ demand without retaining a view.
 The Main daemon publishes `host.network.peer.reachability.changed` (schema
 `sinomo.component-host.peer-reachability` 1.0.0) once per changed peer, as a
 transient, local, private component-host event. The payload carries the
-observer, peer, previous and current entries, the snapshot generation, the
-moved inputs as causes, and the input generations as evidence. Consumers read
-state from the subscription; the event bus may drop events on lag.
+observer, peer, previous and current entries (`verdict`, `verifying`,
+`relayed_only`, `examined_generation`, `concluded_generation`), the snapshot
+generation, the moved inputs as causes, and the input generations as evidence.
+Consumers read state from the subscription; the event bus may drop events on
+lag.
 
 Verification requests come from the terminal outcome of `call_target` once a
 dial has started, endpoint calls, a prepared connector's first-hop realization
@@ -329,6 +332,17 @@ An episode settles when:
 A failure-driven first round for a peer whose planned endpoints are all already
 unreachable settles without probing.
 
+Every settlement gives the peer a new `examined_generation`. Only an episode
+whose own probe concluded, with an endpoint that answered or with every planned
+endpoint at the failure threshold, also moves `concluded_generation` to that
+value. The other settlements leave it unchanged: the no-observation and
+six-round bounds, the failure-driven round that did not probe, a peer with
+nothing this node dials, and the cancellation of every episode when the node
+has no cluster, is alone in it, is not yet a registered member or its probe's
+identity was superseded. A service that needs a standing no-path verdict
+examined compares `concluded_generation`, and asks again when an episode
+settled without moving it; the registry starts no episode on its own.
+
 Every connectivity probe, periodic or verification, is a status RPC under the
 connect and no-progress limits of `NetworkHealthPolicy`, with no whole-call
 deadline. A batch has its own budget: the pending-step bound less 250 ms. Its
@@ -340,8 +354,11 @@ budget. An endpoint still answering when that budget ends records nothing
 Every module endpoint of an authorized member is an active probe key, so
 verification evidence for it survives later regular batches, but only built-in
 endpoints are ever regularly due and only those records schedule renewal. The
-regular seed never copies module evidence back into a batch. Main schedules one
-wake at the earliest expiry of records no regular probe renews;
+regular seed never copies module evidence back into a batch. The seed keeps the
+expiry each record's source gave it, so a renewal comes due at that expiry;
+routing reads instead keep a committed verdict current for its lifetime from
+the read, so a route survives a source that is silent past its TTL. Main
+schedules one wake at the earliest expiry of records no regular probe renews;
 `remove_expired_local_cluster_connectivity_source_records` then removes those
 expired in both the persisted and in-memory views, once, and the source's
 publication withdraws the committed copy. A record renewed in memory by a later

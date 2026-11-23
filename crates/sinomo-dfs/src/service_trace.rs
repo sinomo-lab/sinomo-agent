@@ -178,6 +178,7 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
 ) -> &'static str {
     match result {
         DfsDistributedWriteResult::Rejected { .. } => "rejected",
+        DfsDistributedWriteResult::ShardStorageClosed { .. } => "shard-storage-closed",
         DfsDistributedWriteResult::PreconditionFailed { .. } => "precondition-failed",
         DfsDistributedWriteResult::UnsupportedPrecondition { .. } => "unsupported-precondition",
         DfsDistributedWriteResult::ReconciliationRequired { .. } => "reconciliation-required",

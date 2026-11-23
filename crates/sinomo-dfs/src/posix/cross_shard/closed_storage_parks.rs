@@ -28,8 +28,7 @@
 //! shard's primary runs the job only while it serves.
 use super::*;
 
-/// Whether `error` is a shard's refusal because its storage is closed, by
-/// the wording a remote refusal keeps (see
+/// Whether `error` is a shard's refusal because its storage is closed (see
 /// [`crate::error::dfs_error_is_closed_shard_storage`]).
 pub(super) fn posix_error_is_closed_shard_storage(error: &DfsPosixError) -> bool {
     match error {

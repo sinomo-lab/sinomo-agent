@@ -132,11 +132,10 @@ the shard before its storage record is Active.
 
 ## Dispatch, cancellation and bounds
 
-The read retains the existing 15-second freshness budget, shortened by an
-enclosing caller deadline, and restores the caller's deadline on return.
-Cancellation fails the read without publishing metadata or creating recovery
-work. Hardlink resolution retains its sixteen-hop bound. These bounds do not
-permit retries merely because an unrelated shard changed.
+The read adds no deadline of its own: its only bound in time is a deadline
+its caller set. Cancellation fails the read without publishing metadata or
+creating recovery work. Hardlink resolution retains its sixteen-hop bound.
+These bounds do not permit retries merely because an unrelated shard changed.
 
 A Core owning one physical shard cannot impersonate another shard because both
 primaries share a node ID. Same-node queries use the existing authenticated Main

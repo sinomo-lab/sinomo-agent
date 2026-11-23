@@ -40,6 +40,8 @@ pub(crate) use takeover::{
 };
 
 #[cfg(test)]
+mod adoption_takeover_native_tests;
+#[cfg(test)]
 mod budget_native_tests;
 #[cfg(test)]
 mod commit_native_tests;
@@ -58,7 +60,13 @@ mod takeover_loss_native_tests;
 #[cfg(test)]
 mod takeover_native_tests;
 #[cfg(test)]
+mod successor_retry_native_tests;
+#[cfg(test)]
+mod successor_write_native_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_identity_native_tests;
 
 /// Persisted format of [`DfsMetadataShardWriteSet`]. Readers reject any other
 /// value, so a record written by a later protocol fails closed.

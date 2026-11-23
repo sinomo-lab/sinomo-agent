@@ -656,6 +656,26 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         None
     }
 
+    /// Run `waker` each time a message for this transport arrives from
+    /// another thread, until it is replaced or cleared. A caller waiting on
+    /// something other than [`Self::wait_for_incoming`] installs it so an
+    /// arrival ends that wait too. Transports whose messages arrive only
+    /// through their own sends have nothing to signal.
+    fn set_incoming_arrival_waker(
+        &mut self,
+        _waker: Option<crate::service_state::DfsCancellationWaker>,
+    ) {
+    }
+
+    /// Post a hint to this node's own Main without waiting for its answer.
+    /// A hint changes nothing its sender depends on, so nothing reports
+    /// whether it arrived: the sender posts it again with its next attempt.
+    /// Transports that cannot send without waiting use the ordinary call.
+    fn post_hint_to_local_main(&mut self, message: DfsRoutedMessage) -> Result<(), NetworkError> {
+        let target_node_id = message.target_node_id.clone();
+        self.send_routed_call(&target_node_id, DfsRoutedCall::value(message))
+    }
+
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         if self
             .pending_incoming_count()?

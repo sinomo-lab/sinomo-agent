@@ -195,17 +195,29 @@ when the network layer's own probing reports the primary unreachable.
 A candidate is a write-set member that can commit to cluster KV. If its verdict
 already said the primary had no path when it first observed that primary at the
 current epoch, it asks the network to examine the peer. The campaign can start
-once a later examination of that peer settles with no path. A path lost while
-the primary already holds that epoch qualifies directly. The primary uses the
-same rule to remove a write-set member. If two surviving members lose their
-path to each other but both can commit to cluster KV, the first guarded change
-to the shard record wins.
+once a later examination of that peer concludes from its own probe and the
+verdict is still no path. An examination that ends without a conclusion,
+because it was cancelled, the peer has nothing this node dials, or its probes
+produced no verdict, certifies nothing, and the candidate asks again. A node
+that dials no endpoint of the primary therefore never certifies a verdict that
+already stood when it first observed that primary at the epoch. A path
+lost while the primary already holds that epoch qualifies directly. The primary
+uses the same rule to remove a write-set member, and a member handed the
+attempt uses it before it swaps. If two surviving members lose their path to
+each other but both can commit to cluster KV, the first guarded change to the
+shard record wins.
 
 1. **Corroborate.** The candidate asks the other reachable write-set members, in
    one round, whether they still have a path to the primary and how far their
-   journal goes. A member asked has the network verify the primary first, unless
-   its verdict already says there is no path, so connectivity records that have
-   not yet aged out cannot veto a primary that died. Any member that still
+   journal goes. A member asked says it lost the primary only by the
+   candidate's own rule: its verdict turned to no path while it already observed
+   that primary at the current epoch, or an examination of the primary has
+   concluded with no path since. Otherwise it has the network examine the
+   primary first, so connectivity records that have not yet aged out can neither
+   veto a primary that died nor depose one that is alive. A member whose
+   examination ends without a conclusion answers that it has no evidence, which
+   neither vetoes nor ranks it, and a later question has the network examine
+   the primary again. Any member that still
    reaches the primary vetoes the attempt, so one node's poor link cannot depose
    a healthy primary. The remaining members are ranked by journal position, then
    non-mobile before mobile, then node id. A candidate that does not rank first
@@ -233,8 +245,11 @@ to the shard record wins.
    re-reading the record cannot tell a lost swap from one that may still apply.
    The candidate re-sends the identical request until it settles; the re-send
    is a timer, because while the swap is unknown no primary can commit and no
-   change may arrive to prompt it. Re-sends of a failed confirm read and of a
-   failed rejoin step are the only other timers, for the same reason. The candidate releases its promise
+   change may arrive to prompt it. Re-sends of a failed confirm read, of a
+   failed rejoin step and of a request to examine a peer whose examination
+   ended without a conclusion are the only other timers, for the same reason:
+   nothing would prompt them again, and the network starts no examination on
+   its own. The candidate releases its promise
    only when its own swap was rejected and the old primary is still primary.
 5. **Activate.** The candidate rebinds its existing store to the new epoch and
    republishes every prepared change it holds through prepared-change recovery,

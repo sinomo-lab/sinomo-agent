@@ -790,6 +790,7 @@ fn peer_reachability_event_entry(
             "verifying": entry.verifying,
             "relayed_only": entry.relayed_only,
             "examined_generation": entry.examined_generation,
+            "concluded_generation": entry.concluded_generation,
         })
     })
 }
@@ -3763,6 +3764,57 @@ pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_peer_reachability_event_carries_both_examination_generations() {
+        let node = |name: &str| sinomo_core::node::NodeId::from_legacy_named(name).unwrap();
+        let (observer, peer) = (
+            node("reachability_event_observer"),
+            node("reachability_event_peer"),
+        );
+        let entry =
+            |examined_generation, concluded_generation| sinomo_core::network::PeerReachability {
+                peer_node_id: peer.clone(),
+                verdict: sinomo_core::network::PeerPathVerdict::NoPath,
+                relayed_only: false,
+                verifying: false,
+                examined_generation,
+                concluded_generation,
+            };
+        let snapshot = |generation, entry: sinomo_core::network::PeerReachability| {
+            sinomo_core::network::PeerReachabilitySnapshot {
+                cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
+                    "cluster_reachability_event",
+                )
+                .unwrap(),
+                observer_node_id: observer.clone(),
+                generation,
+                inputs: sinomo_core::network::PeerReachabilityInputs::default(),
+                peers: [(peer.clone(), entry)].into_iter().collect(),
+            }
+        };
+        // An episode that concluded, then one that settled without a
+        // conclusion: only the examined generation moved.
+        let (before, after) = (entry(4, 4), entry(7, 4));
+        let event = component_host_peer_reachability_event(
+            &DaemonPaths::with_root(std::path::PathBuf::from(
+                "/nonexistent/sinomo-reachability-event",
+            )),
+            &snapshot(1, before.clone()),
+            &snapshot(2, after.clone()),
+            &sinomo_core::network::PeerReachabilityChange {
+                peer_node_id: peer.clone(),
+                previous: Some(before),
+                current: Some(after),
+            },
+        );
+        let payload = &event.envelope.payload;
+        for (side, examined, concluded) in [("previous", 4, 4), ("current", 7, 4)] {
+            assert_eq!(payload[side]["examined_generation"], examined, "{side}");
+            assert_eq!(payload[side]["concluded_generation"], concluded, "{side}");
+        }
+        assert_eq!(payload["current"]["verdict"], "no-path");
+    }
 
     struct TestRolloutHost;
 

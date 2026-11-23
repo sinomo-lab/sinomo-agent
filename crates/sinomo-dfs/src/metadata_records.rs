@@ -421,6 +421,7 @@ impl DfsWriteIntentReceipt {
             policy: self.policy.clone(),
             status: self.status.clone(),
             content_hash: self.content_hash.clone(),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: self.touch_parent_on_create,
             create_predecessor_object_id: self.create_predecessor_object_id.clone(),
@@ -1019,7 +1020,8 @@ pub use prepared_operation::{
     DfsPreparedOperationStatus,
 };
 pub(crate) use prepared_operation::{
-    compound_prepared_operation_id, with_prepared_payload_validation,
+    compound_prepared_operation_id, recovered_operation_id, recovery_operation_id,
+    retired_admission_operation_id, with_prepared_payload_validation,
 };
 #[cfg(test)]
 pub(crate) use prepared_operation::{

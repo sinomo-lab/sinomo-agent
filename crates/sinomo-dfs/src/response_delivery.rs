@@ -183,9 +183,16 @@ impl DfsRoutedResponseDelivery {
         }
         incoming.messages.push_back((message.clone(), charge));
         incoming.bytes += charge;
+        let arrival = incoming.arrival.clone();
         drop(incoming);
+        drop(state);
         inbox.ready.notify_all();
         inbox.async_ready.notify_waiters();
+        // The owner's other wait, if it is in one, ends too. Neither lock is
+        // held while its waker runs.
+        if let Some(arrival) = arrival {
+            arrival();
+        }
         Ok(true)
     }
 
@@ -246,6 +253,9 @@ struct InboxState {
     interrupted: bool,
     bytes: usize,
     messages: VecDeque<(DfsRoutedMessage, usize)>,
+    /// Run after each delivery, for an owner that waits on something other
+    /// than this inbox.
+    arrival: Option<crate::service_state::DfsCancellationWaker>,
 }
 
 #[derive(Default)]
@@ -308,6 +318,19 @@ impl DfsRoutedResponseInboxOwner {
             .lock()
             .map_err(|_| custody_error("response inbox lock poisoned"))?;
         Ok(state.messages.len())
+    }
+
+    /// Run `waker` after each message delivered to this inbox, until it is
+    /// replaced or cleared.
+    pub(crate) fn set_arrival_waker(
+        &self,
+        waker: Option<crate::service_state::DfsCancellationWaker>,
+    ) {
+        self.inbox
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .arrival = waker;
     }
 
     /// Ends the current or next [`Self::wait`] on this inbox early.

@@ -1361,7 +1361,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 // The maintained count names an alias: one a closed shard
                 // holds is unknown, so no alias found is not "none".
-                Ok(fan_out.undecided(format!("aliases of {}", target.path), None)?)
+                Ok(service.fan_out_undecided(
+                    &fan_out,
+                    format!("aliases of {}", target.path),
+                    None,
+                )?)
             })?
         };
         if let Some(object) = result.as_ref() {
@@ -1502,7 +1506,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// [`Self::resolve_hardlink_target_distributed`], leaving to the caller
     /// what an unfound target means: the shards whose storage is closed are
-    /// noted in `fan_out` and the search goes on past them.
+    /// noted in `fan_out` and the search goes on past them. A target that a
+    /// shard left unanswered could hold is not unfound: its answer is needed
+    /// (see [`NetworkedDfsService::fan_out_needed_answer`]).
     pub(super) fn resolve_hardlink_target_distributed_noting_closed(
         &mut self,
         object: &DfsObjectMetadata,
@@ -1521,6 +1527,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         resolve_hardlink_target_with(object, |target_id| {
+            fan_out.next_question();
             for shard in catalog {
                 let Some(queried) = self.query_metadata_authority_in_fan_out(
                     fan_out,
@@ -1572,6 +1579,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     return Ok(Some(*target));
                 }
+            }
+            if let Some(needed) = self.fan_out_needed_answer(fan_out) {
+                return Err(needed.into());
             }
             Ok(None)
         })

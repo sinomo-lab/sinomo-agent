@@ -23,9 +23,10 @@ pub const MAX_PENDING_PEER_VERIFICATIONS: usize = 256;
 static NEXT_PEER_VERIFICATION_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static PEER_VERIFICATIONS: LazyLock<Mutex<HashMap<PathBuf, RootPeerVerifications>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Source of [`RootPeerVerifications::examined`] values: process-wide and
-/// never zero, so a value is never reused after a root's registry is dropped.
 static NEXT_VERIFICATION_CHANGE: AtomicU64 = AtomicU64::new(1);
+/// Source of [`RootPeerVerifications::examined`] values: process-wide,
+/// increasing and never zero, so a value is never reused after a root's
+/// registry is dropped.
 static NEXT_PEER_EXAMINATION: AtomicU64 = AtomicU64::new(1);
 
 /// Why a peer's direct edges should be verified now.
@@ -80,15 +81,32 @@ impl PeerVerificationCause {
     }
 }
 
+/// How a verification episode ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerVerificationOutcome {
+    /// The episode's own probe concluded about the peer's direct edges: one
+    /// answered, or every one of them failed.
+    Concluded,
+    /// The episode ended without a conclusion of its own: it was cancelled,
+    /// the peer had nothing this node dials, its rounds produced no
+    /// observation or ran out, or recorded evidence answered in place of a
+    /// probe.
+    Unconcluded,
+}
+
 #[derive(Default)]
 struct RootPeerVerifications {
     owners: BTreeMap<u64, Arc<tokio::sync::Notify>>,
     pending: BTreeMap<NodeId, PeerVerificationCause>,
     in_progress: BTreeSet<NodeId>,
     generation: u64,
-    /// Per peer, a value that changes each time an episode for it settles.
-    /// An episode abandoned because the owner went away settles nothing.
+    /// Per peer, a value that changes each time an episode for it settles,
+    /// whatever ended it. An episode abandoned because the owner went away
+    /// settles nothing.
     examined: BTreeMap<NodeId, u64>,
+    /// Per peer, the `examined` value of its last episode that settled
+    /// [`PeerVerificationOutcome::Concluded`].
+    concluded: BTreeMap<NodeId, u64>,
 }
 
 impl RootPeerVerifications {
@@ -260,16 +278,22 @@ pub fn begin_peer_verification(paths: &ClusterPaths, peer_node_id: &NodeId) {
     update_in_progress(paths, |root| root.in_progress.insert(peer_node_id.clone()));
 }
 
-/// Marks the verification episode for `peer` as settled.
+/// Marks the verification episode for `peer` as settled with `outcome`. Only
+/// a concluded episode counts as an examination of the peer.
 #[doc(hidden)]
-pub fn settle_peer_verification(paths: &ClusterPaths, peer_node_id: &NodeId) {
+pub fn settle_peer_verification(
+    paths: &ClusterPaths,
+    peer_node_id: &NodeId,
+    outcome: PeerVerificationOutcome,
+) {
     update_in_progress(paths, |root| {
         let settled = root.in_progress.remove(peer_node_id);
         if settled {
-            root.examined.insert(
-                peer_node_id.clone(),
-                NEXT_PEER_EXAMINATION.fetch_add(1, Ordering::Relaxed),
-            );
+            let examined = NEXT_PEER_EXAMINATION.fetch_add(1, Ordering::Relaxed);
+            root.examined.insert(peer_node_id.clone(), examined);
+            if outcome == PeerVerificationOutcome::Concluded {
+                root.concluded.insert(peer_node_id.clone(), examined);
+            }
         }
         settled
     });
@@ -307,10 +331,13 @@ pub(crate) struct PeerVerificationState {
     /// Per peer, a value that changes each time an episode for it settles;
     /// absent while none has.
     pub(crate) examined: BTreeMap<NodeId, u64>,
+    /// Per peer, the `examined` value of its last concluded episode; absent
+    /// while none concluded.
+    pub(crate) concluded: BTreeMap<NodeId, u64>,
 }
 
 /// The running-verification set for `paths`, its generation and every peer's
-/// last settled episode.
+/// last settled and last concluded episode.
 pub(crate) fn peer_verification_state(paths: &ClusterPaths) -> PeerVerificationState {
     PEER_VERIFICATIONS
         .lock()
@@ -320,6 +347,7 @@ pub(crate) fn peer_verification_state(paths: &ClusterPaths) -> PeerVerificationS
                 generation: root.generation,
                 verifying: root.in_progress.clone(),
                 examined: root.examined.clone(),
+                concluded: root.concluded.clone(),
             })
         })
         .unwrap_or_default()
@@ -449,14 +477,14 @@ mod tests {
             !running.examined.contains_key(&peer),
             "a running episode has examined nothing yet"
         );
-        settle_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Concluded);
         let settled = peer_verification_state(&paths);
         assert!(settled.verifying.is_empty());
         assert_ne!(running.generation, settled.generation);
         let examined = settled.examined.get(&peer).copied();
         assert!(examined.is_some_and(|examined| examined != 0));
         // Settling a peer that has no running episode examines nothing.
-        settle_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Concluded);
         assert_eq!(
             peer_verification_state(&paths).examined.get(&peer).copied(),
             examined
@@ -465,7 +493,7 @@ mod tests {
         let other = node("node_peer_verification_other_peer");
         begin_peer_verification(&paths, &other);
         begin_peer_verification(&paths, &peer);
-        settle_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Concluded);
         let again = peer_verification_state(&paths);
         assert_ne!(again.examined.get(&peer).copied(), examined);
         assert!(!again.examined.contains_key(&other));
@@ -482,6 +510,69 @@ mod tests {
             &peer,
             PeerVerificationCause::DeliveryFailed
         ));
+    }
+
+    #[test]
+    fn only_a_concluded_episode_advances_the_concluded_value() {
+        let paths = paths("outcomes");
+        let peer = node("node_peer_verification_outcomes_peer");
+        let other = node("node_peer_verification_outcomes_other");
+        let owner = register_peer_verification_owner(&paths);
+        let values = |peer: &NodeId| {
+            let state = peer_verification_state(&paths);
+            (
+                state.examined.get(peer).copied(),
+                state.concluded.get(peer).copied(),
+            )
+        };
+        assert_eq!(values(&peer), (None, None));
+
+        // An episode that ends without a conclusion settles, and examines
+        // nothing.
+        begin_peer_verification(&paths, &peer);
+        let before = peer_verification_state(&paths).generation;
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Unconcluded);
+        let (unconcluded, concluded) = values(&peer);
+        assert!(unconcluded.is_some());
+        assert_eq!(concluded, None, "nothing concluded yet");
+        assert_ne!(
+            peer_verification_state(&paths).generation,
+            before,
+            "the settlement is still verification activity"
+        );
+
+        // A concluded episode advances both, to the same value.
+        begin_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Concluded);
+        let (examined, concluded) = values(&peer);
+        assert!(examined > unconcluded, "values only increase");
+        assert_eq!(concluded, examined);
+
+        // A later unconcluded episode leaves the concluded value where the
+        // last conclusion put it.
+        begin_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Unconcluded);
+        let (later, still) = values(&peer);
+        assert!(later > examined);
+        assert_eq!(still, concluded);
+
+        // Another peer's conclusion says nothing about this one.
+        begin_peer_verification(&paths, &other);
+        settle_peer_verification(&paths, &other, PeerVerificationOutcome::Concluded);
+        assert_eq!(values(&peer), (later, still));
+        assert!(values(&other).1 > later);
+
+        // An episode abandoned with its owner settles and concludes nothing.
+        begin_peer_verification(&paths, &peer);
+        drop(owner);
+        let _owner = register_peer_verification_owner(&paths);
+        assert_eq!(values(&peer), (None, None), "the registry was dropped");
+        begin_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer, PeerVerificationOutcome::Concluded);
+        assert!(
+            values(&peer).1 > later,
+            "a value is never reused after the registry is dropped"
+        );
     }
 
     #[test]

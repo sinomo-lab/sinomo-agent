@@ -619,6 +619,17 @@ impl LocalSobjMetadataBackend {
             });
         }
         #[cfg(test)]
+        if prepared_commit_is_held(&self.root, &digest.operation_id) {
+            // Negative-only native fault: the durable prepare stays prepared.
+            return Err(MetadataBackendError::Io {
+                path: self.root.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "test holds this prepared commit",
+                ),
+            });
+        }
+        #[cfg(test)]
         crate::default_cluster::genesis::defer_native_genesis_commit_at_writer(
             &self.root,
             &record,
@@ -749,6 +760,50 @@ impl LocalSobjMetadataBackend {
             published: true,
         })
     }
+}
+
+#[cfg(test)]
+static PREPARED_COMMIT_HOLDS: std::sync::Mutex<BTreeSet<(std::path::PathBuf, String)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+/// Holds the commit of one prepared operation on the given shard roots while
+/// it lives: each attempt fails as an interrupted commit, and the prepare
+/// stays prepared.
+#[cfg(test)]
+pub(crate) struct PreparedCommitHold(Vec<(std::path::PathBuf, String)>);
+#[cfg(test)]
+impl Drop for PreparedCommitHold {
+    fn drop(&mut self) {
+        let mut holds = PREPARED_COMMIT_HOLDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for key in &self.0 {
+            holds.remove(key);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn hold_prepared_commit(
+    roots: &[std::path::PathBuf],
+    operation_id: &str,
+) -> PreparedCommitHold {
+    let keys = roots
+        .iter()
+        .map(|root| (root.clone(), operation_id.to_owned()))
+        .collect::<Vec<_>>();
+    let mut holds = PREPARED_COMMIT_HOLDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for key in &keys {
+        assert!(holds.insert(key.clone()), "one hold per prepared commit");
+    }
+    PreparedCommitHold(keys)
+}
+#[cfg(test)]
+fn prepared_commit_is_held(root: &std::path::Path, operation_id: &str) -> bool {
+    PREPARED_COMMIT_HOLDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&(root.to_owned(), operation_id.to_owned()))
 }
 
 /// A commit that creates retained or committed Current placement owners must
@@ -892,6 +947,7 @@ pub(crate) fn validate_preparation_against_tables(
             .is_some_and(|existing| {
                 let mut expected = existing.clone();
                 expected.owner_epoch = intent.owner_epoch;
+                agree_on_unrecorded_content_size(&mut expected, intent);
                 expected != *intent
             })
             || tables
@@ -1189,6 +1245,7 @@ fn validate_precondition_failure_effect(
         if intent.object_metadata.is_none() {
             expected.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut expected, intent);
         if expected == *intent {
             return Ok(());
         }
@@ -1199,6 +1256,7 @@ fn validate_precondition_failure_effect(
     let mut expected = previous.clone();
     expected.status = intent.status.clone();
     expected.updated_at = intent.updated_at;
+    agree_on_unrecorded_content_size(&mut expected, intent);
     if !matches!(
         previous.status,
         DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
@@ -1309,7 +1367,8 @@ fn negative_publication_effect_shape(
             || body.file_system_id != old.file_system_id
             || body.shard_id != old.shard_id
             || body.owner_epoch <= old.owner_epoch
-            || body.operation_id != format!("recover:{}:{}", old.operation_id, body.owner_epoch)
+            || crate::metadata_records::recovered_operation_id(&body.operation_id, body.owner_epoch)
+                != Some(old.operation_id.as_str())
         {
             return false;
         }
@@ -1371,6 +1430,7 @@ fn validate_failed_intent_source_binding(
         if intent.object_metadata.is_none() {
             previous.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut previous, intent);
         if previous == *intent {
             return Ok(());
         }
@@ -1751,6 +1811,7 @@ fn validate_committed_intent_content(
         if intent.object_metadata.is_none() {
             previous.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut previous, intent);
         if previous == *intent {
             return Ok(());
         }
@@ -1772,6 +1833,7 @@ fn validate_committed_intent_content(
         if intent.object_metadata.is_none() {
             captured.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut captured, intent);
         captured == *intent
     }) {
         return Ok(());
@@ -1965,6 +2027,31 @@ pub(super) fn validate_metadata_effect_content_bindings(
         }
     }
     Ok(())
+}
+
+/// Whether putting `row` would replace a request's final outcome: its
+/// receipt, or a completed row it differs from. A request completes once.
+pub(crate) fn namespace_request_row_replaces_final_outcome(
+    receipt_exists: bool,
+    existing: Option<&crate::DfsNamespaceRequestRecord>,
+    row: &crate::DfsNamespaceRequestRecord,
+) -> bool {
+    receipt_exists
+        || existing.is_some_and(|existing| {
+            existing.status == crate::DfsNamespaceRequestStatus::Completed && existing != row
+        })
+}
+
+/// Two records of one write agree on its content size unless both record
+/// one and they differ: a record that does not carry the size, such as a
+/// compact receipt's, agrees with any.
+fn agree_on_unrecorded_content_size(
+    previous: &mut crate::DfsWriteIntentRecord,
+    intent: &crate::DfsWriteIntentRecord,
+) {
+    if previous.content_size_bytes.is_none() || intent.content_size_bytes.is_none() {
+        previous.content_size_bytes = intent.content_size_bytes;
+    }
 }
 
 fn validate_metadata_effects(
@@ -2319,6 +2406,22 @@ fn validate_metadata_effects(
                     ));
                 }
             }
+            E::PutNamespaceRequest { request } => {
+                let key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                );
+                if namespace_request_row_replaces_final_outcome(
+                    tables.namespace_request_receipts.contains_key(&key),
+                    tables.namespace_requests.get(&key),
+                    request,
+                ) {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request {}/{} already holds its final outcome",
+                        request.requester_node_id, request.request_id
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -2363,6 +2466,7 @@ fn validate_intent_effect(
         identity.updated_at = intent.updated_at;
         identity.object_metadata = intent.object_metadata.clone();
         identity.owner_epoch = intent.owner_epoch;
+        agree_on_unrecorded_content_size(&mut identity, intent);
         if identity != *intent
             || intent.owner_epoch < previous.owner_epoch
             || (!matches!(

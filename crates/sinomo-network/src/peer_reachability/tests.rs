@@ -1,8 +1,8 @@
 use super::*;
 use crate::connectivity::{ClusterConnectivityRecord, ClusterConnectivityState};
 use crate::connectivity_verification::{
-    begin_peer_verification, register_peer_verification_owner, settle_peer_verification,
-    take_pending_peer_verifications,
+    PeerVerificationOutcome, begin_peer_verification, register_peer_verification_owner,
+    settle_peer_verification, take_pending_peer_verifications,
 };
 use sinomo_base::{ClusterEndpointRecord, ClusterMemberRecord};
 use sinomo_local::SinomoDataDir;
@@ -306,20 +306,34 @@ async fn running_verification_is_part_of_the_reported_entry() {
     assert!(current.verifying);
     assert_eq!(current.verdict, PeerPathVerdict::Path);
 
-    settle_peer_verification(&fixture.paths, &fixture.b);
+    settle_peer_verification(
+        &fixture.paths,
+        &fixture.b,
+        PeerVerificationOutcome::Concluded,
+    );
     let changes = tokio::time::timeout(Duration::from_secs(5), subscription.changed())
         .await
         .expect("a settled verification is reported even with an unchanged verdict");
     let settled = changes[0].current.as_ref().expect("peer entry").clone();
     assert!(!settled.verifying);
     assert_ne!(settled.examined_generation, 0);
+    assert_eq!(
+        settled.concluded_generation, settled.examined_generation,
+        "the episode concluded"
+    );
     assert_eq!(current.examined_generation, 0, "nothing had settled before");
+    assert_eq!(current.concluded_generation, 0);
 
     // An episode that begins and settles between two waits leaves the
     // verdict and the verifying flag as they were. It is still reported,
-    // because the peer's examined generation moved.
+    // because the peer's examined generation moved, whether or not the
+    // episode concluded.
     begin_peer_verification(&fixture.paths, &fixture.b);
-    settle_peer_verification(&fixture.paths, &fixture.b);
+    settle_peer_verification(
+        &fixture.paths,
+        &fixture.b,
+        PeerVerificationOutcome::Unconcluded,
+    );
     let changes = tokio::time::timeout(Duration::from_secs(5), subscription.changed())
         .await
         .expect("an episode that ran between two waits is reported");
@@ -329,7 +343,27 @@ async fn running_verification_is_part_of_the_reported_entry() {
         (again.verdict, again.verifying),
         (settled.verdict, settled.verifying)
     );
-    assert_ne!(again.examined_generation, settled.examined_generation);
+    assert!(again.examined_generation > settled.examined_generation);
+    assert_eq!(
+        again.concluded_generation, settled.concluded_generation,
+        "an episode without a conclusion examined nothing"
+    );
+
+    begin_peer_verification(&fixture.paths, &fixture.b);
+    settle_peer_verification(
+        &fixture.paths,
+        &fixture.b,
+        PeerVerificationOutcome::Concluded,
+    );
+    let changes = tokio::time::timeout(Duration::from_secs(5), subscription.changed())
+        .await
+        .expect("a concluded episode is reported");
+    let concluded = changes[0].current.as_ref().expect("peer entry");
+    assert!(concluded.examined_generation > again.examined_generation);
+    assert_eq!(
+        concluded.concluded_generation,
+        concluded.examined_generation
+    );
 }
 
 #[tokio::test]

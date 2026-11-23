@@ -71,6 +71,40 @@ impl MountedSifsMutationHandoffRequest {
         }
     }
 
+    /// The marker and Arm identity this request names, which its answer
+    /// echoes.
+    pub(crate) fn identity(
+        &self,
+    ) -> (
+        Option<crate::MountedSifsMutationMarkerId>,
+        Option<crate::MountedSifsMutationArmRequestId>,
+    ) {
+        match self {
+            Self::Probe | Self::ProbeFuse => (None, None),
+            Self::Arm {
+                marker_id,
+                arm_request_id,
+                ..
+            }
+            | Self::CommitApplied {
+                marker_id,
+                arm_request_id,
+                ..
+            }
+            | Self::CommitUnknown {
+                marker_id,
+                arm_request_id,
+                ..
+            }
+            | Self::ProveNoWrite {
+                marker_id,
+                arm_request_id,
+                ..
+            } => (Some(marker_id.clone()), Some(arm_request_id.clone())),
+            Self::AbortUnstarted { marker_id, .. } => (Some(marker_id.clone()), None),
+        }
+    }
+
     fn phase_and_marker_id(&self) -> (&'static str, Option<String>) {
         match self {
             Self::Probe => ("probe", None),
@@ -98,6 +132,10 @@ pub enum MountedSifsMutationHandoffPhase {
     DaemonAccepted,
     ProvenNoWrite,
     AbortedUnstarted,
+    /// The owner could not take the request now: another holder kept the
+    /// outbox lock for the whole bounded wait. Nothing was decided, and the
+    /// same request sent again can be accepted.
+    Busy,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -120,6 +158,35 @@ pub trait MountedSifsMutationHandoffHost {
 /// Apply one exact durable handoff transition and publish only the resulting
 /// host edges. All marker validation and phase matching remain owner policy.
 pub fn handle_mounted_sifs_mutation_handoff(
+    data_dir: &SinomoDataDir,
+    host: &dyn MountedSifsMutationHandoffHost,
+    request: MountedSifsMutationHandoffRequest,
+) -> Result<MountedSifsMutationHandoffResponse, DfsError> {
+    let (marker_id, arm_request_id) = request.identity();
+    match handle_mounted_sifs_mutation_handoff_request(data_dir, host, request) {
+        // Contention is an answer, not a refusal: the adapter sends the same
+        // request again.
+        Err(DfsError::MountedMutationOutboxBusy {
+            lock,
+            waited_millis,
+        }) => {
+            tracing::debug!(
+                target: "sinomo.dfs.mounted_mutation",
+                lock,
+                waited_millis,
+                "mounted-mutation owner answered busy"
+            );
+            Ok(MountedSifsMutationHandoffResponse {
+                marker_id,
+                arm_request_id,
+                phase: MountedSifsMutationHandoffPhase::Busy,
+            })
+        }
+        other => other,
+    }
+}
+
+fn handle_mounted_sifs_mutation_handoff_request(
     data_dir: &SinomoDataDir,
     host: &dyn MountedSifsMutationHandoffHost,
     request: MountedSifsMutationHandoffRequest,
@@ -474,6 +541,12 @@ impl MountedSifsMutationRecoveryBatch {
 
     pub fn requires_full_recovery(&self) -> bool {
         self.requires_full_recovery
+    }
+
+    /// How many markers this batch claimed, corrupt ones included.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn claim_count(&self) -> usize {
+        self.claims.len() + self.corrupt_claims.len()
     }
 
     pub fn committed_work(&self) -> &[DfsMessageCommittedWork] {

@@ -13,8 +13,9 @@ use crate::posix_path::{
     posix_path_is_at_or_under_prefix,
 };
 use crate::{
-    DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
+    DfsDirectoryPageCursor, DfsError, DfsMessageTransport, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService,
+    sifs_file_system_id,
 };
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -344,7 +345,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        self.with_stat_deadline(|service| service.posix_stat_authoritative(path))
+        self.replan_on_record_change(|service| {
+            service.with_stat_deadline(|service| service.posix_stat_authoritative(path))
+        })
+    }
+
+    /// Run an attribute read again each time it ends because a shard record
+    /// it read changed, or because a shard whose answer it needs is due to
+    /// be asked again: each run plans at the current records. Every run
+    /// after the first follows a record change or a re-send time, so the
+    /// reads never spin.
+    pub(super) fn replan_on_record_change<R>(
+        &mut self,
+        mut read: impl FnMut(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        // Only a read that plans again lets its metadata queries follow their
+        // records; one planned inside another operation keeps its plan.
+        let previous = std::mem::replace(&mut self.attribute_read_replans, true);
+        if !previous {
+            self.attribute_read_resend = None;
+        }
+        let result = loop {
+            match read(self) {
+                Err(DfsPosixError::Dfs(
+                    DfsError::ShardRecordChanged { .. } | DfsError::ShardAnswerDue { .. },
+                )) => {}
+                result => break result,
+            }
+        };
+        self.attribute_read_replans = previous;
+        if !previous {
+            self.attribute_read_resend = None;
+        }
+        result
     }
 
     fn posix_stat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
@@ -439,7 +472,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        self.with_stat_deadline(|service| service.posix_lstat_authoritative(path))
+        self.replan_on_record_change(|service| {
+            service.with_stat_deadline(|service| service.posix_lstat_authoritative(path))
+        })
     }
 
     fn posix_lstat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
@@ -551,6 +586,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_object(&mut self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
+        self.replan_on_record_change(|service| {
+            service.posix_stat_object_at_current_records(object_id)
+        })
+    }
+
+    fn posix_stat_object_at_current_records(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsStat>> {
         let source = self.object_read_source(object_id, None)?;
         let from_authority = matches!(
             source,

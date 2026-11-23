@@ -137,7 +137,8 @@ pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
 };
 pub use connectivity_verification::{
-    MAX_PENDING_PEER_VERIFICATIONS, PeerVerificationCause, request_peer_verification,
+    MAX_PENDING_PEER_VERIFICATIONS, PeerVerificationCause, PeerVerificationOutcome,
+    request_peer_verification,
 };
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,

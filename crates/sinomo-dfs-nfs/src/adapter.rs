@@ -14,12 +14,16 @@ use sinomo_dfs::{
     DfsStat, DfsWriteOptions, MountedSifsService,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_NFS_IO_BYTES: usize = 1024 * 1024;
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 const DEFAULT_FILE_MODE: u32 = 0o644;
+
+/// An export's lock: its waiters wait for the holder's release, within the
+/// request's deadline when the export has an operation budget.
+type ExportLock<T> = dfs::MountedSifsLock<T>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsNfsHandle {
@@ -115,15 +119,28 @@ impl SifsNfsState {
     }
 }
 
+/// The export's own departure. Once the last handle to the export is gone,
+/// a request still waiting for the cluster or for the daemon has no caller
+/// left: its waits are cancelled.
+#[derive(Debug)]
+struct ExportLifetime(dfs::DfsCancellationFlag);
+
+impl Drop for ExportLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SifsNfsFileSystem {
-    service: Arc<Mutex<MountedSifsService>>,
-    state: Arc<Mutex<SifsNfsState>>,
+    service: Arc<ExportLock<MountedSifsService>>,
+    state: Arc<ExportLock<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     root: SifsNfsHandle,
     /// The operator's bound on one request's DFS work; `None` waits for
     /// events only.
     operation_budget: Option<Duration>,
+    _lifetime: Arc<ExportLifetime>,
 }
 
 impl SifsNfsFileSystem {
@@ -134,8 +151,11 @@ impl SifsNfsFileSystem {
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?,
         };
+        let closing = dfs::DfsCancellationFlag::new();
         #[cfg(test)]
-        if let Some(opened) = sinomo_vfs_sifs::test_support::open_registered(&data_dir, None) {
+        if let Some(opened) =
+            sinomo_vfs_sifs::test_support::open_registered(&data_dir, Some(closing.clone()))
+        {
             // Adapter tests borrow the real component owner in this process;
             // the external daemon handoff remains a separate host boundary.
             let mut opened = opened.map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
@@ -143,7 +163,7 @@ impl SifsNfsFileSystem {
                 .service
                 .posix_lstat_distributed(&root_path)
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-            return Self::from_opened(opened, root_stat, root_path, read_only, None);
+            return Self::from_opened(opened, root_stat, root_path, read_only, None, closing);
         }
         let clustered = sinomo_core::network::ClusterPaths::new(&data_dir)
             .state
@@ -152,6 +172,7 @@ impl SifsNfsFileSystem {
             Some(Arc::new(NfsMountedMutationHandoff::open(
                 &data_dir,
                 format!("nfs:{root_path}"),
+                &closing,
             )?))
         } else {
             None
@@ -164,15 +185,19 @@ impl SifsNfsFileSystem {
                 );
                 let sync_peer: Arc<dyn dfs::DfsPeerTransport> = peer.clone();
                 let async_peer: Arc<dyn dfs::AsyncDfsPeerTransport> = peer;
-                dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+                dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
                     data_dir.clone(),
                     sync_peer,
                     async_peer,
+                    Some(closing.clone()),
                 )
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
             } else {
-                dfs::open_mounted_sifs_service(Some(data_dir.root()))
-                    .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
+                dfs::open_mounted_sifs_service_with_cancellation(
+                    Some(data_dir.root()),
+                    Some(closing.clone()),
+                )
+                .map_err(|source| DfsNfsError::Dfs(source.to_string()))?
             };
             let root_stat = opened
                 .service
@@ -186,7 +211,7 @@ impl SifsNfsFileSystem {
             open_service()?
         };
         let (opened, root_stat) = opened;
-        Self::from_opened(opened, root_stat, root_path, read_only, handoff)
+        Self::from_opened(opened, root_stat, root_path, read_only, handoff, closing)
     }
 
     /// Bound each request's DFS work by the export operator's own budget.
@@ -196,12 +221,13 @@ impl SifsNfsFileSystem {
         self
     }
 
-    fn from_opened(
+    pub(crate) fn from_opened(
         opened: dfs::OpenedMountedSifsService,
         root_stat: DfsStat,
         root_path: String,
         read_only: bool,
         handoff: Option<Arc<NfsMountedMutationHandoff>>,
+        closing: dfs::DfsCancellationFlag,
     ) -> Result<Self> {
         let dfs::OpenedMountedSifsService {
             service,
@@ -224,8 +250,8 @@ impl SifsNfsFileSystem {
         let mut write_options = DfsWriteOptions::replicated_eventual(replica_candidates);
         write_options.foreground_replica_repair = false;
         Ok(Self {
-            service: Arc::new(Mutex::new(service)),
-            state: Arc::new(Mutex::new(SifsNfsState {
+            service: Arc::new(ExportLock::new(service)),
+            state: Arc::new(ExportLock::new(SifsNfsState {
                 root_path,
                 write_options,
                 read_only,
@@ -233,6 +259,7 @@ impl SifsNfsFileSystem {
             handoff,
             root: SifsNfsHandle::new(root_stat.object_id),
             operation_budget: None,
+            _lifetime: Arc::new(ExportLifetime(closing)),
         })
     }
 
@@ -265,24 +292,14 @@ impl SifsNfsFileSystem {
     ) -> std::result::Result<R, nfsstat3>
     where
         R: Send + 'static,
-        F: FnOnce(&mut MountedSifsService, &mut SifsNfsState) -> std::result::Result<R, nfsstat3>
+        F: FnMut(&mut MountedSifsService, &mut SifsNfsState) -> std::result::Result<R, nfsstat3>
             + Send
             + 'static,
     {
-        if self
-            .handoff
-            .as_ref()
-            .is_some_and(|handoff| handoff.is_gated())
-        {
-            return Err(nfsstat3::NFS3ERR_IO);
-        }
         let service = Arc::clone(&self.service);
         let state = Arc::clone(&self.state);
         blocking_request(deadline, move || {
-            let mut service =
-                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            let mut state = dfs::MountedSifsCall::lock(&state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            operation(&mut service, &mut state)
+            run_with_service_state(&service, &state, operation)
         })
         .await
     }
@@ -296,24 +313,77 @@ impl SifsNfsFileSystem {
     ) -> std::result::Result<R, nfsstat3>
     where
         R: Send + 'static,
-        F: FnOnce(&mut MountedSifsService) -> std::result::Result<R, DfsPosixError>
-            + Send
-            + 'static,
+        F: FnMut(&mut MountedSifsService) -> std::result::Result<R, DfsPosixError> + Send + 'static,
     {
         let service = Arc::clone(&self.service);
         let handoff = self.handoff.clone();
         blocking_request(deadline, move || {
-            if let Some(handoff) = handoff {
-                handoff
-                    .run_operation(operation, stable_operation_id, &service, mutation)
-                    .map_err(map_posix_error)
-            } else {
-                let mut service = dfs::MountedSifsCall::lock_service(&service)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                mutation(&mut service).map_err(map_posix_error)
-            }
+            run_mutation(
+                &service,
+                handoff.as_deref(),
+                operation,
+                stable_operation_id,
+                mutation,
+            )
         })
         .await
+    }
+}
+
+/// Run `operation` with the export's service lane and state until it no
+/// longer hands back a wait for a newer shard record. The request makes that
+/// wait with both released, then runs `operation` again.
+fn run_with_service_state<R>(
+    service: &ExportLock<MountedSifsService>,
+    state: &ExportLock<SifsNfsState>,
+    mut operation: impl FnMut(
+        &mut MountedSifsService,
+        &mut SifsNfsState,
+    ) -> std::result::Result<R, nfsstat3>,
+) -> std::result::Result<R, nfsstat3> {
+    let mut replay = dfs::MountedSifsCallReplay::new();
+    loop {
+        let result = (|| {
+            let mut service =
+                dfs::MountedSifsCall::lock_service(service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let mut state = dfs::MountedSifsCall::lock(state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            replay.run(&mut *service, |service| operation(service, &mut state))
+        })();
+        match replay.take_record_wait() {
+            Some(wait) => wait.wait(),
+            None => return result,
+        }
+    }
+}
+
+/// Run one mutation until it no longer hands back a wait for a newer shard
+/// record. Between runs the request holds neither the service lane nor the
+/// mutation admission; the next run continues the same call, inside the same
+/// daemon handoff when the export has one.
+fn run_mutation<R>(
+    service: &ExportLock<MountedSifsService>,
+    handoff: Option<&NfsMountedMutationHandoff>,
+    operation: &'static str,
+    stable_operation_id: Option<String>,
+    mut mutation: impl FnMut(&mut MountedSifsService) -> std::result::Result<R, DfsPosixError>,
+) -> std::result::Result<R, nfsstat3> {
+    if let Some(handoff) = handoff {
+        return handoff
+            .run_operation(operation, stable_operation_id, service, mutation)
+            .map_err(map_posix_error);
+    }
+    let mut replay = dfs::MountedSifsCallReplay::new();
+    loop {
+        let result = match dfs::MountedSifsCall::lock_service(service) {
+            Ok(mut service) => replay
+                .run(&mut *service, &mut mutation)
+                .map_err(map_posix_error),
+            Err(_) => Err(nfsstat3::NFS3ERR_IO),
+        };
+        match replay.take_record_wait() {
+            Some(wait) => wait.wait(),
+            None => return result,
+        }
     }
 }
 
@@ -504,13 +574,17 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let stat_kind = stat.kind.clone();
+        // One id for the request's truncate, kept across its runs: the
+        // primary answers each repeat with what the first attempt did.
+        let operation_id = format!("nfs_truncate_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.setattr", None, move |service| {
                 if let Nfs3Option::Some(size) = setattr.size {
-                    stat = service.posix_truncate_file_for_object(
+                    stat = service.posix_truncate_file_for_object_with_operation_id(
                         &stat.object_id,
                         size,
                         write_options.clone(),
+                        &operation_id,
                     )?;
                 }
                 if let Nfs3Option::Some(mode) = setattr.mode {
@@ -540,7 +614,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
                         service.posix_set_times(&stat.path, atime, mtime)
                     }?;
                 }
-                Ok(stat)
+                Ok(stat.clone())
             })
             .await?;
         Ok(stat_to_fattr(&stat))
@@ -566,9 +640,18 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let data = data.to_vec();
+        // One id for the request's write, kept across its runs: the primary
+        // answers each repeat with what the first attempt did.
+        let operation_id = format!("nfs_write_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.write", None, move |service| {
-                service.posix_write_file_at_for_object(&object_id, offset, &data, write_options)
+                service.posix_write_file_at_for_object_with_operation_id(
+                    &object_id,
+                    offset,
+                    &data,
+                    write_options.clone(),
+                    &operation_id,
+                )
             })
             .await?;
         Ok((stat_to_fattr(&stat), stable_how::FILE_SYNC))
@@ -593,9 +676,15 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let attrs = create_attrs(&attr, false);
+        let operation_id = format!("nfs_create_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.create", None, move |service| {
-                service.posix_create_file_with_attrs(&path, write_options, attrs)
+                service.posix_create_file_with_attrs_and_operation_id(
+                    &path,
+                    write_options.clone(),
+                    attrs,
+                    &operation_id,
+                )
             })
             .await?;
         let handle = self
@@ -732,9 +821,16 @@ impl NfsFileSystem for SifsNfsFileSystem {
                 ))
             })
             .await?;
+        let operation_id = format!("nfs_symlink_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.symlink", None, move |service| {
-                service.posix_symlink_with_create_attrs(&target, &path, write_options, attrs)
+                service.posix_symlink_with_create_attrs_and_operation_id(
+                    &target,
+                    &path,
+                    write_options.clone(),
+                    attrs,
+                    &operation_id,
+                )
             })
             .await?;
         let handle = self
@@ -815,19 +911,16 @@ impl ReadDirPlusIterator<SifsNfsHandle> for SifsNfsDirIterator {
 
 async fn directory_iterator(
     deadline: Option<Instant>,
-    service: Arc<Mutex<MountedSifsService>>,
-    state: Arc<Mutex<SifsNfsState>>,
+    service: Arc<ExportLock<MountedSifsService>>,
+    state: Arc<ExportLock<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     dirid: SifsNfsHandle,
     cookie: u64,
 ) -> std::result::Result<SifsNfsDirIterator, nfsstat3> {
     blocking_request(deadline, move || {
-        let directory = {
-            let mut service =
-                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            let state = dfs::MountedSifsCall::lock(&state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            state.stat_handle(&mut service, &dirid)?
-        };
+        let directory = run_with_service_state(&service, &state, |service, state| {
+            state.stat_handle(service, &dirid)
+        })?;
         if !matches!(
             directory.kind,
             DfsObjectKind::Directory | DfsObjectKind::Mount
@@ -835,19 +928,13 @@ async fn directory_iterator(
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
         let directory_path = directory.path;
-        let mut entries = if let Some(handoff) = handoff {
-            handoff
-                .run_operation("nfs.readdir-refresh", None, &service, move |service| {
-                    service.posix_list_dir_distributed(&directory_path)
-                })
-                .map_err(map_posix_error)?
-        } else {
-            let mut service =
-                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            service
-                .posix_list_dir_distributed(&directory_path)
-                .map_err(map_posix_error)?
-        };
+        let mut entries = run_mutation(
+            &service,
+            handoff.as_deref(),
+            "nfs.readdir-refresh",
+            None,
+            |service| service.posix_list_dir_distributed(&directory_path),
+        )?;
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         let mut records = entries
             .into_iter()
@@ -1026,6 +1113,12 @@ fn map_posix_error(error: DfsPosixError) -> nfsstat3 {
         | DfsPosixError::SymlinkContentPending { .. }
         | DfsPosixError::PartialBulkCommit { .. } => nfsstat3::NFS3ERR_JUKEBOX,
         DfsPosixError::Conflict { .. } => nfsstat3::NFS3ERR_NOT_SYNC,
+        // A path moving between shards, or a shard whose storage is closed
+        // for preparation or conversion, refused before any effect; the
+        // client tries again later.
+        DfsPosixError::Dfs(
+            dfs::DfsError::Busy { .. } | dfs::DfsError::ShardStorageClosed { .. },
+        ) => nfsstat3::NFS3ERR_JUKEBOX,
         // An unknown outcome is what is left once the call has followed its
         // shard's record for as long as its caller allowed. It is an I/O
         // error, and the export keeps serving.
@@ -1071,6 +1164,151 @@ mod tests {
             }),
             nfsstat3::NFS3ERR_JUKEBOX
         );
+    }
+
+    #[test]
+    fn a_path_moving_between_shards_is_retried_later() {
+        assert_eq!(
+            map_posix_error(DfsPosixError::Dfs(dfs::DfsError::Busy {
+                path: "/users/moving".into(),
+            })),
+            nfsstat3::NFS3ERR_JUKEBOX
+        );
+    }
+
+    #[test]
+    fn a_closed_shard_storage_refusal_is_retried_later() {
+        for cause in [
+            dfs::DfsShardStorageClosedCause::Preparation,
+            dfs::DfsShardStorageClosedCause::Conversion,
+        ] {
+            assert_eq!(
+                map_posix_error(DfsPosixError::Dfs(dfs::DfsError::ShardStorageClosed {
+                    cause,
+                    detail: "closed".into(),
+                })),
+                nfsstat3::NFS3ERR_JUKEBOX
+            );
+        }
+    }
+
+    /// Run `waiting` on an export of a native cluster whose users primary
+    /// cannot be reached: it follows the shard's record without holding the
+    /// export, a MKDIR on the healthy services shard completes meanwhile,
+    /// and once the primary is reached again `waiting` completes the same
+    /// call. Returns what `waiting` returned.
+    fn waits_while_the_export_serves<R, F>(
+        name: &str,
+        waiting: impl FnOnce(SifsNfsFileSystem, SifsNfsHandle) -> F,
+    ) -> R
+    where
+        R: Send + std::fmt::Debug + 'static,
+        F: std::future::Future<Output = std::result::Result<R, nfsstat3>> + Send + 'static,
+    {
+        let (native, nodes) =
+            dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
+        let registration = sinomo_vfs_sifs::test_support::NativeMountedFixture::register(
+            &native,
+            &nodes.mount_node,
+        );
+        let fs = SifsNfsFileSystem::open(
+            Some(native.data_dir(&nodes.mount_node).root()),
+            "/".into(),
+            false,
+        )
+        .expect("open the export");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("the export's runtime");
+        let faulted_calls = || {
+            native
+                .rpc_observations()
+                .iter()
+                .filter(|observation| {
+                    observation.source == nodes.mount_node
+                        && observation.target == nodes.users_primary
+                        && observation.route == dfs::DFS_DATA_NAMESPACE_ROUTE
+                })
+                .count()
+        };
+        let waited = runtime.block_on(async {
+            let root = fs.root_dir();
+            let services = fs
+                .lookup(&root, &filename("services"))
+                .await
+                .expect("services");
+            let users = fs.lookup(&root, &filename("users")).await.expect("users");
+            // Every request from the export to the users primary fails
+            // undelivered.
+            let before = faulted_calls();
+            native.install_fault(dfs::test_support::DfsTestFaultRule {
+                source: Some(nodes.mount_node.clone()),
+                target: Some(nodes.users_primary.clone()),
+                route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.to_string()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
+            });
+            let waiting = tokio::spawn(waiting(fs.clone(), users));
+            // The request has been sent and refused at least once.
+            let until = Instant::now() + Duration::from_secs(20);
+            while faulted_calls() == before {
+                assert!(Instant::now() < until, "the users request was never sent");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let served = tokio::time::timeout(
+                Duration::from_secs(60),
+                fs.mkdir(&services, &filename(&format!("{name}-meanwhile"))),
+            )
+            .await;
+            let still_waiting = !waiting.is_finished();
+            native.clear_faults();
+            assert!(
+                matches!(served, Ok(Ok(_))),
+                "the healthy shard's request waited behind the other: {served:?}"
+            );
+            // Once the primary answers, the waiting request completes the
+            // same call.
+            let waited = waiting.await.expect("the waiting request");
+            assert!(
+                still_waiting,
+                "the users request did not wait for its record: {waited:?}"
+            );
+            waited.expect("the waiting request completes")
+        });
+        drop(runtime);
+        drop(fs);
+        drop(registration);
+        native.close().expect("close the native cluster");
+        waited
+    }
+
+    /// A MKDIR whose shard's primary cannot be reached follows the shard's
+    /// record, its handle's attribute read included, without holding the
+    /// export: the wait is made with the service lane and the mutation
+    /// admission released.
+    #[test]
+    fn a_request_waiting_for_its_shard_record_leaves_the_export_serving() {
+        let (handle, attributes) =
+            waits_while_the_export_serves("nfs-record-wait-handback", |fs, users| async move {
+                fs.mkdir(&users, &filename("nfs-waits-for-its-record"))
+                    .await
+            });
+        assert!(matches!(attributes.type_, ftype3::NF3DIR), "{handle:?}");
+    }
+
+    /// A GETATTR follows the record of the shard its handle's object lives
+    /// in, as any other read does, without holding the export.
+    #[test]
+    fn an_attribute_read_waiting_for_its_shard_record_leaves_the_export_serving() {
+        let attributes =
+            waits_while_the_export_serves("nfs-getattr-record-wait", |fs, users| async move {
+                fs.getattr(&users).await
+            });
+        assert!(matches!(attributes.type_, ftype3::NF3DIR));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

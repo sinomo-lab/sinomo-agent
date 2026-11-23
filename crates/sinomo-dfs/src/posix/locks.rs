@@ -68,6 +68,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsAdvisoryLockOutcome> {
         let timeout: Option<Duration> = timeout.into();
+        // The command reads its object like an attribute read, and plans
+        // again when a record it read changes, under its own request id.
+        self.replan_on_record_change(|service| {
+            service.advisory_lock_for_object_once(path, object_id, command.clone(), timeout)
+        })
+    }
+
+    fn advisory_lock_for_object_once(
+        &mut self,
+        path: &str,
+        object_id: &DfsObjectId,
+        command: DfsAdvisoryLockCommand,
+        timeout: Option<Duration>,
+    ) -> Result<DfsAdvisoryLockOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if timeout.is_some_and(|timeout| timeout.is_zero()) {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -106,9 +120,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
 
+        // One id for the whole call. The lock command carries its own
+        // request id, which the shard's lock state records with its outcome:
+        // a repeat is answered from that record, at whichever primary holds
+        // the state.
+        let operation_id = self.next_request_id();
         let followed = self
             .route_namespace_following_record(
-                None,
+                &operation_id,
                 &file_system_id,
                 primary,
                 &operation,

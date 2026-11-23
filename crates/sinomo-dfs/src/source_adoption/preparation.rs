@@ -709,7 +709,7 @@ impl DfsSourceAdoptionActor {
         )?;
         match reply.outcome {
             Some(DfsSourceAdoptionOutcome::Committed { digest, commit })
-                if digest == completed.digest =>
+                if commits_adoption(&completed.digest, &digest) =>
             {
                 commit.validate(&digest)?
             }
@@ -783,7 +783,7 @@ impl DfsSourceAdoptionActor {
         )?;
         match reply.outcome {
             Some(DfsSourceAdoptionOutcome::Committed { digest, commit })
-                if digest == completed.digest =>
+                if commits_adoption(&completed.digest, &digest) =>
             {
                 commit.validate(&digest)?
             }
@@ -1568,6 +1568,8 @@ mod genuine_source_first_tests {
             )
             .unwrap();
         std::thread::scope(|scope| {
+            // A step that fails while the rename is paused releases it.
+            let _released = (source_pause.release_on_drop(), bind_pause.release_on_drop());
             let foreground = scope.spawn(move || {
                 let result = requester.posix_rename(from, to);
                 if result.is_err() {
@@ -1773,6 +1775,8 @@ mod genuine_source_first_tests {
             .unwrap();
         let operation = sinomo_core::Id::generate().to_string();
         let (captured_job, captured_source, read_scope) = std::thread::scope(|scope| {
+            // A step that fails while the rename is paused releases it.
+            let _released = (source_pause.release_on_drop(), bind_pause.release_on_drop());
             let op = operation.clone();
             let foreground = scope.spawn(move || {
                 let result = requester.posix_rename_with_operation_id(from, to, &op);
@@ -2255,6 +2259,8 @@ mod genuine_source_first_tests {
         let operation = sinomo_core::Id::generate().to_string();
         let mut revoked_first = false;
         std::thread::scope(|scope| {
+            // A step that fails while the rename is paused releases it.
+            let _released = (source_pause.release_on_drop(), bind_pause.release_on_drop());
             let op = operation.clone();
             let foreground = scope.spawn(move || {
                 let result = requester.posix_rename_with_operation_id(from, to, &op);
@@ -2400,6 +2406,9 @@ mod actual_unbound_capture_tests {
         let pause = native.pause_remote_namespace_phase(&node).unwrap();
         let mut source_client = native.client(&node).unwrap();
         let original_origin = std::thread::scope(|scope| {
+            // A step that fails while the rename is paused releases it, so
+            // the rename's thread ends and the failure is reported.
+            let _released = pause.release_on_drop();
             let original = scope.spawn(move || requester.posix_rename(from, to));
             let captured = pause.wait_captured(Duration::from_secs(5)).unwrap();
             let crate::DfsNetworkMessage::NamespaceRequest(command) =

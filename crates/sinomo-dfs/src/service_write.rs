@@ -779,6 +779,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         candidate_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         foreground_replica_repair: bool,
+        operation_id: Option<String>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
@@ -801,7 +802,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 dispatch: DfsWriteDispatch::AwaitResponse,
                 replay_response_journal: true,
-                operation_id: None,
+                operation_id,
             },
         )
     }
@@ -2857,7 +2858,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// under the same id and with the body it kept, to the primary the newer
     /// record names; while the record has not changed, the re-send timer
     /// sends it to the current primary again. The wait ends once a dispatch
-    /// is delivered, at the caller's operation deadline or on cancellation.
+    /// is delivered, once an answer to an earlier dispatch settles the write,
+    /// at the caller's operation deadline or on cancellation.
     ///
     /// A dispatch failure cannot erase an earlier attempt with the same
     /// stable identity: a definitely-unsent retry says nothing about whether
@@ -2908,20 +2910,102 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let evidence = crate::service_record_follow::DfsRecordChangeEvidence {
                 dispatched: shard.clone(),
                 floor_epoch: None,
-                undelivered: true,
             };
             let resend =
                 resend.get_or_insert_with(crate::service_record_follow::DfsRecordFollowResend::new);
-            let record = match self.await_newer_shard_record(&evidence, resend) {
-                Ok(crate::service_record_follow::DfsRecordFollowed::Newer(record)) => record,
-                Ok(crate::service_record_follow::DfsRecordFollowed::ResendDue(record)) => record,
-                Ok(crate::service_record_follow::DfsRecordFollowed::Ended) => {
-                    break (unroutable, error);
+            if self.mounted_call_hands_back_waits() {
+                // The mount waits for the record with its lock released and
+                // runs the write again under the same id, so the primary
+                // answers that repeat with what this attempt did.
+                if let Some(carried) = self.take_mounted_probe_resend() {
+                    *resend = carried;
                 }
-                Err(cancelled) => {
-                    self.compact_pending_routed_write(request_id);
-                    return Err(cancelled);
+                match self.record_change_or_watch(&evidence, resend) {
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::NotYet {
+                        watch,
+                        until,
+                    }) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(self.hand_back_mounted_write_wait(*resend, watch, until));
+                    }
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::Due(
+                        crate::service_record_follow::DfsRecordFollowed::Newer(record)
+                        | crate::service_record_follow::DfsRecordFollowed::ResendDue(record),
+                    )) => {
+                        let ambiguous = !(unroutable
+                            || matches!(
+                                error,
+                                DfsError::NetworkDelivery {
+                                    delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                                    ..
+                                }
+                            ));
+                        sent = match self.resend_pending_routed_write(request_id, &record) {
+                            Ok((sent, replaced)) => {
+                                if ambiguous {
+                                    earlier_ambiguous = true;
+                                    previous = replaced;
+                                }
+                                sent
+                            }
+                            Err(error) => {
+                                self.compact_pending_routed_write(request_id);
+                                return Err(error);
+                            }
+                        };
+                        primary_node_id = record.primary_node_id.clone();
+                        shard = record;
+                        continue;
+                    }
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::Due(_)) => {
+                        break (unroutable, error);
+                    }
+                    Err(cancelled) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(cancelled);
+                    }
                 }
+            }
+            let record = loop {
+                let followed = self.await_shard_record_change(
+                    &evidence,
+                    Some(&mut *resend),
+                    crate::service_record_follow::DfsRecordWaitWake {
+                        on_arrival: true,
+                        at: None,
+                    },
+                );
+                match followed {
+                    Ok(
+                        crate::service_record_follow::DfsRecordFollowed::Newer(record)
+                        | crate::service_record_follow::DfsRecordFollowed::ResendDue(record),
+                    ) => break Some(record),
+                    Ok(crate::service_record_follow::DfsRecordFollowed::Woken) => {
+                        // An answer to an earlier dispatch of this write may
+                        // have arrived. Read it now: if it settled the write,
+                        // the caller takes that result and nothing is sent.
+                        if let Err(error) = self.process_incoming() {
+                            self.compact_pending_routed_write(request_id);
+                            return Err(error);
+                        }
+                        if self
+                            .writes
+                            .pending_routed_writes
+                            .get(request_id)
+                            .is_none_or(|pending| pending.result.is_some())
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Ok(crate::service_record_follow::DfsRecordFollowed::Ended) => break None,
+                    Err(cancelled) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(cancelled);
+                    }
+                }
+            };
+            let Some(record) = record else {
+                break (unroutable, error);
             };
             let ambiguous = !(unroutable
                 || matches!(
@@ -3127,6 +3211,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence = if !detach_request
@@ -3221,7 +3310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        let follow = self.writes.take_followed_write(&request_id) && !detach_request;
         self.finish_routed_write_dispatch(
             &request_id,
             previous,
@@ -3361,6 +3450,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: DfsMetadataShardConfig,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = operation_id.unwrap_or_else(|| self.next_request_id());
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let (hash, size, attachment, attachment_bytes, patch_attachment) = match source {
             DfsPatchSource::Bytes(bytes) => {
                 let bytes = bytes::Bytes::copy_from_slice(bytes);
@@ -3459,7 +3553,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 NetworkError::UnknownNode { .. } => Ok(false),
                 error => Err(DfsError::from_network(error)),
             });
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        let follow = self.writes.take_followed_write(&request_id);
         self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary, sent, follow)?;
         Ok(outcome)
     }
@@ -3499,6 +3593,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence = if !detach_request
@@ -3571,7 +3670,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.send_dfs_message_if_routable(&primary_node_id, message)
         };
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        let follow = self.writes.take_followed_write(&request_id) && !detach_request;
         self.finish_routed_write_dispatch(
             &request_id,
             previous,
@@ -3646,6 +3745,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let capture_started = Instant::now();
         let manifest = self.content.put_object_version_from_reader(
             request.object_id.as_str(),
@@ -3734,6 +3838,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let primary_node_id = shard.primary_node_id.clone();
         let (command_content_hash, command_content_size_bytes) = if captured_size == 0 {
             (None, None)
@@ -3815,7 +3924,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        let follow = self.writes.take_followed_write(&request_id);
         self.finish_routed_write_dispatch(
             &request_id,
             previous,

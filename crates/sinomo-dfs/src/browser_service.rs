@@ -296,7 +296,8 @@ pub struct DfsBrowserBackend {
     data_dir: SinomoDataDir,
     host: Arc<dyn DfsBrowserServiceHost>,
     node_id: sinomo_core::node::NodeId,
-    service: Mutex<crate::MountedSifsService>,
+    /// A waiter sleeps until the holder releases the service; nothing polls.
+    service: crate::MountedSifsLock<crate::MountedSifsService>,
     replica_control_plane: Mutex<Option<Box<dyn crate::DfsControlPlaneKvClient>>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     stat_cache: Mutex<HashMap<String, DfsBrowserCachedStat>>,
@@ -459,11 +460,54 @@ pub(crate) fn release_browser_backends(data_dir: &SinomoDataDir) {
 
 /// Keep the notification with the synchronous mutation owner: an RPC caller
 /// may disappear after the metadata commit and before receiving its response.
+/// The resident service borrowed for one read. When the read runs for a
+/// served request, its waits observe that request's budget and departure
+/// until the borrow ends.
+struct BrowserRead<'a> {
+    service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>,
+    served: Option<(
+        crate::service_core::DfsServedRequestRestore,
+        crate::served_request::DfsServedRequestExecution,
+    )>,
+}
+
+impl<'a> BrowserRead<'a> {
+    fn enter(mut service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>) -> Self {
+        let served = ServedBrowserWork::current().map(|served| {
+            let execution = served.enter_execution();
+            (service.enter_served_request(&served), execution)
+        });
+        Self { service, served }
+    }
+}
+
+impl std::ops::Deref for BrowserRead<'_> {
+    type Target = crate::MountedSifsService;
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
+impl std::ops::DerefMut for BrowserRead<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.service
+    }
+}
+
+impl Drop for BrowserRead<'_> {
+    fn drop(&mut self) {
+        if let Some((restore, _execution)) = self.served.take() {
+            self.service.leave_served_request(restore);
+        }
+    }
+}
+
 struct BrowserMutation<'a> {
-    service: std::sync::MutexGuard<'a, crate::MountedSifsService>,
+    service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>,
     tracker: crate::DfsCommittedWorkTracker,
     previous: Option<crate::DfsCommittedWorkTracker>,
     served_request: Option<crate::service_core::DfsServedRequestRestore>,
+    served_execution: Option<crate::served_request::DfsServedRequestExecution>,
     _publication_scope: Option<crate::publication_guard::DfsPublicationProviderRestore>,
     host: &'a dyn DfsBrowserServiceHost,
     origin_node_id: &'a sinomo_core::node::NodeId,
@@ -484,6 +528,7 @@ impl Drop for BrowserMutation<'_> {
         if let Some(restore) = self.served_request.take() {
             self.service.leave_served_request(restore);
         }
+        drop(self.served_execution.take());
         let work = self.tracker.take();
         let owns_effects = self.previous.is_none();
         if let Some(previous) = &self.previous {
@@ -508,6 +553,63 @@ impl Drop for BrowserMutation<'_> {
 /// Registered cold contexts join their existing configuration owner and open
 /// the cached core backend before invoking the task at most once. Keep the
 /// FIFO permit in the blocking closure through an executing filesystem call.
+tokio::task_local! {
+    /// The served request a hosted browser route's work belongs to.
+    static SERVED_BROWSER_REQUEST: crate::DfsServedRequestScope;
+}
+
+thread_local! {
+    /// The served request the blocking browser work on this thread runs for.
+    static SERVED_BROWSER_WORK: std::cell::RefCell<Option<crate::DfsServedRequestScope>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Marks the blocking browser work on this thread as part of one served
+/// request until dropped.
+struct ServedBrowserWork(Option<crate::DfsServedRequestScope>);
+
+impl ServedBrowserWork {
+    fn enter(served: crate::DfsServedRequestScope) -> Self {
+        Self(SERVED_BROWSER_WORK.with(|work| work.replace(Some(served))))
+    }
+
+    fn current() -> Option<crate::DfsServedRequestScope> {
+        SERVED_BROWSER_WORK.with(|work| work.borrow().clone())
+    }
+}
+
+impl Drop for ServedBrowserWork {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SERVED_BROWSER_WORK.with(|work| *work.borrow_mut() = previous);
+    }
+}
+
+/// Run one hosted browser route as a served request, as DFS routes are.
+///
+/// The client's budget, when its request carries one, becomes the deadline of
+/// every wait the route's work makes and of every request that work sends.
+/// The client's departure (the route's handler is dropped because the client
+/// left, or because the route's own timeout ended it) cancels that work: the
+/// blocking worker does not outlive its handler. Without a budget the work
+/// waits for its events.
+pub async fn run_served_browser_route<T>(
+    request: &ObjectRpcRequest,
+    route_work: impl std::future::Future<Output = Result<T, ServiceError>>,
+) -> Result<T, ServiceError> {
+    let (served, departure) =
+        crate::DfsServedRequestScope::at_arrival(crate::routes::dfs_request_budget(request));
+    let outcome = served
+        .until_budget(SERVED_BROWSER_REQUEST.scope(served.clone(), route_work))
+        .await;
+    // Reached only when the route's work ended: a completed request is not a
+    // departed client, and what the work left running keeps running.
+    departure.answered();
+    outcome.map_err(|crate::DfsRequestBudgetEnded| {
+        dfs_browser_service_error("the request's budget ended before its work ran")
+    })?
+}
+
 pub async fn run_blocking_browser_task<T>(
     data_dir: Arc<SinomoDataDir>,
     route: impl Into<String>,
@@ -566,6 +668,8 @@ async fn run_browser_task_with_admission<T>(
 where T: Send + 'static,
 {
     let route = route.into();
+    // The served request this work belongs to, when a route runs it as one.
+    let served = SERVED_BROWSER_REQUEST.try_with(Clone::clone).ok();
     let slot = browser_backend_slot(&data_dir)?;
     let host = slot.host.lock().map_err(dfs_browser_service_error)?
         .as_ref().and_then(std::sync::Weak::upgrade);
@@ -615,6 +719,7 @@ where T: Send + 'static,
         } else { None };
         return run_blocking_service_task(route, label, move || {
             let _execution = execution;
+            let _served = served.map(ServedBrowserWork::enter);
             if let (Some(host), Some(configuration)) = (host, configuration) {
                 // Reuse the actual Current cut instead of repeating the cold
                 // replica-candidate projection read after FIFO admission.
@@ -923,7 +1028,7 @@ impl DfsBrowserBackend {
             data_dir,
             host,
             node_id,
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(replica_control_plane),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -1001,7 +1106,7 @@ impl DfsBrowserBackend {
 
     pub fn lock_service(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, crate::MountedSifsService>, ServiceError> {
+    ) -> Result<crate::MountedSifsLockGuard<'_, crate::MountedSifsService>, ServiceError> {
         self.service.lock().map_err(|source| {
             ServiceError::Service(format!("DFS browser service lock failed: {source}"))
         })
@@ -1017,7 +1122,9 @@ impl DfsBrowserBackend {
         served: &crate::DfsServedRequestScope,
     ) -> Result<BrowserMutation<'_>, ServiceError> {
         let mut resident = self.lock_mutation()?;
-        resident.served_request = Some(resident.enter_served_request(served));
+        if resident.served_request.is_none() {
+            resident.served_request = Some(resident.enter_served_request(served));
+        }
         Ok(resident)
     }
 
@@ -1027,42 +1134,41 @@ impl DfsBrowserBackend {
         let publication_scope = owners.map(|owners| service.publication_provider.install(owners));
         let tracker = crate::DfsCommittedWorkTracker::new();
         let previous = service.committed_work_tracker.replace(tracker.clone());
+        // A feature route's mutation runs inside its served request, as a
+        // browser read does.
+        let served = ServedBrowserWork::current();
+        let served_execution = served
+            .as_ref()
+            .map(crate::DfsServedRequestScope::enter_execution);
+        let served_request = served.map(|served| service.enter_served_request(&served));
         Ok(BrowserMutation {
             service,
             tracker,
             previous,
-            served_request: None,
+            served_request,
+            served_execution,
             _publication_scope: publication_scope,
             host: self.host.as_ref(),
             origin_node_id: &self.node_id,
         })
     }
 
-    fn lock_service_for_read(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, crate::MountedSifsService>, ServiceError> {
-        let started = Instant::now();
-        loop {
-            match self.service.try_lock() {
-                Ok(service) => return Ok(service),
-                Err(std::sync::TryLockError::Poisoned(source)) => {
-                    return Err(ServiceError::Service(format!(
-                        "DFS browser service lock failed: {source}"
-                    )));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let Some(remaining) = DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT
-                        .checked_sub(started.elapsed())
-                        .filter(|remaining| !remaining.is_zero())
-                    else {
-                        return Err(ServiceError::Service(format!(
-                            "DFS browser service is busy after waiting {}ms; retry the read",
-                            DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT.as_millis()
-                        )));
-                    };
-                    std::thread::sleep(Duration::from_millis(1).min(remaining));
-                }
+    fn lock_service_for_read(&self) -> Result<BrowserRead<'_>, ServiceError> {
+        // The read sleeps until the holder releases the service, or until
+        // its admission bound passes.
+        match self.service.lock_until(Some(
+            Instant::now() + DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT,
+        )) {
+            Ok(service) => Ok(BrowserRead::enter(service)),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                Err(ServiceError::Service(format!(
+                    "DFS browser service is busy after waiting {}ms; retry the read",
+                    DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT.as_millis()
+                )))
             }
+            Err(source) => Err(ServiceError::Service(format!(
+                "DFS browser service lock failed: {source}"
+            ))),
         }
     }
 
@@ -2517,42 +2623,45 @@ impl Service for HostedDfsBrowserService {
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let attempt_host = Arc::clone(&backend_host);
-                    let result = if content_write {
-                        run_configured_browser_task(
-                            data_dir,
-                            route.clone(),
-                            "DFS scoped no-link content write",
-                            runtime,
-                            backend_host,
-                            payload,
-                            move |payload| {
-                                DfsBrowserBackend::for_data_dir(
-                                    Arc::clone(&backend_data_dir),
-                                    &backend_runtime,
-                                    Arc::clone(&attempt_host),
-                                )?
-                                .try_no_links(payload)
-                            },
-                        )
-                        .await?
-                    } else {
-                        // Namespace-only mkdir and reads retain the normal
-                        // browser path without a content-placement dependency.
-                        run_blocking_browser_task(
-                            data_dir,
-                            route.clone(),
-                            "DFS scoped no-link operation",
-                            move || {
-                                DfsBrowserBackend::for_data_dir(
-                                    backend_data_dir,
-                                    &backend_runtime,
-                                    attempt_host,
-                                )?
-                                .no_links(payload)
-                            },
-                        )
-                        .await?
-                    };
+                    let result = run_served_browser_route(&request, async {
+                        Ok::<_, ServiceError>(if content_write {
+                            run_configured_browser_task(
+                                data_dir,
+                                route.clone(),
+                                "DFS scoped no-link content write",
+                                runtime,
+                                backend_host,
+                                payload,
+                                move |payload| {
+                                    DfsBrowserBackend::for_data_dir(
+                                        Arc::clone(&backend_data_dir),
+                                        &backend_runtime,
+                                        Arc::clone(&attempt_host),
+                                    )?
+                                    .try_no_links(payload)
+                                },
+                            )
+                            .await?
+                        } else {
+                            // Namespace-only mkdir and reads retain the normal
+                            // browser path without a content-placement dependency.
+                            run_blocking_browser_task(
+                                data_dir,
+                                route.clone(),
+                                "DFS scoped no-link operation",
+                                move || {
+                                    DfsBrowserBackend::for_data_dir(
+                                        backend_data_dir,
+                                        &backend_runtime,
+                                        attempt_host,
+                                    )?
+                                    .no_links(payload)
+                                },
+                            )
+                            .await?
+                        })
+                    })
+                    .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_NO_LINKS_ROUTE, result)?;
                 }
                 DFS_CORE_COMPONENT_ACCESS_ROUTE => {
@@ -2617,72 +2726,84 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_LIST_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser list",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .list(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser list",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .list(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser namespace lstat",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .namespace_lstat(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser namespace lstat",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .namespace_lstat(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_STAT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser stat",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .stat(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser stat",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .stat(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_STAT_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser read file",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_file(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser read file",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_file(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, result)?;
@@ -2690,72 +2811,84 @@ impl Service for HostedDfsBrowserService {
 
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser read object version",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_object_version(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser read object version",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_object_version(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser read object version range",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_object_range(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser read object version range",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_object_range(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser read file prefix",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_file_prefix(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser read file prefix",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_file_prefix(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILES_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_browser_task(
-                        Arc::clone(&data_dir),
-                        route.clone(),
-                        "DFS browser read files",
-                        move || {
-                            DfsBrowserBackend::for_data_dir(
-                                data_dir,
-                                &runtime,
-                                Arc::clone(&backend_host),
-                            )?
-                            .read_files(payload)
-                        },
+                    let result = run_served_browser_route(
+                        &request,
+                        run_blocking_browser_task(
+                            Arc::clone(&data_dir),
+                            route.clone(),
+                            "DFS browser read files",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    data_dir,
+                                    &runtime,
+                                    Arc::clone(&backend_host),
+                                )?
+                                .read_files(payload)
+                            },
+                        ),
                     )
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, result)?;
@@ -4505,7 +4638,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: host.clone(),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4569,7 +4702,7 @@ mod tests {
             data_dir,
             host: Arc::new(UnusedHost::default()),
             node_id: node_id.clone(),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4614,7 +4747,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4714,7 +4847,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4805,7 +4938,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -5000,6 +5133,50 @@ mod tests {
         );
     }
 
+    /// A browser read waits for the service on its release, not on a poll:
+    /// it enters as soon as the holder releases it, and is refused as busy
+    /// only at its admission bound.
+    #[test]
+    fn a_browser_read_enters_when_the_service_is_released_and_is_refused_at_its_bound() {
+        let (native, nodes) =
+            crate::test_runtime::DfsTestRuntime::start_cluster("browser-read-condition-wait", 1)
+                .unwrap();
+        let data = Arc::new(native.data_dir(&nodes[0]).clone());
+        let runtime = native.runtime_handle();
+        let backend =
+            DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &runtime).unwrap();
+        let held = backend.service.lock().unwrap();
+        let (started, entered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let backend = &backend;
+            let read = scope.spawn(move || {
+                let _ = started.send(Instant::now());
+                backend.with_read_service(|_| Ok(Instant::now()))
+            });
+            let started = entered.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let released = Instant::now();
+            drop(held);
+            let read_at = read.join().unwrap().expect("the read enters once released");
+            assert!(read_at >= released, "the read waited for the holder");
+            assert!(
+                read_at.duration_since(started) < DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT,
+                "the read entered at the release, within its bound"
+            );
+        });
+        let held = backend.service.lock().unwrap();
+        let started = Instant::now();
+        let refused = backend.with_read_service(|_| Ok(()));
+        assert!(
+            matches!(&refused, Err(ServiceError::Service(message)) if message.contains("busy")),
+            "{refused:?}"
+        );
+        assert!(started.elapsed() >= DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT);
+        drop(held);
+        drop(backend);
+        native.close().unwrap();
+    }
+
     #[test]
     fn hosted_write_releases_both_browser_locks_while_the_owner_executes() {
         struct Sink;
@@ -5112,7 +5289,7 @@ mod tests {
             node_id: node,
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -5232,7 +5409,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -5437,6 +5614,10 @@ mod configuration_consumer_tests;
 #[cfg(test)]
 #[path = "browser_service/placement_visibility_tests.rs"]
 mod placement_visibility_tests;
+
+#[cfg(test)]
+#[path = "browser_service/served_read_native_tests.rs"]
+mod served_read_native_tests;
 
 #[cfg(test)]
 #[path = "browser_service/remote_parent_tests.rs"]

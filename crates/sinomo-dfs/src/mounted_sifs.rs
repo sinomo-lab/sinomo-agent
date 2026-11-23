@@ -53,16 +53,6 @@ impl MountedSifsCall {
         }
     }
 
-    /// A worker that owes Main a durable handoff finishes it under the handoff
-    /// client's own bound, independently of the syscall that has ended.
-    pub fn finish_handoff<R>(work: impl FnOnce() -> R) -> R {
-        let _restore = Self {
-            previous: MOUNTED_CALL_DEADLINE.replace(None),
-            _thread: std::marker::PhantomData,
-        };
-        work()
-    }
-
     pub fn deadline() -> Option<Instant> {
         MOUNTED_CALL_DEADLINE.get()
     }
@@ -71,28 +61,20 @@ impl MountedSifsCall {
         Self::deadline().into_iter().chain(other).min()
     }
 
-    pub fn lock<T>(mutex: &Mutex<T>) -> std::io::Result<std::sync::MutexGuard<'_, T>> {
-        let poisoned = || std::io::Error::other("mounted filesystem lock poisoned");
-        let Some(deadline) = Self::deadline() else {
-            return mutex.lock().map_err(|_| poisoned());
-        };
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(std::io::ErrorKind::TimedOut.into());
+    /// Take `lock` within this callback's deadline. A callback without a
+    /// deadline waits for the lock's release; one whose deadline has passed
+    /// does not enter.
+    pub fn lock<T>(lock: &MountedSifsLock<T>) -> std::io::Result<MountedSifsLockGuard<'_, T>> {
+        match Self::deadline() {
+            Some(deadline) if deadline <= Instant::now() => {
+                Err(std::io::ErrorKind::TimedOut.into())
             }
-            match mutex.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(remaining.min(Duration::from_millis(2)));
-                }
-            }
+            deadline => lock.lock_until(deadline),
         }
     }
 
     pub fn lock_service(
-        service: &Mutex<MountedSifsService>,
+        service: &MountedSifsLock<MountedSifsService>,
     ) -> std::io::Result<MountedSifsServiceGuard<'_>> {
         let mut service = Self::lock(service)?;
         let deadline = Self::earliest(service.transport.operation_deadline());
@@ -107,8 +89,145 @@ impl Drop for MountedSifsCall {
     }
 }
 
+/// A mutex of a mounted adapter. A waiter sleeps until the holder releases
+/// the lock or the waiter's own deadline passes; nothing polls.
+///
+/// A holder that panics poisons the lock, as [`std::sync::Mutex`] does, and
+/// every later attempt reports it.
+#[derive(Debug)]
+pub struct MountedSifsLock<T> {
+    state: Mutex<MountedSifsLockState<T>>,
+    released: Condvar,
+}
+
+#[derive(Debug)]
+struct MountedSifsLockState<T> {
+    /// The protected value while no guard holds it.
+    value: Option<Box<T>>,
+    poisoned: bool,
+}
+
+impl<T: Default> Default for MountedSifsLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> MountedSifsLock<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            state: Mutex::new(MountedSifsLockState {
+                value: Some(Box::new(value)),
+                poisoned: false,
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Wait for the lock, however long its holder keeps it.
+    pub fn lock(&self) -> std::io::Result<MountedSifsLockGuard<'_, T>> {
+        self.lock_until(None)
+    }
+
+    /// Take the lock only when no guard holds it now.
+    pub fn try_lock(&self) -> std::io::Result<MountedSifsLockGuard<'_, T>> {
+        let mut state = self.state.lock().map_err(|_| Self::poisoned())?;
+        if state.poisoned {
+            return Err(Self::poisoned());
+        }
+        match state.value.take() {
+            Some(value) => Ok(MountedSifsLockGuard {
+                lock: self,
+                value: Some(value),
+            }),
+            None => Err(std::io::ErrorKind::WouldBlock.into()),
+        }
+    }
+
+    /// Wait for the lock until `deadline`; `None` waits for its release.
+    pub fn lock_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<MountedSifsLockGuard<'_, T>> {
+        let mut state = self.state.lock().map_err(|_| Self::poisoned())?;
+        loop {
+            if state.poisoned {
+                return Err(Self::poisoned());
+            }
+            if let Some(value) = state.value.take() {
+                return Ok(MountedSifsLockGuard {
+                    lock: self,
+                    value: Some(value),
+                });
+            }
+            state = match deadline {
+                None => self.released.wait(state).map_err(|_| Self::poisoned())?,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    self.released
+                        .wait_timeout(state, remaining)
+                        .map_err(|_| Self::poisoned())?
+                        .0
+                }
+            };
+        }
+    }
+
+    fn poisoned() -> std::io::Error {
+        std::io::Error::other("mounted filesystem lock poisoned")
+    }
+}
+
+/// Exclusive access to the value of a [`MountedSifsLock`]. Dropping the guard
+/// releases the lock and wakes one waiter.
+#[derive(Debug)]
+pub struct MountedSifsLockGuard<'a, T> {
+    lock: &'a MountedSifsLock<T>,
+    value: Option<Box<T>>,
+}
+
+impl<T> std::ops::Deref for MountedSifsLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.value
+            .as_deref()
+            .expect("a live guard holds the locked value")
+    }
+}
+
+impl<T> std::ops::DerefMut for MountedSifsLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+            .as_deref_mut()
+            .expect("a live guard holds the locked value")
+    }
+}
+
+impl<T> Drop for MountedSifsLockGuard<'_, T> {
+    fn drop(&mut self) {
+        let mut state = self
+            .lock
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.value = self.value.take();
+        state.poisoned |= std::thread::panicking();
+        drop(state);
+        // Every waiter of a poisoned lock must learn it; otherwise one
+        // release admits one waiter.
+        if std::thread::panicking() {
+            self.lock.released.notify_all();
+        } else {
+            self.lock.released.notify_one();
+        }
+    }
+}
+
 pub struct MountedSifsServiceGuard<'a> {
-    service: std::sync::MutexGuard<'a, MountedSifsService>,
+    service: MountedSifsLockGuard<'a, MountedSifsService>,
     previous: Option<Instant>,
 }
 
@@ -704,6 +823,168 @@ mod tests {
         runtime.close().unwrap();
     }
 
+
+    #[test]
+    fn a_mounted_lock_waiter_enters_on_release_and_leaves_at_its_deadline() {
+        let lock = MountedSifsLock::new(0usize);
+        let held = lock.lock().unwrap();
+        // A waiter with a deadline leaves at it, and takes nothing.
+        let started = Instant::now();
+        let timed_out = lock
+            .lock_until(Some(started + Duration::from_millis(40)))
+            .expect_err("the lock is held past the deadline");
+        assert_eq!(timed_out.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert_eq!(
+            lock.try_lock().expect_err("held").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        // A waiter without one sleeps until the release wakes it.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut guard = lock.lock().expect("the release admits the waiter");
+                *guard += 1;
+                entered_tx.send(Instant::now()).unwrap();
+            });
+            assert!(
+                entered_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+                "the waiter cannot enter while the lock is held"
+            );
+            let released = Instant::now();
+            drop(held);
+            let entered = entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the waiter entered after the release");
+            assert!(entered >= released);
+        });
+        assert_eq!(*lock.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_callback_past_its_deadline_does_not_take_a_free_mounted_lock() {
+        let lock = MountedSifsLock::new(());
+        {
+            let _call = MountedSifsCall::enter(Some(Instant::now()));
+            assert_eq!(
+                MountedSifsCall::lock(&lock)
+                    .expect_err("the deadline passed")
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+        // Without a deadline the same lock is taken at once.
+        assert!(MountedSifsCall::lock(&lock).is_ok());
+    }
+
+    #[test]
+    fn a_panicking_holder_poisons_a_mounted_lock_for_every_waiter() {
+        let lock = MountedSifsLock::new(());
+        let panicked = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = lock.lock().unwrap();
+                    panic!("holder failed");
+                })
+                .join()
+        });
+        assert!(panicked.is_err());
+        assert!(lock.lock().is_err());
+        assert!(lock.try_lock().is_err());
+        assert!(
+            lock.lock_until(Some(Instant::now() + Duration::from_secs(5)))
+                .is_err()
+        );
+    }
+
+    /// Records the budget each request carries, as the serving node reads it.
+    #[derive(Debug, Default)]
+    struct BudgetRecordingPeerTransport {
+        budgets: Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl DfsPeerTransport for BudgetRecordingPeerTransport {
+        fn call_object_rpc(
+            &self,
+            _target_node_id: &NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.budgets
+                .lock()
+                .unwrap()
+                .push(crate::routes::dfs_request_budget(&call.request));
+            Err(DfsPeerTransportError::new("the budget was recorded"))
+        }
+    }
+
+    impl AsyncDfsPeerTransport for BudgetRecordingPeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            call: ObjectRpcCall,
+            options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            let result = self.call_object_rpc(target_node_id, call, options);
+            Box::pin(async move { result })
+        }
+    }
+
+    #[test]
+    fn a_configured_operation_budget_travels_with_each_request_a_callback_sends() {
+        let root = sinomo_testdir::TestDir::new("mounted-operation-budget-request-key");
+        let local = NodeId::from_legacy_named("node_mounted_budget_local").unwrap();
+        let remote = NodeId::from_legacy_named("node_mounted_budget_remote").unwrap();
+        let recorder = Arc::new(BudgetRecordingPeerTransport::default());
+        let transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            local.clone(),
+            vec![remote.clone()],
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            recorder.clone(),
+            recorder.clone(),
+        );
+        let content = crate::LocalContentStore::new(root.path().join("content")).unwrap();
+        let service = MountedSifsLock::new(NetworkedDfsService::new(transport, content));
+        let verification = || {
+            crate::DfsNetworkMessage::PrimaryVerificationRequest(
+                crate::DfsPrimaryVerificationRequest {
+                    file_system_id: crate::sifs_file_system_id(),
+                    shard_id: "root".into(),
+                    epoch: 1,
+                    primary_node_id: remote.clone(),
+                },
+            )
+        };
+
+        // The text a mount's `--operation-budget` flag and its
+        // `operation_budget` configuration field both carry.
+        let budget = crate::parse_mount_operation_budget("30s")
+            .unwrap()
+            .expect("a non-empty budget");
+        assert_eq!(budget, Duration::from_secs(30));
+        {
+            let _call = MountedSifsCall::enter(Instant::now().checked_add(budget));
+            let mut service = MountedSifsCall::lock_service(&service).unwrap();
+            let _ = service.send_dfs_message_if_routable(&remote, verification());
+        }
+        // A mount without a budget stamps none: its request has no deadline.
+        assert_eq!(crate::parse_mount_operation_budget("").unwrap(), None);
+        {
+            let _call = MountedSifsCall::enter(None);
+            let mut service = MountedSifsCall::lock_service(&service).unwrap();
+            let _ = service.send_dfs_message_if_routable(&remote, verification());
+        }
+
+        let budgets = recorder.budgets.lock().unwrap().clone();
+        assert_eq!(budgets.len(), 2, "each callback sent its request");
+        let stamped = budgets[0].expect("the budgeted callback's request carries its budget");
+        assert!(
+            stamped <= budget && stamped > budget - Duration::from_secs(5),
+            "the request carries what is left of the mount's budget: {stamped:?}"
+        );
+        assert_eq!(budgets[1], None, "no budget, no key");
+    }
 
     #[derive(Debug)]
     struct RecordingMountedPeerTransport {
@@ -2739,7 +3020,11 @@ impl MountedSifsConfigurationShared {
     /// The current state. Only a use before the first subscription settled
     /// waits, and only under one network deadline.
     fn current(&self) -> MountedSifsConfiguration {
-        let Ok(mut state) = MountedSifsCall::lock(&self.state) else {
+        // The state is never held across a wait: the wait below releases it.
+        if MountedSifsCall::deadline().is_some_and(|at| at <= Instant::now()) {
+            return MountedSifsConfiguration::Disconnected;
+        }
+        let Ok(mut state) = self.state.lock() else {
             return MountedSifsConfiguration::Disconnected;
         };
         let network_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;

@@ -1,11 +1,11 @@
 //! Routed namespace helpers for the POSIX facade.
 //!
-//! These helpers keep SIFS metadata-shard routing, bounded read freshness, and
-//! routed mutation replay together. The parent `posix` module owns local
+//! These helpers keep SIFS metadata-shard routing, read freshness, and routed
+//! mutation replay together. A read adds no deadline of its own. The parent `posix` module owns local
 //! namespace operations and cross-shard sagas; this module decides when those
 //! operations should run locally or be sent to another shard primary.
 
-use super::POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
+use super::POSIX_READ_NO_BUDGET;
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::posix_model::{DfsPosixError, DfsStat, Result, posix_error_for_namespace_rejection};
 use crate::posix_path::{
@@ -56,20 +56,6 @@ pub(crate) fn directory_child_authority_shards<'a>(
         .collect())
 }
 
-fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) -> bool {
-    matches!(
-        operation,
-        DfsNamespaceOperation::Mkdir { .. }
-            | DfsNamespaceOperation::MkdirWithAttrs { .. }
-            | DfsNamespaceOperation::MkdirAtNoLinks { .. }
-            | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(_)
-            | DfsNamespaceOperation::MkdirAll { .. }
-            | DfsNamespaceOperation::ConditionalUnlink { .. }
-            | DfsNamespaceOperation::ConditionalRmdir { .. }
-            | DfsNamespaceOperation::ConditionalRename { .. }
-    )
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A live assignment-boundary directory needs no child/parent mutation.
     /// Observe it at its current owner before requesting that wider footprint.
@@ -90,7 +76,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             sifs_file_system_id(),
             shard.primary_node_id.clone(),
             path.to_owned(),
-            POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            POSIX_READ_NO_BUDGET,
         )?;
         Ok(Some(object.is_some_and(|object| {
             object.kind == DfsObjectKind::Directory
@@ -546,14 +532,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path.to_string(),
                 offset,
                 max_bytes,
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
         } else {
             self.route_namespace_lookup_path_to_metadata_primary(
                 sifs_file_system_id(),
                 primary_node_id,
                 path.to_string(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             )
             .map(|object| (object, None))
         }
@@ -677,7 +663,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id.clone(),
                 primary_node_id,
                 paths.clone(),
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                POSIX_READ_NO_BUDGET,
             ) else {
                 continue;
             };
@@ -784,9 +770,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// `DfsPosixError` a local execution would have produced. On success the
     /// response journal batches are already replayed locally.
     ///
-    /// A node routing on a stale shard view can address a former primary;
-    /// the authority rejection names the current primary, and the operation
-    /// is retried against it (bounded) instead of failing.
+    /// The call keeps one operation id. A node routing on a stale shard view
+    /// can address a former primary: its refusal, like an unknown outcome or
+    /// an undelivered request, makes the caller wait for its own projection
+    /// of the shard's record to change and send the same request to the
+    /// primary that record names. Only the caller's budget bounds the wait.
     pub(crate) fn route_namespace_operation(
         &mut self,
         primary_node_id: NodeId,
@@ -835,7 +823,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // it from durable admission, at whichever node the record names.
         let followed = self
             .route_namespace_following_record(
-                Some(&operation_id),
+                &operation_id,
                 &file_system_id,
                 primary_node_id,
                 &operation,
@@ -872,9 +860,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    /// Keep caller-owned stable admission when routing discovers local
-    /// authority, including after a lost response. Direct execution would lose
-    /// the original durable identity and could create an untracked mutation.
+    /// Run a call whose shard record now names this node under the call's
+    /// own durable admission, as the primary serves any request: an attempt
+    /// an earlier primary applied, or prepared on the write set this node
+    /// belongs to, is answered from that request's rows rather than run a
+    /// second time. Operations without durable admission keep their own
+    /// repeat rule and run directly.
     fn execute_routed_namespace_operation_locally(
         &mut self,
         operation_id: Option<&str>,
@@ -883,33 +874,79 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let (Some(id), DfsNamespaceOperation::WriteFile { .. }) = (operation_id, operation) {
             return self.local_browser_write_reply(id.to_owned(), operation.clone());
         }
-        if let Some(operation_id) =
-            operation_id.filter(|_| namespace_operation_uses_stable_admission(operation))
-        {
-            self.execute_local_primary_namespace_operation_with_request_id(
-                operation_id.to_string(),
+        if let Some(operation_id) = operation_id.filter(|_| {
+            crate::service_routed_namespace::namespace_operation_uses_durable_request_admission(
+                operation,
+            )
+        }) {
+            let (result, coordination) = self.execute_local_primary_namespace_reply(
+                sifs_file_system_id(),
+                operation_id.to_owned(),
                 operation.clone(),
             )?;
-            return Ok(None);
+            return match result {
+                DfsNamespaceResult::Applied => Ok(coordination),
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            };
         }
         self.execute_posix_coordination_operation_local(operation)
     }
 
+    /// Route one bounded namespace-job step under one operation id. Starting
+    /// a job is answered from its request row on a repeat, and resuming one
+    /// only advances the durable job it names, so the same request is sent
+    /// again like any other mutation.
     pub(super) fn route_namespace_job_operation(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<DfsNamespaceJobRecord> {
-        let routed = self
-            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                sifs_file_system_id(),
+        let file_system_id = sifs_file_system_id();
+        let operation_id = self.next_request_id();
+        let followed = self
+            .route_namespace_following_record(
+                &operation_id,
+                &file_system_id,
                 primary_node_id,
-                operation.clone(),
+                &operation,
                 DFS_NO_CALLER_BUDGET,
                 true,
                 true,
             )
             .map_err(DfsPosixError::Dfs)?;
+        let routed = match followed {
+            DfsFollowedNamespaceRoute::Settled(routed) => routed,
+            // Authority moved to this node, which runs the step itself:
+            // starting a job under the call's admission, resuming one by its
+            // durable job.
+            DfsFollowedNamespaceRoute::LocalAuthority => {
+                return match &operation {
+                    DfsNamespaceOperation::RenameDirectoryBounded { .. } => match self
+                        .execute_routed_namespace_operation_locally(
+                            Some(&operation_id),
+                            &operation,
+                        )? {
+                        Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
+                        _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                            message: "bounded namespace job omitted its typed receipt".to_string(),
+                        })),
+                    },
+                    DfsNamespaceOperation::ResumeNamespaceJobBounded {
+                        job_id, max_steps, ..
+                    } => self.posix_resume_namespace_job_bounded(
+                        job_id,
+                        usize::try_from(*max_steps).unwrap_or(usize::MAX),
+                    ),
+                    _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "namespace job route carried another operation".to_string(),
+                    })),
+                };
+            }
+        };
         match routed.result.clone() {
             DfsNamespaceResult::Applied => match routed.posix_coordination_result {
                 Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
@@ -925,18 +962,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Route one mutation whose reply this caller does not replay into local
+    /// metadata. It keeps one operation id like every other mutation: the
+    /// primary answers a repeat from the request row it recorded.
     pub(super) fn route_namespace_operation_without_local_replay(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
         let file_system_id = sifs_file_system_id();
-        // Each attempt here has a new request id, so only an attempt that was
-        // not delivered, or was refused for its authority, is sent again. A
-        // possibly applied dispatch is returned unchanged.
+        let operation_id = self.next_request_id();
         let followed = self
             .route_namespace_following_record(
-                None,
+                &operation_id,
                 &file_system_id,
                 primary_node_id,
                 &operation,
@@ -947,7 +985,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsPosixError::Dfs)?;
         match followed {
             DfsFollowedNamespaceRoute::LocalAuthority => self
-                .execute_routed_namespace_operation_locally(None, &operation)
+                .execute_routed_namespace_operation_locally(Some(&operation_id), &operation)
                 .map(drop),
             DfsFollowedNamespaceRoute::Settled(routed) => match routed.result {
                 DfsNamespaceResult::Applied => Ok(()),

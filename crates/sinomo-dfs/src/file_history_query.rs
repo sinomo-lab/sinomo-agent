@@ -2,7 +2,6 @@
 
 use crate::*;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 pub(crate) const HISTORY_PAGE_LIMIT: usize = 128;
 pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
@@ -202,15 +201,33 @@ pub struct DfsMetadataShardResponse {
 /// Without a deciding answer the fan-out is undecided, and returns the
 /// retryable `Busy` rather than absence. Every fan-out over the authorities
 /// queries through [`NetworkedDfsService::query_metadata_authority_in_fan_out`].
+///
+/// A shard whose primary the query did not reach is noted the same way and
+/// asked no further while the others are asked: an unrelated object does not
+/// depend on an unavailable primary. Its answer is needed only when no other
+/// shard decided; [`NetworkedDfsService::fan_out_undecided`] then returns the
+/// query's error, or, in an attribute read, waits for that shard's record.
 #[derive(Debug, Default)]
 pub(crate) struct DfsAuthorityFanOut {
     closed: Vec<DfsMetadataShardConfig>,
+    unanswered: Vec<(DfsMetadataShardConfig, DfsError)>,
 }
 
 impl DfsAuthorityFanOut {
     /// The shards that could not answer because their storage is closed.
     pub(crate) fn closed(&self) -> &[DfsMetadataShardConfig] {
         &self.closed
+    }
+
+    /// Whether `shard` was asked and its primary was not reached.
+    pub(crate) fn left_unanswered(&self, shard: &DfsMetadataShardConfig) -> bool {
+        self.unanswered.iter().any(|(asked, _)| asked == shard)
+    }
+
+    /// Start the next question of a fan-out that asks several in turn: the
+    /// shards left unanswered so far concern the questions already decided.
+    pub(crate) fn next_question(&mut self) {
+        self.unanswered.clear();
     }
 
     /// The fan-out found no deciding answer: `none` when every authority
@@ -235,6 +252,14 @@ impl DfsAuthorityFanOut {
             path: format!("{subject} (metadata shard {shards} storage is closed)"),
         }
     }
+}
+
+/// What one metadata query came back with.
+pub(crate) enum DfsMetadataQueryAnswer {
+    Answered(DfsMetadataQueryResult),
+    /// The query was not delivered, or its primary refused it for authority;
+    /// the error is what the query ended with.
+    Unanswered(DfsError),
 }
 
 fn error(message: impl Into<String>) -> DfsError {
@@ -1223,7 +1248,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// One query of a fan-out over every shard authority (see
     /// [`DfsAuthorityFanOut`]): `None` when `shard` cannot answer now because
-    /// its storage is closed, which `fan_out` notes.
+    /// its storage is closed or its primary was not reached, which `fan_out`
+    /// notes. The query is sent once; the fan-out asks the other shards.
     pub(crate) fn query_metadata_authority_in_fan_out(
         &mut self,
         fan_out: &mut DfsAuthorityFanOut,
@@ -1231,15 +1257,92 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         selection: DfsMetadataSelection,
         snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<Option<DfsMetadataQueryResult>, DfsError> {
-        match self.query_metadata_authority_from_snapshot(shard, selection, snapshot) {
-            Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => {
+        match self.query_metadata_authority_routed(shard, selection, snapshot, false) {
+            Err(error) | Ok(DfsMetadataQueryAnswer::Unanswered(error))
+                if crate::error::dfs_error_is_closed_shard_storage(&error) =>
+            {
                 if !fan_out.closed.contains(shard) {
                     fan_out.closed.push(shard.clone());
                 }
                 Ok(None)
             }
-            queried => queried.map(Some),
+            Ok(DfsMetadataQueryAnswer::Unanswered(error)) => {
+                if !fan_out.left_unanswered(shard) {
+                    fan_out.unanswered.push((shard.clone(), error));
+                }
+                Ok(None)
+            }
+            Ok(DfsMetadataQueryAnswer::Answered(result)) => Ok(Some(result)),
+            Err(error) => Err(error),
         }
+    }
+
+    /// A fan-out found no deciding answer (see [`DfsAuthorityFanOut`]). A
+    /// shard it left unanswered could hold the answer, so its answer is
+    /// needed: the error its query ended with, or, in an attribute read, the
+    /// wait for that shard's record. Otherwise `none` when every authority
+    /// answered, or the retryable `Busy` naming the closed shards.
+    pub(crate) fn fan_out_undecided<R>(
+        &mut self,
+        fan_out: &DfsAuthorityFanOut,
+        subject: impl std::fmt::Display,
+        none: R,
+    ) -> Result<R, DfsError> {
+        if let Some(needed) = self.fan_out_needed_answer(fan_out) {
+            return Err(needed);
+        }
+        fan_out.undecided(subject, none)
+    }
+
+    /// What a fan-out without a deciding answer ends with while a shard it
+    /// left unanswered could hold the answer; `None` when it left none.
+    ///
+    /// An attribute read waits for that shard's record, as its own query
+    /// would: a newer record ends the read with
+    /// [`DfsError::ShardRecordChanged`], and the re-send time with
+    /// [`DfsError::ShardAnswerDue`], so the read asks every shard again. A
+    /// mounted call hands the wait back and a background pass parks it.
+    /// Any other fan-out sent its queries once and returns the error.
+    pub(crate) fn fan_out_needed_answer(
+        &mut self,
+        fan_out: &DfsAuthorityFanOut,
+    ) -> Option<DfsError> {
+        let (shard, unanswered) = fan_out.unanswered.first()?;
+        if !self.attribute_read_replans {
+            return Some(unanswered.clone());
+        }
+        let mut resend = self
+            .attribute_read_resend
+            .take()
+            .unwrap_or_else(crate::service_record_follow::DfsRecordFollowResend::new);
+        let followed = self.follow_undelivered_read(shard, &mut resend);
+        self.attribute_read_resend = Some(resend);
+        Some(match followed {
+            Err(error) => error,
+            Ok(crate::service_record_follow::DfsRecordFollowed::ResendDue(record))
+                if record.shard_id == shard.shard_id
+                    && record.epoch == shard.epoch
+                    && record.primary_node_id == shard.primary_node_id =>
+            {
+                DfsError::ShardAnswerDue {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    epoch: shard.epoch,
+                }
+            }
+            Ok(
+                crate::service_record_follow::DfsRecordFollowed::Newer(_)
+                | crate::service_record_follow::DfsRecordFollowed::ResendDue(_),
+            ) => DfsError::ShardRecordChanged {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: shard.shard_id.clone(),
+                epoch: shard.epoch,
+            },
+            Ok(
+                crate::service_record_follow::DfsRecordFollowed::Woken
+                | crate::service_record_follow::DfsRecordFollowed::Ended,
+            ) => unanswered.clone(),
+        })
     }
 
     pub(crate) fn query_metadata_authority_from_snapshot(
@@ -1248,6 +1351,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         selection: DfsMetadataSelection,
         snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsMetadataQueryResult, DfsError> {
+        match self.query_metadata_authority_routed(shard, selection, snapshot, true)? {
+            DfsMetadataQueryAnswer::Answered(result) => Ok(result),
+            DfsMetadataQueryAnswer::Unanswered(error) => Err(error),
+        }
+    }
+
+    /// Ask `shard`'s authority one metadata query. With `follow`, a query
+    /// an attribute read makes follows its record (see
+    /// [`Self::route_metadata_query`]); without it the query is sent once.
+    fn query_metadata_authority_routed(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        selection: DfsMetadataSelection,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+        follow: bool,
+    ) -> Result<DfsMetadataQueryAnswer, DfsError> {
         let query = DfsMetadataShardQuery {
             file_system_id: shard.file_system_id.clone(),
             shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
@@ -1257,14 +1376,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let response = if self.control_plane.is_none() {
             self.serve_metadata_query(&query)?
         } else {
-            let outcome = self.route_metadata_query(shard, &query, snapshot)?;
-            match (outcome.result, outcome.posix_coordination_result) {
-                (
-                    DfsNamespaceResult::Applied,
-                    Some(DfsPosixCoordinationResult::MetadataQuery(response)),
-                ) => response,
-                (DfsNamespaceResult::Rejected { reason, .. }, _) => return Err(error(reason)),
-                _ => return Err(error("history authority omitted its typed query response")),
+            let (outcome, unanswered) = self.route_metadata_query(shard, &query, snapshot, follow);
+            let response = outcome.and_then(|outcome| {
+                match (outcome.result, outcome.posix_coordination_result) {
+                    (
+                        DfsNamespaceResult::Applied,
+                        Some(DfsPosixCoordinationResult::MetadataQuery(response)),
+                    ) => Ok(response),
+                    (
+                        DfsNamespaceResult::Rejected {
+                            posix_error:
+                                Some(DfsNamespacePosixError::ShardStorageClosed { cause, detail }),
+                            ..
+                        },
+                        _,
+                    ) => Err(DfsError::ShardStorageClosed { cause, detail }),
+                    (DfsNamespaceResult::Rejected { reason, .. }, _) => Err(error(reason)),
+                    _ => Err(error("history authority omitted its typed query response")),
+                }
+            });
+            match response {
+                Ok(response) => response,
+                Err(failed) if unanswered => {
+                    return Ok(DfsMetadataQueryAnswer::Unanswered(failed));
+                }
+                Err(failed) => return Err(failed),
             }
         };
         if response.file_system_id != query.file_system_id
@@ -1343,16 +1479,106 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ) => return Err(error("count contribution authority returned the wrong query kind")),
             _ => {}
         }
-        Ok(response.result)
+        Ok(DfsMetadataQueryAnswer::Answered(response.result))
     }
 
     /// The read uses the existing namespace command, authenticated sender and
     /// exact response fence. Its wait must not enter the mutation dispatcher.
+    /// Ask `expected`'s primary one metadata query. A query names one exact
+    /// record. One an attribute read makes follows that record like any
+    /// other read when it could not be delivered or its primary refused it
+    /// for authority: it is sent again on the re-send timer while the record
+    /// stands, and a newer record ends it with
+    /// [`DfsError::ShardRecordChanged`], so the attribute read plans again at
+    /// the new record. A query another operation planned is sent once.
+    /// Without `follow` (a query of a fan-out) the query is sent once too.
+    ///
+    /// Also returns whether the query was left unanswered: it was not
+    /// delivered, or its primary refused it for authority to a requester
+    /// that follows record changes.
     fn route_metadata_query(
         &mut self,
         expected: &DfsMetadataShardConfig,
         query: &DfsMetadataShardQuery,
         snapshot: Option<&[DfsMetadataShardConfig]>,
+        follow: bool,
+    ) -> (Result<PendingRoutedNamespaceResult, DfsError>, bool) {
+        let mut expected = expected.clone();
+        let mut snapshot = snapshot.map(<[DfsMetadataShardConfig]>::to_vec);
+        let mut resend = crate::service_record_follow::DfsRecordFollowResend::new();
+        loop {
+            let (result, undelivered) =
+                self.route_metadata_query_once(&expected, query, snapshot.as_deref());
+            let refused_for_authority = matches!(
+                &result,
+                Ok(routed) if matches!(
+                    routed.result,
+                    DfsNamespaceResult::Rejected { current_primary_node_id: Some(_), .. }
+                )
+            );
+            let unanswered =
+                undelivered || (refused_for_authority && self.follows_record_changes());
+            // Only an attribute read plans again at a newer record; a query
+            // another operation planned is sent once, as that operation's
+            // plan stands.
+            if !follow || !self.attribute_read_replans || !unanswered {
+                if undelivered {
+                    self.request_primary_verification(&expected);
+                }
+                return (result, unanswered);
+            }
+            let followed = match self.follow_undelivered_read(&expected, &mut resend) {
+                Ok(followed) => followed,
+                Err(error) => return (Err(error), false),
+            };
+            match followed {
+                crate::service_record_follow::DfsRecordFollowed::ResendDue(record)
+                    if record.shard_id == expected.shard_id
+                        && record.epoch == expected.epoch
+                        && record.primary_node_id == expected.primary_node_id =>
+                {
+                    // The same record, with the replica list the projection
+                    // has now.
+                    expected = record;
+                    snapshot = None;
+                }
+                crate::service_record_follow::DfsRecordFollowed::Newer(_)
+                | crate::service_record_follow::DfsRecordFollowed::ResendDue(_) => {
+                    return (
+                        Err(DfsError::ShardRecordChanged {
+                            file_system_id: expected.file_system_id.clone(),
+                            shard_id: expected.shard_id.clone(),
+                            epoch: expected.epoch,
+                        }),
+                        false,
+                    );
+                }
+                crate::service_record_follow::DfsRecordFollowed::Woken
+                | crate::service_record_follow::DfsRecordFollowed::Ended => {
+                    return (result, unanswered);
+                }
+            }
+        }
+    }
+
+    /// One attempt at a metadata query, and whether it went undelivered.
+    fn route_metadata_query_once(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        query: &DfsMetadataShardQuery,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> (Result<PendingRoutedNamespaceResult, DfsError>, bool) {
+        let mut undelivered = false;
+        let result = self.route_metadata_query_attempt(expected, query, snapshot, &mut undelivered);
+        (result, undelivered)
+    }
+
+    fn route_metadata_query_attempt(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        query: &DfsMetadataShardQuery,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+        undelivered: &mut bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         self.check_cancelled("metadata query")?;
         let snapshot = match snapshot {
@@ -1442,10 +1668,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
         })
         .transpose()?;
-        let requested = std::time::Instant::now() + Duration::from_secs(30);
-        let previous_deadline = self.transport.set_operation_deadline(Some(requested));
-        let deadline = previous_deadline.map_or(requested, |old| old.min(requested));
-        self.transport.set_operation_deadline(Some(deadline));
+        let lanes_released = lanes_released_read.is_some();
+        // A query adds no deadline of its own when nothing is held across
+        // its wait: a requester that delegates to its node's Main (a mount,
+        // the CLI, a hosted client), or a read made with the request's lanes
+        // released. Its caller's budget or departure ends it. A query this
+        // service waits for while it serves a request or holds a shard's
+        // admission keeps a bound, so that admission is never held without
+        // end.
+        let holds_nothing = self.transport.delegates_local_namespace_authority()
+            && !self.transport.serves_routed_request()
+            && self.publication_execution.current().is_none();
+        let requested = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let previous_deadline = self.transport.operation_deadline();
+        let own_deadline = previous_deadline.map_or(requested, |old| old.min(requested));
+        self.transport
+            .set_operation_deadline(if lanes_released_read.is_some() || holds_nothing {
+                previous_deadline
+            } else {
+                Some(own_deadline)
+            });
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         self.pending_routed_namespace_ops.insert(
             request_id.clone(),
@@ -1458,6 +1700,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 result: None,
             },
         );
+        let mut unroutable = false;
         let result = (|| {
             let response = if let Some(key) = lanes_released_read {
                 match self.answered_remote_reads.get(&key).cloned() {
@@ -1477,12 +1720,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             key,
                             command.clone(),
                             pending,
-                            Some(deadline),
+                            previous_deadline,
                         ));
                     }
                 }
             } else {
                 if expected.primary_node_id == self.node_id {
+                    self.check_mounted_call_running()?;
                     let message = self.next_dfs_routed_message(
                         &expected.primary_node_id,
                         DfsNetworkMessage::NamespaceRequest(command.clone()),
@@ -1494,15 +1738,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &expected.primary_node_id,
                     DfsNetworkMessage::NamespaceRequest(command.clone()),
                 )? {
+                    unroutable = true;
                     return Err(error("metadata query primary is not routable"));
                 }
+                let effective_deadline = self.transport.operation_deadline();
                 wait_for_metadata_query_response(
                     &mut self.transport,
                     self.cancellation.as_ref(),
                     &self.node_id,
                     &expected.primary_node_id,
                     &request_id,
-                    deadline,
+                    effective_deadline,
                 )?
             };
             match &response.result {
@@ -1533,6 +1779,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.pending_routed_namespace_ops.remove(&request_id);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
         self.transport.set_operation_deadline(previous_deadline);
+        // A query handed to a lanes-released read is answered by that read;
+        // only one this attempt sent itself can have gone undelivered.
+        *undelivered = !lanes_released
+            && matches!(&result, Err(failed) if unroutable
+                || matches!(failed, DfsError::Network { .. } | DfsError::NetworkDelivery { .. }));
         result
     }
 
@@ -1548,10 +1799,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        let mut fan_out = DfsAuthorityFanOut::default();
+        self.current_object_in_fan_out(
+            &mut DfsAuthorityFanOut::default(),
+            file_system_id,
+            object_id,
+        )
+    }
+
+    /// Ask every shard authority for the current record of `object_id`,
+    /// past the shards `fan_out` already left unanswered.
+    pub(crate) fn current_object_in_fan_out(
+        &mut self,
+        fan_out: &mut DfsAuthorityFanOut,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
         for shard in self.metadata_shard_authorities(file_system_id)? {
+            if fan_out.left_unanswered(&shard) {
+                continue;
+            }
             let Some(result) = self.query_metadata_authority_in_fan_out(
-                &mut fan_out,
+                fan_out,
                 &shard,
                 DfsMetadataSelection::CurrentObject {
                     object_id: object_id.clone(),
@@ -1574,7 +1842,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(Some(*object));
             }
         }
-        fan_out.undecided(format!("object {object_id}"), None)
+        self.fan_out_undecided(fan_out, format!("object {object_id}"), None)
     }
 
     /// Collect an exact current or explicitly retained version. The supplied
@@ -1772,7 +2040,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        fan_out.undecided(format!("object {}", identity.object_id), None)
+        self.fan_out_undecided(&fan_out, format!("object {}", identity.object_id), None)
     }
 
     pub fn resolve_retained_revision(
@@ -1828,20 +2096,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 _ => return Err(error("revision authority returned wrong query kind")),
             }
         }
-        fan_out.undecided(format!("object {}", identity.object_id), None)
+        self.fan_out_undecided(&fan_out, format!("object {}", identity.object_id), None)
     }
 }
 
 /// Transport-only wait: no backend, service dispatcher, prepare or repair graph.
+///
+/// The answer's arrival, the caller's cancellation or the caller's deadline
+/// ends the wait. Unrelated queued traffic keeps its custody: the wait takes
+/// only this request's answer and wakes on arrivals, never on what is already
+/// queued, so it cannot spin. Without an arrival it looks again at the
+/// network's liveness interval; that look ends nothing.
 fn wait_for_metadata_query_response(
     transport: &mut dyn DfsMessageTransport,
     cancellation: Option<&DfsCancellationFlag>,
     local: &sinomo_core::node::NodeId,
     primary: &sinomo_core::node::NodeId,
     request_id: &str,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> Result<DfsNamespaceResponse, DfsError> {
-    loop {
+    let arrived = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let signal = std::sync::Arc::clone(&arrived);
+    let waker: crate::service_state::DfsCancellationWaker = std::sync::Arc::new(move || {
+        *signal
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        signal.1.notify_all();
+    });
+    let _cancellation_wake = cancellation.map(|cancellation| cancellation.register_waker(&waker));
+    transport.set_incoming_arrival_waker(Some(std::sync::Arc::clone(&waker)));
+    let answer = (|| loop {
         if cancellation.is_some_and(DfsCancellationFlag::is_cancelled) {
             return Err(DfsError::Cancelled {
                 operation: "metadata query",
@@ -1862,13 +2147,27 @@ fn wait_for_metadata_query_response(
             }
             return Ok(response);
         }
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| error("metadata query timed out waiting for its authority"))?;
-        // Unrelated queued traffic retains custody and cannot cause a busy loop.
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
+        let now = std::time::Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(error("metadata query timed out waiting for its authority"));
+        }
+        let wait = deadline.map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        });
+        let flag = arrived
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut flag, _) = arrived
+            .1
+            .wait_timeout_while(flag, wait, |arrived| !*arrived)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *flag = false;
+    })();
+    transport.set_incoming_arrival_waker(None);
+    answer
 }
 
 #[cfg(test)]

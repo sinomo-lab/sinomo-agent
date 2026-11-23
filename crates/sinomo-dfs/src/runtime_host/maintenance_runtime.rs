@@ -850,7 +850,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                     // service, backend checkout and all admission guards ended above.
                     let completed =
                         super::message_host::dispatch_daemon_dfs_remote_namespace_phase(
-                            &data_dir, phase, runtime,
+                            &data_dir, phase, None, runtime,
                         )
                         .await?;
                     completed_remote_phase = Some((request, completed));

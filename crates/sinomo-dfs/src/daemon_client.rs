@@ -11,13 +11,98 @@ pub use crate::{
     DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
     DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
 };
-/// Normal whole-call budget for the local mounted-mutation durability handoff.
+/// How long one attempt at a mounted-mutation handoff step waits for the
+/// daemon's answer. An attempt that ends without one is sent again by its
+/// adapter: the bound ends an attempt, never the handoff.
 pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Largest caller-selected whole-call budget. Every request retains an
-/// absolute deadline even while authenticated keepalives show transport
-/// progress.
+/// Largest per-attempt bound a caller may select. Every attempt keeps an
+/// absolute end even while authenticated keepalives show transport progress.
 pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why one attempt at a mounted-mutation handoff step ended without the
+/// daemon's acknowledgement.
+#[derive(Debug)]
+pub enum DaemonDfsMountedMutationHandoffError {
+    /// The handoff owner answered and refused the step, or the step cannot
+    /// be sent as built. The same step sent again gets the same answer.
+    Rejected(DaemonApiError),
+    /// The handoff owner answered that it cannot take the step now: another
+    /// holder kept the outbox lock. Nothing was decided; the step is sent
+    /// again.
+    Busy,
+    /// No answer from the handoff owner: the attempt was not delivered, its
+    /// answer did not arrive within the attempt's bound, or the daemon is not
+    /// serving the handoff yet. The step is sent again.
+    Unacknowledged(DaemonApiError),
+}
+
+impl DaemonDfsMountedMutationHandoffError {
+    /// Whether the handoff owner definitely refused the step.
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected(_))
+    }
+
+    pub fn into_api_error(self) -> DaemonApiError {
+        match self {
+            Self::Rejected(error) | Self::Unacknowledged(error) => error,
+            Self::Busy => DaemonApiError::RemoteService {
+                route: DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE.into(),
+                detail: "the mounted-mutation outbox is busy; try again".into(),
+            },
+        }
+    }
+
+    /// Only an error the handoff route's own handler returned is a refusal.
+    /// A transport failure, an elapsed attempt, and a daemon that does not
+    /// serve the route or the caller yet are all the absence of an answer.
+    fn from_attempt(error: DaemonApiError) -> Self {
+        match error {
+            DaemonApiError::RemoteService { .. } => Self::Rejected(error),
+            other => Self::Unacknowledged(other),
+        }
+    }
+
+    /// A `busy` answer for the request it answers. One naming another
+    /// marker or Arm is a broken answer, not contention.
+    fn from_busy_answer(
+        request: &DaemonDfsMountedMutationHandoffRequest,
+        response: &DaemonDfsMountedMutationHandoffResponse,
+    ) -> Self {
+        let (marker_id, arm_request_id) = request.identity();
+        if response.marker_id == marker_id && response.arm_request_id == arm_request_id {
+            Self::Busy
+        } else {
+            Self::Rejected(DaemonApiError::Parse {
+                detail: format!(
+                    "mounted-mutation handoff answered busy for another step: marker_id={:?}, arm_request_id={:?}",
+                    response.marker_id, response.arm_request_id
+                ),
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonDfsMountedMutationHandoffError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(error) => write!(formatter, "handoff step rejected: {error}"),
+            Self::Busy => write!(formatter, "handoff step not taken: the outbox is busy"),
+            Self::Unacknowledged(error) => {
+                write!(formatter, "handoff step not acknowledged: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonDfsMountedMutationHandoffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected(error) | Self::Unacknowledged(error) => Some(error),
+            Self::Busy => None,
+        }
+    }
+}
 
 /// Explicit local-command client used by separately supervised filesystem
 /// mount processes to transfer mutation ownership to the main daemon.
@@ -55,8 +140,8 @@ impl DaemonDfsMountedMutationHandoffClient {
         })
     }
 
-    /// Override the one whole-call budget while retaining a finite upper
-    /// bound. The same duration also bounds connection establishment and every
+    /// Override the per-attempt bound while retaining a finite upper bound.
+    /// The same duration also bounds connection establishment and every
     /// interval without stream progress.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, DaemonApiError> {
         if timeout.is_zero() || timeout > DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT {
@@ -84,7 +169,9 @@ impl DaemonDfsMountedMutationHandoffClient {
     }
 
     pub fn probe(&self) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
-        let response = self.call(DaemonDfsMountedMutationHandoffRequest::Probe)?;
+        let response = self
+            .call(DaemonDfsMountedMutationHandoffRequest::Probe)
+            .map_err(DaemonDfsMountedMutationHandoffError::into_api_error)?;
         validate_daemon_dfs_mounted_mutation_handoff_response(
             response,
             crate::DaemonDfsMountedMutationHandoffPhase::Ready,
@@ -93,14 +180,24 @@ impl DaemonDfsMountedMutationHandoffClient {
         )
     }
 
+    /// Ask the daemon to classify the outbox and schedule the recovery it
+    /// finds. Any answer, ready or not, is the acknowledgement: the daemon
+    /// wakes its maintenance when the outbox holds recoverable markers.
+    pub fn wake_recovery(&self) -> Result<(), DaemonDfsMountedMutationHandoffError> {
+        match self.call(DaemonDfsMountedMutationHandoffRequest::Probe) {
+            Ok(_) | Err(DaemonDfsMountedMutationHandoffError::Rejected(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Older daemons only implement the more restrictive installation-wide probe.
     pub fn probe_fuse(&self) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
         let response = match self.call(DaemonDfsMountedMutationHandoffRequest::ProbeFuse) {
             Ok(response) => response,
             // A legacy Ready reply requires an entirely clean outbox. It
             // cannot admit anything that the FUSE-specific probe would fence.
-            Err(DaemonApiError::RemoteService { .. }) => return self.probe(),
-            Err(error) => return Err(error),
+            Err(DaemonDfsMountedMutationHandoffError::Rejected(_)) => return self.probe(),
+            Err(error) => return Err(error.into_api_error()),
         };
         validate_daemon_dfs_mounted_mutation_handoff_response(
             response,
@@ -117,7 +214,7 @@ impl DaemonDfsMountedMutationHandoffClient {
         marker_id: crate::MountedSifsMutationMarkerId,
         marker_nonce: crate::MountedSifsMutationNonce,
         arm_request_id: crate::MountedSifsMutationArmRequestId,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::Arm {
@@ -131,6 +228,7 @@ impl DaemonDfsMountedMutationHandoffClient {
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
         )
+        .map_err(DaemonDfsMountedMutationHandoffError::Rejected)
     }
 
     pub fn commit_applied(
@@ -139,7 +237,7 @@ impl DaemonDfsMountedMutationHandoffClient {
         marker_nonce: crate::MountedSifsMutationNonce,
         arm_request_id: crate::MountedSifsMutationArmRequestId,
         captured_work: crate::MountedSifsMutationCapturedWork,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitApplied {
@@ -154,6 +252,7 @@ impl DaemonDfsMountedMutationHandoffClient {
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
         )
+        .map_err(DaemonDfsMountedMutationHandoffError::Rejected)
     }
 
     /// Preserve an ambiguous mutation error together with every exact work bit
@@ -165,7 +264,7 @@ impl DaemonDfsMountedMutationHandoffClient {
         marker_nonce: crate::MountedSifsMutationNonce,
         arm_request_id: crate::MountedSifsMutationArmRequestId,
         observation: crate::MountedSifsMutationErrorObservation,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
@@ -180,6 +279,7 @@ impl DaemonDfsMountedMutationHandoffClient {
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
         )
+        .map_err(DaemonDfsMountedMutationHandoffError::Rejected)
     }
 
     pub fn prove_no_write(
@@ -188,7 +288,7 @@ impl DaemonDfsMountedMutationHandoffClient {
         marker_nonce: crate::MountedSifsMutationNonce,
         arm_request_id: crate::MountedSifsMutationArmRequestId,
         proof_code: impl Into<String>,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
@@ -203,6 +303,7 @@ impl DaemonDfsMountedMutationHandoffClient {
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
         )
+        .map_err(DaemonDfsMountedMutationHandoffError::Rejected)
     }
 
     /// Abort only a marker whose mutation was positively never started. The
@@ -212,7 +313,7 @@ impl DaemonDfsMountedMutationHandoffClient {
         &self,
         marker_id: crate::MountedSifsMutationMarkerId,
         marker_nonce: crate::MountedSifsMutationNonce,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
         let expected_marker_id = marker_id.clone();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
             marker_id,
@@ -224,13 +325,19 @@ impl DaemonDfsMountedMutationHandoffClient {
             Some(&expected_marker_id),
             None,
         )
+        .map_err(DaemonDfsMountedMutationHandoffError::Rejected)
     }
 
+    /// One attempt at `request`, bounded by this client's per-attempt bound
+    /// and by the calling adapter callback's deadline when that is sooner.
     fn call(
         &self,
         request: DaemonDfsMountedMutationHandoffRequest,
-    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
-        let call = daemon_dfs_mounted_mutation_handoff_call(&request)?;
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonDfsMountedMutationHandoffError> {
+        // A request that cannot be built is never sent, however often.
+        let call = daemon_dfs_mounted_mutation_handoff_call(&request)
+            .map_err(DaemonDfsMountedMutationHandoffError::Rejected)?;
+        let answered = request.clone();
         let data_dir = self.data_dir.clone();
         let address = self.address.clone();
         let timeout = crate::MountedSifsCall::deadline().map_or(self.timeout, |deadline| {
@@ -238,27 +345,37 @@ impl DaemonDfsMountedMutationHandoffClient {
                 .min(deadline.saturating_duration_since(std::time::Instant::now()))
         });
         if timeout.is_zero() {
-            return Err(DaemonApiError::Parse {
-                detail: "mounted filesystem operation deadline expired".into(),
-            });
+            return Err(DaemonDfsMountedMutationHandoffError::Unacknowledged(
+                DaemonApiError::Parse {
+                    detail: "mounted filesystem operation deadline expired".into(),
+                },
+            ));
         }
-        block_on_daemon_client(Box::pin(async move {
-            let runtime = tokio::runtime::Handle::current();
-            let deadline = daemon_api_overall_deadline(Some(timeout));
-            let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
-            run_daemon_api_with_overall_deadline(
-                "mounted-mutation main-daemon handoff",
-                deadline,
-                Box::pin(async move {
-                    call_daemon_address_rpc_async(data_dir, &address, call, options, &runtime)
-                        .await?
-                        .decode_body()
-                        .await
-                        .map_err(Into::into)
-                }),
-            )
-            .await
-        }))
+        let attempt: Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> =
+            block_on_daemon_client(Box::pin(async move {
+                let runtime = tokio::runtime::Handle::current();
+                let deadline = daemon_api_overall_deadline(Some(timeout));
+                let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
+                run_daemon_api_with_overall_deadline(
+                    "mounted-mutation main-daemon handoff",
+                    deadline,
+                    Box::pin(async move {
+                        call_daemon_address_rpc_async(data_dir, &address, call, options, &runtime)
+                            .await?
+                            .decode_body()
+                            .await
+                            .map_err(Into::into)
+                    }),
+                )
+                .await
+            }));
+        let response = attempt.map_err(DaemonDfsMountedMutationHandoffError::from_attempt)?;
+        if response.phase == crate::DaemonDfsMountedMutationHandoffPhase::Busy {
+            return Err(DaemonDfsMountedMutationHandoffError::from_busy_answer(
+                &answered, &response,
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -882,6 +999,88 @@ mod tests {
             daemon_dfs_mounted_mutation_handoff_call(&oversized).expect_err("label length limit");
         assert!(error.to_string().contains("error_code"));
         assert!(error.to_string().contains("max is"));
+    }
+
+    #[test]
+    fn only_a_handlers_definite_answer_is_a_refusal_of_a_handoff_step() {
+        let handler = |detail: String| DaemonApiError::RemoteService {
+            route: DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE.into(),
+            detail,
+        };
+        assert!(
+            DaemonDfsMountedMutationHandoffError::from_attempt(handler(
+                "mounted-mutation host-mount session is not live".into()
+            ))
+            .is_rejected()
+        );
+        // A handler error is a refusal whatever its text says: contention is
+        // a typed answer, never inferred from a message.
+        assert!(
+            DaemonDfsMountedMutationHandoffError::from_attempt(handler(
+                "timed out acquiring mounted-mutation outbox lock /data/outbox.lock".into()
+            ))
+            .is_rejected()
+        );
+        for silence in [
+            DaemonApiError::Network {
+                address: "127.0.0.1:1".into(),
+                detail: "connection refused".into(),
+            },
+            DaemonApiError::UnknownRoute {
+                route: DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE.into(),
+            },
+            DaemonApiError::NetworkDelivery {
+                detail: "attempt ended".into(),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            },
+        ] {
+            assert!(!DaemonDfsMountedMutationHandoffError::from_attempt(silence).is_rejected());
+        }
+    }
+
+    #[test]
+    fn a_busy_answer_for_the_step_is_sent_again_and_one_for_another_is_broken() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let arm = DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce,
+            arm_request_id: arm_request_id.clone(),
+        };
+        let busy = |marker_id, arm_request_id| DaemonDfsMountedMutationHandoffResponse {
+            marker_id,
+            arm_request_id,
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::Busy,
+        };
+        let answered = DaemonDfsMountedMutationHandoffError::from_busy_answer(
+            &arm,
+            &busy(Some(marker_id.clone()), Some(arm_request_id.clone())),
+        );
+        assert!(matches!(
+            answered,
+            DaemonDfsMountedMutationHandoffError::Busy
+        ));
+        assert!(!answered.is_rejected());
+        let other = sinomo_core::Id::derived("test.mounted-mutation.client.arm", b"other");
+        assert!(
+            DaemonDfsMountedMutationHandoffError::from_busy_answer(
+                &arm,
+                &busy(Some(marker_id), Some(other)),
+            )
+            .is_rejected()
+        );
+        // A probe's busy answer names nothing.
+        assert!(matches!(
+            DaemonDfsMountedMutationHandoffError::from_busy_answer(
+                &DaemonDfsMountedMutationHandoffRequest::Probe,
+                &busy(None, None),
+            ),
+            DaemonDfsMountedMutationHandoffError::Busy
+        ));
+        // The wire form of the phase is explicit.
+        assert_eq!(
+            serde_json::to_string(&crate::DaemonDfsMountedMutationHandoffPhase::Busy).unwrap(),
+            "\"busy\""
+        );
     }
 
     #[test]

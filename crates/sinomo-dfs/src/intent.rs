@@ -2,10 +2,71 @@ use sinomo_core::{Id, node::NodeId};
 use time::OffsetDateTime;
 
 use crate::{
-    DfsDistributedError, DfsDistributedWriteCommand, DfsObjectId, DfsObjectMetadata, DfsVersion,
-    DfsWriteIntentRecord, DfsWriteIntentState, DfsWriteIntentStatus, DistributedWriteIntent,
-    content_hash,
+    DfsDistributedError, DfsDistributedWriteCommand, DfsFileSystemId, DfsObjectId,
+    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentState,
+    DfsWriteIntentStatus, DfsWritePublication, DistributedWriteIntent, content_hash,
 };
+
+/// What one write asked for, as its resident intent, its durable intent row
+/// and its sealed prepares each record it. Two records of the same write
+/// agree on it.
+///
+/// The owner epoch is authority, not identity: the primary that owns the
+/// write at a later epoch adopts it at its own epoch. The state and
+/// timestamps are lifecycle, the captured base's replica locations change
+/// with repair, and the desired content targets are placement, which
+/// replacing an unreachable target changes; none of them is part of it.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DfsWriteIdentity<'a> {
+    publication: &'a DfsWritePublication,
+    intent_id: &'a str,
+    file_system_id: &'a DfsFileSystemId,
+    object_id: &'a DfsObjectId,
+    base_version: Option<&'a DfsVersion>,
+    target_version: &'a DfsVersion,
+    coordinator_node_id: &'a NodeId,
+    operation_id: Option<&'a str>,
+    operation_order_token: Option<&'a str>,
+    policy: &'a DfsReplicationPolicy,
+    touch_parent_on_create: bool,
+    create_predecessor_object_id: Option<&'a DfsObjectId>,
+}
+
+impl<'a> DfsWriteIdentity<'a> {
+    pub(crate) fn of_intent(intent: &'a DistributedWriteIntent) -> Self {
+        Self {
+            publication: &intent.publication,
+            intent_id: &intent.intent_id,
+            file_system_id: &intent.file_system_id,
+            object_id: &intent.object_id,
+            base_version: intent.base_version.as_ref(),
+            target_version: &intent.target_version,
+            coordinator_node_id: &intent.requesting_node_id,
+            operation_id: intent.operation_id.as_deref(),
+            operation_order_token: intent.operation_order_token.as_deref(),
+            policy: &intent.policy,
+            touch_parent_on_create: intent.touch_parent_on_create,
+            create_predecessor_object_id: intent.create_predecessor_object_id.as_ref(),
+        }
+    }
+
+    pub(crate) fn of_record(record: &'a DfsWriteIntentRecord) -> Self {
+        Self {
+            publication: &record.publication,
+            intent_id: &record.intent_id,
+            file_system_id: &record.file_system_id,
+            object_id: &record.object_id,
+            base_version: record.base_version.as_ref(),
+            target_version: &record.target_version,
+            coordinator_node_id: &record.coordinator_node_id,
+            operation_id: record.operation_id.as_deref(),
+            operation_order_token: record.operation_order_token.as_deref(),
+            policy: &record.policy,
+            touch_parent_on_create: record.touch_parent_on_create,
+            create_predecessor_object_id: record.create_predecessor_object_id.as_ref(),
+        }
+    }
+}
 
 /// Durable authority-local identity for one caller-owned write operation.
 ///
@@ -137,6 +198,7 @@ pub(crate) fn write_intent_record(
         policy: intent.policy.clone(),
         status: write_intent_status(&intent.state),
         content_hash: content_hash.map(ToOwned::to_owned),
+        content_size_bytes: None,
         object_metadata,
         touch_parent_on_create: intent.touch_parent_on_create,
         create_predecessor_object_id: intent.create_predecessor_object_id.clone(),
@@ -383,6 +445,7 @@ mod stable_operation_tests {
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             status: DfsWriteIntentStatus::Committed,
             content_hash: Some(routed_write_command_content_hash(&original)),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

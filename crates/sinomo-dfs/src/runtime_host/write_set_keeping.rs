@@ -72,7 +72,7 @@ pub(crate) async fn run_dfs_write_set_keeping(
         if !keeping_suspended(&keeper.data_dir) {
             keeper.evaluate();
         } else {
-            super::write_set_takeover::decline_takeover_hand_offs(&keeper.local);
+            keeper.decline_hand_offs();
         }
         #[cfg(any(test, feature = "test-support"))]
         let test_wake = test_control.notified();
@@ -238,7 +238,7 @@ impl Keeper {
             .map(<[_]>::to_vec)
         else {
             // A hand-off asker waits without a deadline: answer it now.
-            super::write_set_takeover::decline_takeover_hand_offs(&self.local);
+            self.decline_hand_offs();
             return;
         };
         let mut unreachable_primaries = BTreeSet::new();
@@ -319,11 +319,6 @@ impl Keeper {
         }
         self.retire_reached_member_fences(&entries, &member_shards);
         let takeover_shards = takeover_shards(&entries, &member_shards);
-        // A hand-off needs only the record, never the member facts below, so
-        // it is answered on every evaluation.
-        for (hand_off, reply) in super::write_set_takeover::take_takeover_hand_offs(&self.local) {
-            self.takeover.hand_off(&takeover_shards, hand_off, reply);
-        }
         // Network verdicts are needed only while this node is primary of a
         // switched shard, or a write-set member that may take one over: an
         // unswitched shard is never shrunk, re-added, recruited for or taken
@@ -347,9 +342,21 @@ impl Keeper {
         record_test_reachability_interest(&self.data_dir.root(), keeps_switched_shard);
         self.verdicts.retain(keeps_switched_shard);
         let verdicts = self.verdicts.current();
+        let members = cluster_member_facts(&snapshot);
+        // A hand-off needs the record and this node's verdict for the
+        // primary, never the member facts below, so it is judged on every
+        // evaluation: it runs, is declined, or waits for the network to
+        // finish examining the primary.
+        self.takeover.hand_offs(
+            &takeover_shards,
+            members.as_ref(),
+            &verdicts,
+            &mut self.verdicts,
+            super::write_set_takeover::take_takeover_hand_offs(&self.local),
+        );
         // Without the cluster scopes no member can be judged; the publication
         // that carries them wakes the keeper again.
-        let Some(members) = cluster_member_facts(&snapshot) else {
+        let Some(members) = members else {
             return;
         };
         self.verdicts
@@ -372,6 +379,13 @@ impl Keeper {
         for (key, (shard, shards)) in primary_shards {
             self.evaluate_shard(&key, &shard, &shards, &snapshot, &entries, &members, &verdicts);
         }
+    }
+
+    /// Answer every hand-off this keeper cannot judge now: the ones posted
+    /// for it and the ones waiting on an examination.
+    fn decline_hand_offs(&mut self) {
+        super::write_set_takeover::decline_takeover_hand_offs(&self.local);
+        self.takeover.decline_waiting_hand_offs();
     }
 
     fn complete_takeover(&mut self, completion: super::write_set_takeover::TakeoverCompletion) {
@@ -1566,13 +1580,22 @@ mod test_control {
         WAKE.notify_waiters();
     }
 
-    /// Settle a verification episode of `peer` for `root` with `verdict`.
+    /// Settle a verification episode of `peer` for `root` whose own probe
+    /// concluded with `verdict`.
     pub(crate) fn settle_test_peer_verification(
         root: PathBuf,
         peer: NodeId,
         verdict: PeerPathVerdict,
     ) {
         super::super::peer_verdicts::test_seam::settle_peer_verification(root, peer, verdict);
+        WAKE.notify_waiters();
+    }
+
+    /// End a verification episode of `peer` for `root` that concluded
+    /// nothing, as a cancelled or inconclusive one does, or one with nothing
+    /// to dial.
+    pub(crate) fn end_test_peer_verification_unconcluded(root: PathBuf, peer: NodeId) {
+        super::super::peer_verdicts::test_seam::end_peer_verification_unconcluded(root, peer);
         WAKE.notify_waiters();
     }
 

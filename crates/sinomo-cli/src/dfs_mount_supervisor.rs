@@ -609,10 +609,7 @@ impl ActiveMount {
                 mount_point,
             } => {
                 if !handle.as_ref().is_some_and(|handle| handle.is_active()) {
-                    return Err(handle
-                        .as_ref()
-                        .and_then(|handle| handle.fatal_error())
-                        .unwrap_or_else(|| "Unix FUSE mount stopped".to_string()));
+                    return Err("Unix FUSE mount stopped".to_string());
                 }
                 let mut status = starting_status(config, mount_point, daemon_pid, restart_count);
                 status.phase = SifsMountRuntimePhase::Mounted;

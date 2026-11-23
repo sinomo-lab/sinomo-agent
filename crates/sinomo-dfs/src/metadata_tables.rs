@@ -1606,37 +1606,43 @@ impl DfsMetadataTables {
         self.namespace_prepare_path_owners = path_owners;
     }
 
-    fn namespace_prepare_request_key(
+    /// Every request a prepare's effects admit or complete: its completed
+    /// request attachment, and each request row it puts. A request's row
+    /// prepares are its admission, so a retry finds them as it finds the
+    /// prepare that completes it.
+    fn namespace_prepare_request_keys(
         prepare: &DfsPreparedOperationRecord,
-    ) -> Option<(NodeId, String)> {
-        prepare
-            .completed_request
-            .as_ref()
-            .map(|request| {
-                (
+    ) -> BTreeSet<(NodeId, String)> {
+        let mut keys = BTreeSet::new();
+        if let Some(request) = prepare.completed_request.as_ref() {
+            keys.insert((
+                request.requester_node_id.clone(),
+                request.request_id.clone(),
+            ));
+        } else if let Some(completion) = prepare.completed_request_completion.as_ref() {
+            keys.insert(completion.request_key());
+        }
+        for effect in &prepare.payload.metadata_effects {
+            if let crate::DfsPreparedMetadataEffect::PutNamespaceRequest { request } = effect {
+                keys.insert((
                     request.requester_node_id.clone(),
                     request.request_id.clone(),
-                )
-            })
-            .or_else(|| {
-                prepare
-                    .completed_request_completion
-                    .as_ref()
-                    .map(|completion| completion.request_key())
-            })
+                ));
+            }
+        }
+        keys
     }
 
     fn index_namespace_prepare_request(&mut self, prepare: &DfsPreparedOperationRecord) {
         if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
-        let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
-            return;
-        };
-        self.namespace_prepare_request_owners
-            .entry(request_key)
-            .or_default()
-            .insert(prepare.operation_id.clone());
+        for request_key in Self::namespace_prepare_request_keys(prepare) {
+            self.namespace_prepare_request_owners
+                .entry(request_key)
+                .or_default()
+                .insert(prepare.operation_id.clone());
+        }
     }
 
     fn namespace_prepare_request_index_from_history(
@@ -1647,13 +1653,12 @@ impl DfsMetadataTables {
             .values()
             .filter(|prepare| prepare.status == DfsPreparedOperationStatus::Prepared)
         {
-            let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
-                continue;
-            };
-            request_owners
-                .entry(request_key)
-                .or_default()
-                .insert(prepare.operation_id.clone());
+            for request_key in Self::namespace_prepare_request_keys(prepare) {
+                request_owners
+                    .entry(request_key)
+                    .or_default()
+                    .insert(prepare.operation_id.clone());
+            }
         }
         request_owners
     }
@@ -1662,29 +1667,32 @@ impl DfsMetadataTables {
         if prepare.status != DfsPreparedOperationStatus::Prepared {
             return;
         }
-        let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
-            return;
-        };
-        let remove_request = self
-            .namespace_prepare_request_owners
-            .get_mut(&request_key)
-            .is_some_and(|owners| {
-                owners.remove(&prepare.operation_id);
-                owners.is_empty()
-            });
-        if remove_request {
-            self.namespace_prepare_request_owners.remove(&request_key);
+        for request_key in Self::namespace_prepare_request_keys(prepare) {
+            let remove_request = self
+                .namespace_prepare_request_owners
+                .get_mut(&request_key)
+                .is_some_and(|owners| {
+                    owners.remove(&prepare.operation_id);
+                    owners.is_empty()
+                });
+            if remove_request {
+                self.namespace_prepare_request_owners.remove(&request_key);
+            }
         }
     }
 
-    pub(crate) fn prepared_operation_for_request(
+    /// The live prepares of one request, in journal order: its row
+    /// prepares, then the prepare that completes it. A prepare that another
+    /// of them supersedes is not live. Two live prepares that would each
+    /// complete the request compete, which no admission produces.
+    pub(crate) fn prepared_operations_for_request(
         &self,
         requester: &NodeId,
         request_id: &str,
-    ) -> Result<Option<&DfsPreparedOperationRecord>> {
+    ) -> Result<Vec<&DfsPreparedOperationRecord>> {
         let key = (requester.clone(), request_id.to_owned());
         let Some(ids) = self.namespace_prepare_request_owners.get(&key) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let records = ids
             .iter()
@@ -1696,17 +1704,30 @@ impl DfsMetadataTables {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let live = records.iter().copied().filter(|record| !records.iter().any(|replacement| {
+        let mut live = records.iter().copied().filter(|record| !records.iter().any(|replacement| {
             replacement.payload.metadata_effects.iter().any(|effect| matches!(effect,
                 crate::DfsPreparedMetadataEffect::ResolvePreparedOperation { digest, status: DfsPreparedOperationStatus::Superseded }
                 if digest == &record.digest))
         })).collect::<Vec<_>>();
-        match live.as_slice() {
-            [record] => Ok(Some(*record)),
-            _ => Err(MetadataBackendError::Serde(
-                "request has competing or cyclic prepared reservations".into(),
-            )),
+        if live.is_empty() {
+            return Err(MetadataBackendError::Serde(
+                "request has cyclic prepared reservations".into(),
+            ));
         }
+        if live
+            .iter()
+            .filter(|record| {
+                record.completed_request.is_some() || record.completed_request_completion.is_some()
+            })
+            .count()
+            > 1
+        {
+            return Err(MetadataBackendError::Serde(
+                "request has competing prepared completions".into(),
+            ));
+        }
+        live.sort_by_key(|record| record.digest.prepare_sequence);
+        Ok(live)
     }
 
     fn rebuild_namespace_prepare_request_index(&mut self) {
@@ -3555,6 +3576,7 @@ mod intent_index_rollback_tests {
             policy: DfsReplicationPolicy::new(1, 1).unwrap(),
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some(crate::content_hash(b"rollback index fixture")),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

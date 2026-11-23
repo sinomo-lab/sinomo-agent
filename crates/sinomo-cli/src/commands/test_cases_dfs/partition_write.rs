@@ -526,6 +526,7 @@ mod original_pending_guard_tests {
             policy,
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some(hash.clone()),
+            content_size_bytes: None,
             object_metadata: Some(object.clone()),
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

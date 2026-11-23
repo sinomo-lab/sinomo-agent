@@ -294,37 +294,76 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "pending write abort changed its original stable intent binding".into(),
             });
         }
-        let response = self
-            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-                format!(
-                    "abort:{}",
-                    blake3::hash(actual_intent_id.as_bytes()).to_hex()
-                ),
-                command.request.file_system_id.clone(),
-                shard.primary_node_id,
-                DfsNamespaceOperation::AbortPendingWrite {
-                    path: object.path,
-                    object_id: command.request.object_id.clone(),
-                    target_version: command.request.target_version.clone(),
-                    intent_id: actual_intent_id.clone(),
-                    write_operation_id: command.request_id.clone(),
-                },
-                crate::DFS_NO_CALLER_BUDGET,
-                false,
-                false,
-            )?;
-        let intent = match (response.result, response.posix_coordination_result) {
-            (
-                DfsNamespaceResult::Applied,
-                Some(DfsPosixCoordinationResult::AbortedWriteIntent(intent)),
-            ) => *intent,
-            (DfsNamespaceResult::Rejected { reason, .. }, _) => {
-                return Err(DfsError::Distributed { message: reason });
+        // The abort's id derives from the intent it closes, so every attempt
+        // of every call is the same request. The primary answers a repeat
+        // with the aborted intent it recorded.
+        let abort_id = format!(
+            "abort:{}",
+            blake3::hash(actual_intent_id.as_bytes()).to_hex()
+        );
+        let operation = DfsNamespaceOperation::AbortPendingWrite {
+            path: object.path,
+            object_id: command.request.object_id.clone(),
+            target_version: command.request.target_version.clone(),
+            intent_id: actual_intent_id.clone(),
+            write_operation_id: command.request_id.clone(),
+        };
+        let followed = self.route_namespace_following_record(
+            &abort_id,
+            &command.request.file_system_id,
+            shard.primary_node_id,
+            &operation,
+            crate::DFS_NO_CALLER_BUDGET,
+            false,
+            false,
+        )?;
+        let intent = match followed {
+            crate::service_record_follow::DfsFollowedNamespaceRoute::Settled(response) => {
+                match (response.result, response.posix_coordination_result) {
+                    (
+                        DfsNamespaceResult::Applied,
+                        Some(DfsPosixCoordinationResult::AbortedWriteIntent(intent)),
+                    ) => *intent,
+                    (
+                        DfsNamespaceResult::Rejected {
+                            reason,
+                            posix_error:
+                                posix_error @ Some(DfsNamespacePosixError::CommitOutcomeUnknown {
+                                    ..
+                                }),
+                            ..
+                        },
+                        _,
+                    ) => {
+                        // Still unknown when the caller's budget ended.
+                        return Err(
+                            crate::service_routed_namespace::dfs_error_from_posix_namespace_sync(
+                                crate::posix_model::posix_error_for_namespace_rejection(
+                                    reason,
+                                    posix_error,
+                                ),
+                            ),
+                        );
+                    }
+                    (DfsNamespaceResult::Rejected { reason, .. }, _) => {
+                        return Err(DfsError::Distributed { message: reason });
+                    }
+                    _ => {
+                        return Err(DfsError::Distributed {
+                            message: "write abort lacks its actual typed durable intent outcome"
+                                .into(),
+                        });
+                    }
+                }
             }
-            _ => {
-                return Err(DfsError::Distributed {
-                    message: "write abort lacks its actual typed durable intent outcome".into(),
-                });
+            // Authority moved to this node: it closes the intent itself.
+            crate::service_record_follow::DfsFollowedNamespaceRoute::LocalAuthority => {
+                let requester = self.node_id.clone();
+                self.abort_routed_pending_write(
+                    &requester,
+                    &command.request.file_system_id,
+                    &operation,
+                )?
             }
         };
         if intent.state != DfsWriteIntentState::Aborted

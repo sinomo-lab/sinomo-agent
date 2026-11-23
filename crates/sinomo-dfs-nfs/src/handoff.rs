@@ -3,6 +3,13 @@
 //! NFS is a long-lived mounted client, not a second daemon. Clustered reads may
 //! ingest authoritative namespace journals and writes may commit DFS work, so
 //! the same outbox/daemon handoff used by FUSE and Cloud Files is mandatory.
+//!
+//! The export is never fenced. A handoff step the daemon has not answered is
+//! sent again until it is acknowledged, by the request while its operation
+//! budget lasts and by the export's re-sender afterwards. A step the daemon
+//! definitely refused ends its request with `NFS3ERR_IO` and releases the
+//! marker. Sending, re-sending and the re-sender are the shared
+//! [`dfs::MountedSifsMutationHandoff`].
 
 use crate::{DfsNfsError, Result};
 use sinomo_api::DaemonApiClient;
@@ -10,20 +17,26 @@ use sinomo_api::DaemonPaths;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_dfs as dfs;
 use sinomo_dfs::DaemonDfsMountedMutationHandoffClient;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
+use std::time::Instant;
+
+type ServiceLock = dfs::MountedSifsLock<dfs::MountedSifsService>;
 
 #[derive(Debug)]
 pub(crate) struct NfsMountedMutationHandoff {
-    store: dfs::MountedSifsMutationOutboxStore,
-    session: Option<dfs::MountedSifsHostMountSessionLease>,
-    client: DaemonDfsMountedMutationHandoffClient,
-    gated: AtomicBool,
-    lane: Mutex<()>,
+    handoff: dfs::MountedSifsMutationHandoff,
+    /// Mutations hand their work to the daemon in the order they ran.
+    lane: dfs::MountedSifsLock<()>,
 }
 
 impl NfsMountedMutationHandoff {
-    pub(crate) fn open(data_dir: &SinomoDataDir, mount_identity: String) -> Result<Self> {
+    /// Open the export's handoff. `closing` is the export's own departure:
+    /// once it fires, no wait for the daemon goes on.
+    pub(crate) fn open(
+        data_dir: &SinomoDataDir,
+        mount_identity: String,
+        closing: &dfs::DfsCancellationFlag,
+    ) -> Result<Self> {
         let daemon = DaemonApiClient::connect_for_paths(&DaemonPaths::new(data_dir))
             .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
         let client = DaemonDfsMountedMutationHandoffClient::new(
@@ -39,150 +52,194 @@ impl NfsMountedMutationHandoff {
         let session = store
             .open_host_mount_session(dfs::MountedSifsMutationAdapter::Nfs, mount_identity)
             .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
+        Self::start(store, session, Arc::new(client), closing)
+    }
+
+    fn start(
+        store: dfs::MountedSifsMutationOutboxStore,
+        session: dfs::MountedSifsHostMountSessionLease,
+        daemon: Arc<dyn dfs::MountedSifsHandoffDaemon>,
+        closing: &dfs::DfsCancellationFlag,
+    ) -> Result<Self> {
+        let handoff = dfs::MountedSifsMutationHandoff::start(store, session, daemon, Some(closing))
+            .map_err(|source| {
+                DfsNfsError::Dfs(format!("start NFS mounted handoff worker: {source}"))
+            })?;
         Ok(Self {
-            store,
-            session: Some(session),
-            client,
-            gated: AtomicBool::new(false),
-            lane: Mutex::new(()),
+            handoff,
+            lane: dfs::MountedSifsLock::new(()),
         })
     }
 
-    pub(crate) fn is_gated(&self) -> bool {
-        self.gated.load(Ordering::Acquire)
-    }
-
-    fn gate(&self, detail: &str) {
-        self.gated.store(true, Ordering::Release);
-        tracing::error!(target: "sinomo.dfs.nfs", detail, "NFS mounted mutation was fenced");
-    }
-
-    fn admit(&self) -> Result<MutexGuard<'_, ()>> {
-        dfs::MountedSifsCall::lock(&self.lane)
-            .map_err(|_| DfsNfsError::Dfs("NFS mounted-mutation lane is poisoned".to_string()))
-    }
-
-    fn session(&self) -> Result<&dfs::MountedSifsHostMountSessionLease> {
-        self.session
-            .as_ref()
-            .ok_or_else(|| DfsNfsError::Dfs("NFS mounted-mutation session is closed".to_string()))
-    }
-
-    fn prepare(
-        &self,
-        operation: &'static str,
-        stable_operation_id: Option<String>,
-    ) -> Result<dfs::MountedSifsMutationLease<'_>> {
-        self.store
-            .prepare(self.session()?, stable_operation_id, operation)
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))
-    }
-
-    fn arm(
-        &self,
-        lease: &dfs::MountedSifsMutationLease<'_>,
-    ) -> Result<dfs::MountedSifsMutationArmRequestId> {
-        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
-        let marker = lease.marker();
-        // Prepare created a durable obligation. Arm runs under the handoff
-        // client's own timeout even if the NFS caller has already left.
-        dfs::MountedSifsCall::finish_handoff(|| {
-            self.client.arm(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-            )
+    fn admit(&self) -> Result<dfs::MountedSifsLockGuard<'_, ()>> {
+        dfs::MountedSifsCall::lock(&self.lane).map_err(|source| {
+            DfsNfsError::Dfs(format!(
+                "NFS mounted-mutation lane was not entered: {source}"
+            ))
         })
-        .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        Ok(arm_request_id)
     }
 
+    /// Open the export's service inside its first handoff. The export is not
+    /// serving yet: a step the daemon does not acknowledge fails the open
+    /// instead of being sent again, and the marker is left to recovery.
     pub(crate) fn run_mount_open<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
         let _admission = self.admit()?;
-        if self.is_gated() {
-            return Err(DfsNfsError::Dfs(
-                "NFS mounted-mutation handoff is fenced".to_string(),
-            ));
-        }
-        let lease = self.prepare("nfs.mount-open", None)?;
-        let arm_request_id = self.arm(&lease)?;
+        let mut lease = self
+            .handoff
+            .prepare("nfs.mount-open", None)
+            .map_err(step_error)?;
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        self.handoff
+            .arm(&lease, &arm_request_id)
+            .map_err(step_error)?;
         let opened = match open() {
             Ok(opened) => opened,
             Err(error) => {
-                self.gate("mounted SIFS service failed to open after NFS Arm");
+                // Full daemon recovery is the evidence-preserving fallback.
                 let captured =
                     dfs::MountedSifsMutationCapturedWork::new(mount_open_committed_work());
-                let observation = dfs::MountedSifsMutationErrorObservation::new(
+                if let Ok(observation) = dfs::MountedSifsMutationErrorObservation::new(
                     captured,
                     "nfs-mount-open-service-error",
-                )
-                .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-                self.finish_unknown(lease, &arm_request_id, &observation)?;
+                ) && self
+                    .handoff
+                    .persist_unknown(&mut lease, &arm_request_id, &observation)
+                    .and_then(|()| {
+                        self.handoff
+                            .commit_unknown(&lease, &arm_request_id, &observation)
+                    })
+                    .is_ok()
+                {
+                    let _ = self.handoff.release_after_daemon_ack(lease);
+                }
                 return Err(error);
             }
         };
         let captured = dfs::MountedSifsMutationCapturedWork::new(mount_open_committed_work());
-        if let Err(error) = self.finish_captured(lease, &arm_request_id, &captured) {
-            self.gate("daemon rejected NFS mount-open committed work");
-            return Err(error);
-        }
+        self.handoff
+            .persist_captured(&mut lease, &arm_request_id, &captured)
+            .and_then(|()| {
+                self.handoff
+                    .commit_captured(&lease, &arm_request_id, &captured)
+            })
+            .map_err(step_error)?;
+        self.handoff
+            .release_after_daemon_ack(lease)
+            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
         Ok(opened)
     }
 
+    /// Run one mutation of a serving export inside its handoff.
+    ///
+    /// The request's operation budget, when the export has one, bounds every
+    /// wait here. A step still unacknowledged at that deadline moves to the
+    /// export's re-sender and the request ends with an I/O error; the export
+    /// keeps serving. The service lock is held only while the mutation runs,
+    /// never across a wait for the daemon.
+    ///
+    /// A run that hands back a wait for a newer shard record runs again after
+    /// that wait, which the request makes holding neither the service lock
+    /// nor its mutation admission. The marker stays armed across the runs, so
+    /// a waiting request writes nothing to the outbox: the daemon is handed
+    /// the work of every run once, when the request ends.
     pub(crate) fn run_operation<R>(
         &self,
         operation: &'static str,
         stable_operation_id: Option<String>,
-        service: &Mutex<dfs::MountedSifsService>,
-        mutation: impl FnOnce(
+        service: &ServiceLock,
+        mut mutation: impl FnMut(
             &mut dfs::MountedSifsService,
         ) -> std::result::Result<R, dfs::DfsPosixError>,
     ) -> std::result::Result<R, dfs::DfsPosixError> {
-        let _admission = self.admit().map_err(handoff_posix_error)?;
-        if self.is_gated() {
-            return Err(handoff_posix_error(DfsNfsError::Dfs(
-                "NFS mounted-mutation handoff is fenced".to_string(),
-            )));
-        }
-        let lease = self
-            .prepare(operation, stable_operation_id)
-            .map_err(handoff_posix_error)?;
-        let arm_request_id = self.arm(&lease).map_err(|error| {
-            self.gate("daemon did not acknowledge NFS Arm");
-            handoff_posix_error(error)
-        })?;
-        let report = {
-            let mut service = match dfs::MountedSifsCall::lock_service(service) {
-                Ok(service) => service,
-                Err(error) => {
-                    dfs::MountedSifsCall::finish_handoff(|| {
-                        self.finish_no_write(lease, &arm_request_id, "nfs-service-not-entered")
-                    })
-                    .map_err(|failure| {
-                        self.gate("daemon did not acknowledge NFS no-write proof");
-                        handoff_posix_error(failure)
-                    })?;
-                    return Err(handoff_posix_error(DfsNfsError::Dfs(error.to_string())));
+        let deadline = dfs::MountedSifsCall::deadline();
+        let mut admission = Some(self.admit().map_err(handoff_posix_error)?);
+        // A full outbox is not a refusal: wait for a marker's release.
+        let mut prepared = None;
+        let mut stable_operation_id = Some(stable_operation_id);
+        self.handoff
+            .until_acknowledged(deadline, || {
+                let id = stable_operation_id.take().unwrap_or_default();
+                match self.handoff.prepare(operation, id.clone()) {
+                    Ok(lease) => {
+                        prepared = Some(lease);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        stable_operation_id = Some(id);
+                        Err(error)
+                    }
                 }
-            };
-            service.capture_mounted_mutation(mutation)
+            })
+            .map_err(|ended| ended_error("Prepare", ended))?;
+        let lease = prepared.expect("an acknowledged Prepare returned its lease");
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        match self
+            .handoff
+            .until_acknowledged(deadline, || self.handoff.arm(&lease, &arm_request_id))
+        {
+            Ok(()) => {}
+            Err(dfs::MountedSifsHandoffEnded::Left) => {
+                // The daemon may hold the Arm. The mutation never enters the
+                // service; the marker is closed once the daemon answers.
+                self.handoff.finish_later(
+                    lease,
+                    dfs::MountedSifsUnfinishedHandoff::ArmedWithoutEntry { arm_request_id },
+                );
+                return Err(ended_error("Arm", dfs::MountedSifsHandoffEnded::Left));
+            }
+            Err(ended @ dfs::MountedSifsHandoffEnded::Rejected(_)) => {
+                // The daemon refused the Arm, so the mutation never runs.
+                self.release_unstarted(lease, deadline);
+                return Err(ended_error("Arm", ended));
+            }
+        }
+        let mut entered = match dfs::MountedSifsCall::lock_service(service) {
+            Ok(service) => service,
+            Err(error) => {
+                self.finish_no_write(lease, &arm_request_id, "nfs-service-not-entered", deadline)?;
+                return Err(handoff_posix_error(DfsNfsError::Dfs(error.to_string())));
+            }
         };
-        let captured = dfs::MountedSifsMutationCapturedWork::new(report.committed_work);
-        dfs::MountedSifsCall::finish_handoff(|| match report.outcome {
+        let mut replay = dfs::MountedSifsCallReplay::new();
+        let mut committed_work = dfs::DfsCommittedWork::default();
+        let outcome = loop {
+            let report =
+                entered.capture_mounted_mutation(|service| replay.run(service, &mut mutation));
+            drop(entered);
+            committed_work.merge(report.committed_work);
+            let Some(wait) = replay.take_record_wait() else {
+                break report.outcome;
+            };
+            drop(admission.take());
+            wait.wait();
+            let reentered = self.admit().and_then(|admitted| {
+                dfs::MountedSifsCall::lock_service(service)
+                    .map(|service| (admitted, service))
+                    .map_err(|error| DfsNfsError::Dfs(error.to_string()))
+            });
+            match reentered {
+                Ok((admitted, service)) => {
+                    admission = Some(admitted);
+                    entered = service;
+                }
+                // The runs before may have written: what they left is handed
+                // to the daemon as observed.
+                Err(error) => break Err(handoff_posix_error(error)),
+            }
+        };
+        let captured = dfs::MountedSifsMutationCapturedWork::new(committed_work);
+        match outcome {
             Ok(value) => {
-                self.finish_captured(lease, &arm_request_id, &captured)
-                    .map_err(|error| {
-                        self.gate("daemon rejected captured NFS mutation work");
-                        handoff_posix_error(error)
-                    })?;
+                self.finish_captured(lease, &arm_request_id, captured, deadline)?;
                 Ok(value)
             }
             Err(error) if positive_no_write_error(&error) && capture_is_empty(&captured) => {
-                self.finish_no_write(lease, &arm_request_id, "nfs-typed-error-before-write")
-                    .map_err(|handoff_error| {
-                        self.gate("daemon rejected NFS no-write proof");
-                        handoff_posix_error(handoff_error)
-                    })?;
+                self.finish_no_write(
+                    lease,
+                    &arm_request_id,
+                    "nfs-typed-error-before-write",
+                    deadline,
+                )?;
                 Err(error)
             }
             Err(error) => {
@@ -194,60 +251,89 @@ impl NfsMountedMutationHandoff {
                         .map_err(|source| {
                             handoff_posix_error(DfsNfsError::Dfs(source.to_string()))
                         })?;
-                self.finish_unknown(lease, &arm_request_id, &observation)
-                    .map_err(|handoff_error| {
-                        self.gate("daemon did not acknowledge the NFS error observation");
-                        handoff_posix_error(handoff_error)
-                    })?;
+                self.finish_unknown(lease, &arm_request_id, observation, deadline)?;
                 Err(error)
             }
-        })
+        }
+    }
+
+    /// Close a marker whose Arm the daemon definitely refused: its mutation
+    /// never ran, so the marker is aborted as unstarted.
+    fn release_unstarted(
+        &self,
+        lease: dfs::MountedSifsMutationLease<'_>,
+        deadline: Option<Instant>,
+    ) {
+        match self
+            .handoff
+            .until_acknowledged(deadline, || self.handoff.abort_unstarted(&lease))
+        {
+            Ok(()) => {
+                let _ = self.handoff.release_after_daemon_ack(lease);
+            }
+            Err(dfs::MountedSifsHandoffEnded::Left) => self
+                .handoff
+                .finish_later(lease, dfs::MountedSifsUnfinishedHandoff::Unstarted),
+            Err(dfs::MountedSifsHandoffEnded::Rejected(detail)) => {
+                self.handoff.release_refused(lease, &detail);
+            }
+        }
     }
 
     fn finish_captured(
         &self,
         mut lease: dfs::MountedSifsMutationLease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
-        captured: &dfs::MountedSifsMutationCapturedWork,
-    ) -> Result<()> {
-        lease
-            .record_captured_success(arm_request_id, captured.clone())
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        let marker = lease.marker();
-        self.client
-            .commit_applied(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                captured.clone(),
-            )
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        lease
-            .release_after_daemon_ack()
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))
+        captured: dfs::MountedSifsMutationCapturedWork,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(), dfs::DfsPosixError> {
+        let mut persisted = false;
+        let ended = self.handoff.until_acknowledged(deadline, || {
+            if !persisted {
+                self.handoff
+                    .persist_captured(&mut lease, arm_request_id, &captured)?;
+                persisted = true;
+            }
+            self.handoff
+                .commit_captured(&lease, arm_request_id, &captured)
+        });
+        self.finish(
+            lease,
+            ended,
+            "captured work",
+            dfs::MountedSifsUnfinishedHandoff::Captured {
+                arm_request_id: arm_request_id.clone(),
+                captured_work: captured,
+            },
+        )
     }
 
     fn finish_unknown(
         &self,
         mut lease: dfs::MountedSifsMutationLease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
-        observation: &dfs::MountedSifsMutationErrorObservation,
-    ) -> Result<()> {
-        lease
-            .record_unknown_after_error(arm_request_id, observation.clone())
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        let marker = lease.marker();
-        self.client
-            .commit_unknown(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                observation.clone(),
-            )
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        lease
-            .release_after_daemon_ack()
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))
+        observation: dfs::MountedSifsMutationErrorObservation,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(), dfs::DfsPosixError> {
+        let mut persisted = false;
+        let ended = self.handoff.until_acknowledged(deadline, || {
+            if !persisted {
+                self.handoff
+                    .persist_unknown(&mut lease, arm_request_id, &observation)?;
+                persisted = true;
+            }
+            self.handoff
+                .commit_unknown(&lease, arm_request_id, &observation)
+        });
+        self.finish(
+            lease,
+            ended,
+            "error observation",
+            dfs::MountedSifsUnfinishedHandoff::Unknown {
+                arm_request_id: arm_request_id.clone(),
+                observation,
+            },
+        )
     }
 
     fn finish_no_write(
@@ -255,32 +341,54 @@ impl NfsMountedMutationHandoff {
         mut lease: dfs::MountedSifsMutationLease<'_>,
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         proof_code: &'static str,
-    ) -> Result<()> {
-        lease
-            .record_proven_no_write(arm_request_id, proof_code)
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        let marker = lease.marker();
-        self.client
-            .prove_no_write(
-                marker.marker_id.clone(),
-                marker.marker_nonce.clone(),
-                arm_request_id.clone(),
-                proof_code,
-            )
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-        lease
-            .release_after_daemon_ack()
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(), dfs::DfsPosixError> {
+        let mut persisted = false;
+        let ended = self.handoff.until_acknowledged(deadline, || {
+            if !persisted {
+                self.handoff
+                    .persist_proven_no_write(&mut lease, arm_request_id, proof_code)?;
+                persisted = true;
+            }
+            self.handoff
+                .commit_proven_no_write(&lease, arm_request_id, proof_code)
+        });
+        self.finish(
+            lease,
+            ended,
+            "no-write proof",
+            dfs::MountedSifsUnfinishedHandoff::NoWrite {
+                arm_request_id: arm_request_id.clone(),
+                proof_code: proof_code.to_string(),
+            },
+        )
     }
-}
 
-impl Drop for NfsMountedMutationHandoff {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.take()
-            && let Err(error) = session.close_clean()
-        {
-            self.gated.store(true, Ordering::Release);
-            tracing::error!(target: "sinomo.dfs.nfs", %error, "failed to close NFS mount session");
+    /// End one closing step: release an acknowledged marker, hand a step
+    /// that outlived its request to the re-sender, or give up a refused one.
+    fn finish(
+        &self,
+        lease: dfs::MountedSifsMutationLease<'_>,
+        ended: std::result::Result<(), dfs::MountedSifsHandoffEnded>,
+        step: &'static str,
+        unfinished: dfs::MountedSifsUnfinishedHandoff,
+    ) -> std::result::Result<(), dfs::DfsPosixError> {
+        match ended {
+            Ok(()) => self
+                .handoff
+                .release_after_daemon_ack(lease)
+                .map_err(|source| handoff_posix_error(DfsNfsError::Dfs(source.to_string()))),
+            Err(dfs::MountedSifsHandoffEnded::Left) => {
+                self.handoff.finish_later(lease, unfinished);
+                Err(ended_error(step, dfs::MountedSifsHandoffEnded::Left))
+            }
+            Err(dfs::MountedSifsHandoffEnded::Rejected(detail)) => {
+                self.handoff.release_refused(lease, &detail);
+                Err(ended_error(
+                    step,
+                    dfs::MountedSifsHandoffEnded::Rejected(detail),
+                ))
+            }
         }
     }
 }
@@ -342,43 +450,22 @@ fn handoff_posix_error(error: DfsNfsError) -> dfs::DfsPosixError {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::TcpListener;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_prepared_arm_still_reaches_main_when_the_request_budget_expires() {
-        let dir = sinomo_testdir::TestDir::new("nfs-prepared-arm-budget");
-        let data = SinomoDataDir::new(dir.path());
-        let store = dfs::MountedSifsMutationOutboxStore::new(&data).unwrap();
-        let session = store
-            .open_host_mount_session(dfs::MountedSifsMutationAdapter::Nfs, "nfs:test")
-            .unwrap();
-        let peer = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        peer.set_nonblocking(true).unwrap();
-        let client = DaemonDfsMountedMutationHandoffClient::new(
-            data,
-            peer.local_addr().unwrap().to_string(),
-        )
-        .unwrap()
-        .with_timeout(Duration::from_millis(250))
-        .unwrap();
-        let handoff = NfsMountedMutationHandoff {
-            store,
-            session: Some(session),
-            client,
-            gated: AtomicBool::new(false),
-            lane: Mutex::new(()),
-        };
-        let lease = handoff.prepare("nfs.mkdir", None).unwrap();
-        let deadline = Instant::now();
-        let _call = dfs::MountedSifsCall::enter(Some(deadline));
-        // The listener deliberately withholds the acknowledgement. The worker
-        // must contact it, and must still refuse to enter the mutation.
-        assert!(handoff.arm(&lease).is_err());
-        assert!(peer.accept().is_ok(), "the prepared Arm was never sent");
-        assert_eq!(dfs::MountedSifsCall::deadline(), Some(deadline));
-    }
+fn step_error(error: dfs::MountedSifsHandoffStepError) -> DfsNfsError {
+    DfsNfsError::Dfs(format!("NFS mounted-mutation {error}"))
 }
+
+/// The request's answer when a handoff step ended without the daemon's
+/// acknowledgement. Both endings are an I/O error to the NFS client.
+fn ended_error(step: &'static str, ended: dfs::MountedSifsHandoffEnded) -> dfs::DfsPosixError {
+    handoff_posix_error(DfsNfsError::Dfs(match ended {
+        dfs::MountedSifsHandoffEnded::Left => {
+            format!("the daemon has not acknowledged the NFS {step} handoff step")
+        }
+        dfs::MountedSifsHandoffEnded::Rejected(detail) => {
+            format!("the daemon refused the NFS {step} handoff step: {detail}")
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests;

@@ -469,6 +469,12 @@ pub struct DfsWriteIntentRecord {
     pub status: DfsWriteIntentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Size of the content `content_hash` names, recorded when the write
+    /// opens, so the primary that owns the write builds its transfer from
+    /// the row alone. A row without it gets the size from content it holds
+    /// or from a retry's verified content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
     /// Whether committing this intent makes a previously invisible directory

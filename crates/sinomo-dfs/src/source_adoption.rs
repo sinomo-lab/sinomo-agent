@@ -178,6 +178,43 @@ struct CompletedSource {
     hash: String,
     digest: DfsPreparedOperationDigest,
 }
+/// Whether `committed`, reported as the commit of the adoption that the
+/// target prepared as `original`, is that prepare or a `recover:` replacement
+/// of it: prepared-change recovery republishes the original at each newer
+/// epoch of the target shard under its recovery id, one step per epoch.
+fn commits_adoption(
+    original: &DfsPreparedOperationDigest,
+    committed: &DfsPreparedOperationDigest,
+) -> bool {
+    if committed.operation_id == original.operation_id {
+        return committed == original;
+    }
+    if committed.protocol_version != original.protocol_version
+        || committed.file_system_id != original.file_system_id
+        || committed.shard_id != original.shard_id
+        || committed.prepare_sequence <= original.prepare_sequence
+    {
+        return false;
+    }
+    let (mut operation_id, mut epoch) = (committed.operation_id.as_str(), committed.owner_epoch);
+    while let Some(recovered) = crate::metadata_records::recovered_operation_id(operation_id, epoch)
+    {
+        if recovered == original.operation_id {
+            return original.owner_epoch < epoch;
+        }
+        // An intermediate replacement names its own, older epoch.
+        let Some(older) = recovered
+            .strip_prefix("recover:")
+            .and_then(|rest| rest.rsplit_once(':'))
+            .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+            .filter(|older| *older < epoch)
+        else {
+            return false;
+        };
+        (operation_id, epoch) = (recovered, older);
+    }
+    false
+}
 fn digest_for_release(
     scope: &DfsPreparedOperationScope,
     hash: &str,
@@ -594,16 +631,26 @@ impl DfsSourceAdoptionActor {
                     commit,
                 }) => {
                     commit.validate(&actual)?;
-                    if actual.file_system_id != scope.file_system_id
-                        || actual.shard_id != scope.shard_id
-                        || actual.owner_epoch != scope.owner_epoch
-                        || actual.operation_id != scope.operation_id
-                        || actual.payload_digest != hash
-                        || digest.as_ref().is_some_and(|old| old != &actual)
-                    {
-                        return Err(error("native terminal outcome changed exact digest"));
+                    if actual.operation_id != scope.operation_id {
+                        // Committed through a `recover:` replacement of the
+                        // bound prepare; the release names that prepare.
+                        match digest.as_ref() {
+                            Some(bound) if commits_adoption(bound, &actual) => Some(bound.clone()),
+                            _ => {
+                                return Err(error("native terminal outcome changed exact digest"));
+                            }
+                        }
+                    } else {
+                        if actual.file_system_id != scope.file_system_id
+                            || actual.shard_id != scope.shard_id
+                            || actual.owner_epoch != scope.owner_epoch
+                            || actual.payload_digest != hash
+                            || digest.as_ref().is_some_and(|old| old != &actual)
+                        {
+                            return Err(error("native terminal outcome changed exact digest"));
+                        }
+                        Some(actual)
                     }
-                    Some(actual)
                 }
                 Some(DfsSourceAdoptionOutcome::Inactive { digest: actual, .. }) => {
                     if let Some(actual) = actual.as_ref() {
@@ -619,6 +666,9 @@ impl DfsSourceAdoptionActor {
                     }
                     actual
                 }
+                // Active or unavailable: a prepare in the target's chain may
+                // still commit. The session, its capture and its row fences
+                // stay until a later wake reads a terminal outcome.
                 _ => continue,
             };
             // The target atomically retired this offer against new acquisition
@@ -1396,41 +1446,10 @@ impl DfsSourceAdoptionActor {
         } else if state.witness.as_ref().and_then(Weak::upgrade).is_some() {
             DfsSourceAdoptionOutcome::Active
         } else {
-            let root = crate::default_dfs_metadata_shards_root(
-                &sinomo_core::local::SinomoDataDir::new(&self.data_root),
-            )
-            .join(crate::metadata_keys::key_segment(&scope.shard_id.0));
-            let inspect = || -> Result<DfsSourceAdoptionOutcome> {
-                let backend = crate::LocalSobjMetadataBackend::open_for_inspection(
-                    scope.shard_id.clone(),
-                    root.clone(),
-                )?;
-                backend.source_adoption_outcome(scope, hash, expected)
-            };
-            // An original coordinator's custody holds row fences, not this
-            // shard's writer, so the lookup takes its own inspection fence.
-            let outcome = {
-                match crate::metadata_lock::try_metadata_inspection_lock(
-                    root.clone(),
-                    crate::metadata_cursor::journal_write_lock_path(&root),
-                )? {
-                    None => {
-                        tracing::warn!(
-                            target: "sinomo.dfs.source-adoption",
-                            reason = "inspection-writer-unavailable",
-                            node = %self.node,
-                            file_system = %scope.file_system_id,
-                            shard = %scope.shard_id.0.chars().take(96).collect::<String>(),
-                            owner_epoch = scope.owner_epoch,
-                            operation = %scope.operation_id.chars().take(192).collect::<String>(),
-                            expected_prepare_sequence = ?expected.map(|digest| digest.prepare_sequence),
-                            "native target outcome remains unavailable"
-                        );
-                        DfsSourceAdoptionOutcome::Unavailable
-                    }
-                    Some(_actual_writer_cut) => inspect()?,
-                }
-            };
+            // No live witness: at a target that took over, or once the
+            // target's own effect ended without a commit. The shard's rows
+            // decide; a prepare that can still commit reads as active.
+            let outcome = self.retained_target_outcome(scope, hash, expected)?;
             if matches!(outcome, DfsSourceAdoptionOutcome::Inactive { .. }) {
                 state.revoked = true;
             }
@@ -1444,6 +1463,137 @@ impl DfsSourceAdoptionActor {
             outcome: Some(outcome),
         })
     }
+    /// The outcome this node's retained rows of the target shard give for the
+    /// adoption prepared in `scope`: the outcome of its whole prepare chain.
+    fn retained_target_outcome(
+        &self,
+        scope: &DfsPreparedOperationScope,
+        hash: &str,
+        expected: Option<&DfsPreparedOperationDigest>,
+    ) -> Result<DfsSourceAdoptionOutcome> {
+        let root = crate::default_dfs_metadata_shards_root(
+            &sinomo_core::local::SinomoDataDir::new(&self.data_root),
+        )
+        .join(crate::metadata_keys::key_segment(&scope.shard_id.0));
+        // An original coordinator's custody holds row fences, not this
+        // shard's writer, so the lookup takes its own inspection fence.
+        match crate::metadata_lock::try_metadata_inspection_lock(
+            root.clone(),
+            crate::metadata_cursor::journal_write_lock_path(&root),
+        )? {
+            None => {
+                tracing::warn!(
+                    target: "sinomo.dfs.source-adoption",
+                    reason = "inspection-writer-unavailable",
+                    node = %self.node,
+                    file_system = %scope.file_system_id,
+                    shard = %scope.shard_id.0.chars().take(96).collect::<String>(),
+                    owner_epoch = scope.owner_epoch,
+                    operation = %scope.operation_id.chars().take(192).collect::<String>(),
+                    expected_prepare_sequence = ?expected.map(|digest| digest.prepare_sequence),
+                    "native target outcome remains unavailable"
+                );
+                Ok(DfsSourceAdoptionOutcome::Unavailable)
+            }
+            Some(_actual_writer_cut) => {
+                crate::LocalSobjMetadataBackend::open_for_inspection(scope.shard_id.clone(), root)?
+                    .source_adoption_outcome(scope, hash, expected)
+            }
+        }
+    }
+}
+
+/// The source custody an actor still holds for one offer.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct HeldSourceCustody {
+    /// The target scope, payload digest and bound prepare of the target's
+    /// claim, once a target claimed the source.
+    pub(crate) claim: Option<(
+        DfsPreparedOperationScope,
+        String,
+        Option<DfsPreparedOperationDigest>,
+    )>,
+    /// The physical scope the source family is fenced in.
+    pub(crate) scope: crate::publication_guard::DfsPublicationOwnerScope,
+    pub(crate) object_id: crate::DfsObjectId,
+}
+#[cfg(test)]
+impl HeldSourceCustody {
+    /// Whether the source family is still fenced.
+    pub(crate) fn fenced(&self) -> bool {
+        crate::publication_guard::source_rows_fenced(&self.scope, &self.object_id)
+    }
+}
+#[cfg(test)]
+impl DfsSourceAdoptionActor {
+    /// The custody this actor, or a retained predecessor, still holds for
+    /// `offer`.
+    pub(crate) fn held_source_custody(
+        &self,
+        offer: &DfsSourceAdoptionOffer,
+    ) -> Option<HeldSourceCustody> {
+        let session = std::iter::once(self)
+            .chain(self.predecessors.iter().map(Arc::as_ref))
+            .find_map(|actor| {
+                actor
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&offer.session_id)
+                    .cloned()
+            })?;
+        let claim = session
+            .claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        Some(HeldSourceCustody {
+            claim,
+            scope: session.capture.scope().clone(),
+            object_id: session.capture.family().source_object.object_id.clone(),
+        })
+    }
+    /// Ask `target`, as `offer`'s source, for the outcome of the adoption
+    /// prepared in `scope`, as reconciliation asks.
+    pub(crate) fn query_target_outcome(
+        &self,
+        target: &NodeId,
+        offer: &DfsSourceAdoptionOffer,
+        scope: &DfsPreparedOperationScope,
+        hash: &str,
+        expected: Option<&DfsPreparedOperationDigest>,
+    ) -> Result<Option<DfsSourceAdoptionOutcome>> {
+        let reply = self.call(
+            target,
+            &DfsSourceAdoptionRequest::InspectOutcome {
+                offer: offer.clone(),
+                target_scope: scope.clone(),
+                payload_digest: hash.into(),
+                expected_digest: expected.cloned(),
+            },
+        )?;
+        Ok(reply.outcome)
+    }
+    /// What this node's rows of the target shard give for the adoption
+    /// prepared in `scope`, with no live witness.
+    pub(crate) fn retained_target_outcome_for_test(
+        &self,
+        scope: &DfsPreparedOperationScope,
+        hash: &str,
+        expected: Option<&DfsPreparedOperationDigest>,
+    ) -> Result<DfsSourceAdoptionOutcome> {
+        self.retained_target_outcome(scope, hash, expected)
+    }
+}
+/// Whether the source would accept `committed` as the commit of the
+/// adoption that its target prepared as `original`.
+#[cfg(test)]
+pub(crate) fn commits_adoption_for_test(
+    original: &DfsPreparedOperationDigest,
+    committed: &DfsPreparedOperationDigest,
+) -> bool {
+    commits_adoption(original, committed)
 }
 /// Count-changing promotion is authorized by the same retained original job
 /// as the source family. Its selected destination alias remains an atomic
@@ -1932,6 +2082,41 @@ impl RemoteNamespacePhase {
     }
 }
 
+/// Call `target`. When `requester` is set, the call is driven as a future and
+/// ends as soon as the requester leaves: the serving node sees its stream end.
+fn call_until_requester_leaves(
+    transport: &dyn sinomo_module::ComponentObjectRpcTransport,
+    runtime: &tokio::runtime::Handle,
+    target: &sinomo_core::node::NodeId,
+    call: sinomo_core::network::ObjectRpcCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    requester: Option<crate::DfsCancellationFlag>,
+) -> std::result::Result<sinomo_core::network::ObjectRpcResult, sinomo_core::network::NetworkError>
+{
+    let Some(requester) = requester else {
+        return transport.call(target, call, options, true);
+    };
+    let run = || {
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = requester.cancelled() => Err(sinomo_core::network::NetworkError::delivery_failed(
+                    "read with lanes released",
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    "the requester left before the read was answered",
+                )),
+                result = transport.call_async(target, call, options, true) => result,
+            }
+        })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run)
+        }
+        _ => run(),
+    }
+}
+
 impl RemoteTargetNamespacePhase {
     fn source_offer(&self) -> Result<Option<&DfsSourceAdoptionOffer>> {
         match &self.command.operation {
@@ -2053,11 +2238,13 @@ impl RemoteTargetNamespacePhase {
             }),
             None => (options, call),
         };
-        let mut result = match self.actor.transport.call(
+        let mut result = match call_until_requester_leaves(
+            self.actor.transport.as_ref(),
+            &self.actor.runtime,
             &self.pending.primary_node_id,
             call,
             options,
-            true,
+            crate::node_transport::current_dfs_send_cancellation(),
         ) {
             Ok(result) => result,
             Err(cause) => {
@@ -2208,6 +2395,18 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
 type ClaimObserver = Box<dyn FnOnce(&DfsSourceAdoptionActor, &DfsSourceAdoptionOffer) + Send>;
 #[cfg(test)]
 static CLAIM_OBSERVERS: Mutex<BTreeMap<PathBuf, ClaimObserver>> = Mutex::new(BTreeMap::new());
+/// Run `observer` once, at the next claim the target actor at `root` gets
+/// from a source, before the target prepares its effect.
+#[cfg(test)]
+pub(crate) fn observe_next_claim(
+    root: &std::path::Path,
+    observer: impl FnOnce(&DfsSourceAdoptionActor, &DfsSourceAdoptionOffer) + Send + 'static,
+) {
+    CLAIM_OBSERVERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(root.to_owned(), Box::new(observer));
+}
 
 #[cfg(test)]
 mod guarded_kernel_terminal_tests {
@@ -2385,5 +2584,99 @@ mod guarded_kernel_terminal_tests {
         );
         drop(actor);
         runtime.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod requester_departure_tests {
+    use super::*;
+
+    /// A carrier whose call is never answered.
+    struct SilentCarrier;
+
+    impl sinomo_module::ComponentObjectRpcTransport for SilentCarrier {
+        fn call(
+            &self,
+            _target: &NodeId,
+            _call: sinomo_core::network::ObjectRpcCall,
+            _options: sinomo_core::network::ClusterObjectRpcOptions,
+            _observe: bool,
+        ) -> std::result::Result<
+            sinomo_core::network::ObjectRpcResult,
+            sinomo_core::network::NetworkError,
+        > {
+            Err(sinomo_core::network::NetworkError::delivery_failed(
+                "silent carrier",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                "the blocking call is not the one a leaving requester drives",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            _target: &'a NodeId,
+            _call: sinomo_core::network::ObjectRpcCall,
+            _options: sinomo_core::network::ClusterObjectRpcOptions,
+            _observe: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            sinomo_core::network::ObjectRpcResult,
+                            sinomo_core::network::NetworkError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A read made with its request's lanes released ends when its requester
+    /// leaves, not at its budget or the network's verdict.
+    #[test]
+    fn a_read_with_lanes_released_ends_when_its_requester_leaves() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let requester = crate::DfsCancellationFlag::new();
+        let leaving = requester.clone();
+        let handle = runtime.handle().clone();
+        let read = std::thread::spawn(move || {
+            let call = sinomo_core::network::ObjectRpcCall {
+                request: sinomo_core::network::ObjectRpcRequest::from_encoded_body(
+                    crate::DFS_DATA_NAMESPACE_ROUTE,
+                    "dfs",
+                    Vec::new(),
+                ),
+                body: sinomo_core::network::ObjectRpcBodySource::empty(),
+            };
+            call_until_requester_leaves(
+                &SilentCarrier,
+                &handle,
+                &NodeId::generate(),
+                call,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+                Some(requester),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!read.is_finished(), "the read waits for its answer");
+        let left = std::time::Instant::now();
+        leaving.cancel();
+        let ended = read.join().unwrap();
+        assert!(left.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            matches!(
+                &ended,
+                Err(error) if error.delivery_state()
+                    == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+            ),
+            "{:?}",
+            ended.as_ref().err()
+        );
     }
 }
