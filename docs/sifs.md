@@ -144,8 +144,9 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   network's verdict that the node they need cannot be reached, a change of
   the shard's record, or the mount's close. A metadata-shard primary that is
   slow, unreachable or changing does not make the mount fail the call, and a
-  path lookup or namespace mutation waiting for its shard's record holds none
-  of the mount's locks: the mount serves other calls meanwhile. The
+  lookup, an attribute read, a namespace mutation, a write or a lock command
+  waiting for its shard's record holds none of the mount's locks: the mount
+  serves other calls meanwhile. The
   only bound in time is the mount's operation budget, when it has one:
   `--operation-budget <duration>` on `sinomo dfs mount`, `sinomo dfs nfs
   serve` and `sinomo dfs nfs mount`, or `operation_budget` in the supervised
@@ -155,9 +156,10 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   the local daemon included, and travels with every request the call sends. A
   call that reaches its budget without a result returns `EIO`
   (`NFS3ERR_IO`): the change was not delivered, or its outcome is unknown and
-  it can still commit. A definite refusal returns its own error; a shard whose
-  storage is closed for preparation or conversion refuses with `EAGAIN`
-  (`NFS3ERR_JUKEBOX`). No such error unmounts or fences the mount, which
+  it can still commit. A definite refusal returns its own error; a path
+  moving between metadata shards, or a shard whose storage is closed for
+  preparation or conversion, refuses with `EAGAIN` (`NFS3ERR_JUKEBOX`). No
+  such error unmounts or fences the mount, which
   serves the next call.
 - A FUSE mount or NFS export keeps serving while the local daemon does not
   answer. Each mutation hands its work to the daemon through a durable

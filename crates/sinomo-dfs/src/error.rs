@@ -178,6 +178,26 @@ pub enum DfsError {
     /// succeed.
     #[error("timed out acquiring mounted-mutation outbox lock {lock} after {waited_millis} ms")]
     MountedMutationOutboxBusy { lock: String, waited_millis: u64 },
+    /// A background pass parked a read whose shard primary it could not
+    /// reach, instead of waiting for the shard's record. Nothing was read;
+    /// the pass tries the read again later.
+    #[error(
+        "read of metadata shard {shard_id} at epoch {epoch} parked: its primary {primary_node_id} was not reached"
+    )]
+    RecordWaitParked {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+        primary_node_id: NodeId,
+    },
+    /// A read named one exact shard record, and that record changed while
+    /// the read followed it. The read plans again at the current record.
+    #[error("metadata shard {shard_id} record changed past epoch {epoch}; the read plans again")]
+    ShardRecordChanged {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+    },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
     #[error("path already exists: {path}")]

@@ -638,13 +638,17 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let data = data.to_vec();
+        // One id for the request's write, kept across its runs: the primary
+        // answers each repeat with what the first attempt did.
+        let operation_id = format!("nfs_write_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.write", None, move |service| {
-                service.posix_write_file_at_for_object(
+                service.posix_write_file_at_for_object_with_operation_id(
                     &object_id,
                     offset,
                     &data,
                     write_options.clone(),
+                    &operation_id,
                 )
             })
             .await?;
@@ -1099,9 +1103,12 @@ fn map_posix_error(error: DfsPosixError) -> nfsstat3 {
         | DfsPosixError::SymlinkContentPending { .. }
         | DfsPosixError::PartialBulkCommit { .. } => nfsstat3::NFS3ERR_JUKEBOX,
         DfsPosixError::Conflict { .. } => nfsstat3::NFS3ERR_NOT_SYNC,
-        // A shard whose storage is closed for preparation or conversion
-        // refused before any effect; the client tries again later.
-        DfsPosixError::Dfs(dfs::DfsError::ShardStorageClosed { .. }) => nfsstat3::NFS3ERR_JUKEBOX,
+        // A path moving between shards, or a shard whose storage is closed
+        // for preparation or conversion, refused before any effect; the
+        // client tries again later.
+        DfsPosixError::Dfs(
+            dfs::DfsError::Busy { .. } | dfs::DfsError::ShardStorageClosed { .. },
+        ) => nfsstat3::NFS3ERR_JUKEBOX,
         // An unknown outcome is what is left once the call has followed its
         // shard's record for as long as its caller allowed. It is an I/O
         // error, and the export keeps serving.
@@ -1150,6 +1157,16 @@ mod tests {
     }
 
     #[test]
+    fn a_path_moving_between_shards_is_retried_later() {
+        assert_eq!(
+            map_posix_error(DfsPosixError::Dfs(dfs::DfsError::Busy {
+                path: "/users/moving".into(),
+            })),
+            nfsstat3::NFS3ERR_JUKEBOX
+        );
+    }
+
+    #[test]
     fn a_closed_shard_storage_refusal_is_retried_later() {
         for cause in [
             dfs::DfsShardStorageClosedCause::Preparation,
@@ -1165,13 +1182,19 @@ mod tests {
         }
     }
 
-    /// A request whose shard's primary cannot be reached follows the shard's
-    /// record without holding the export: the wait is made with the service
-    /// lane and the mutation admission released, and a request on a healthy
-    /// shard completes meanwhile.
-    #[test]
-    fn a_request_waiting_for_its_shard_record_leaves_the_export_serving() {
-        let name = "nfs-record-wait-handback";
+    /// Run `waiting` on an export of a native cluster whose users primary
+    /// cannot be reached: it follows the shard's record without holding the
+    /// export, a MKDIR on the healthy services shard completes meanwhile,
+    /// and once the primary is reached again `waiting` completes the same
+    /// call. Returns what `waiting` returned.
+    fn waits_while_the_export_serves<R, F>(
+        name: &str,
+        waiting: impl FnOnce(SifsNfsFileSystem, SifsNfsHandle) -> F,
+    ) -> R
+    where
+        R: Send + std::fmt::Debug + 'static,
+        F: std::future::Future<Output = std::result::Result<R, nfsstat3>> + Send + 'static,
+    {
         let (native, nodes) =
             dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
         let registration = sinomo_vfs_sifs::test_support::NativeMountedFixture::register(
@@ -1200,12 +1223,13 @@ mod tests {
                 })
                 .count()
         };
-        runtime.block_on(async {
+        let waited = runtime.block_on(async {
             let root = fs.root_dir();
             let services = fs
                 .lookup(&root, &filename("services"))
                 .await
                 .expect("services");
+            let users = fs.lookup(&root, &filename("users")).await.expect("users");
             // Every request from the export to the users primary fails
             // undelivered.
             let before = faulted_calls();
@@ -1218,31 +1242,16 @@ mod tests {
                 remaining_hits: 32,
                 action: dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
             });
-            // The export's mutation step, as a MKDIR runs it once it has the
-            // parent's path. Reading a handle's attributes asks the users
-            // primary directly, so the step starts from the path.
-            let waiting = tokio::spawn({
-                let fs = fs.clone();
-                async move {
-                    fs.mutate(None, "nfs.mkdir", None, |service| {
-                        service.posix_mkdir_with_create_attrs(
-                            "/users/nfs-waits-for-its-record",
-                            DfsPosixCreateAttrs::new(DEFAULT_DIRECTORY_MODE, 0, 0),
-                        )
-                    })
-                    .await
-                    .map(drop)
-                }
-            });
+            let waiting = tokio::spawn(waiting(fs.clone(), users));
             // The request has been sent and refused at least once.
             let until = Instant::now() + Duration::from_secs(20);
             while faulted_calls() == before {
-                assert!(Instant::now() < until, "the users mkdir was never sent");
+                assert!(Instant::now() < until, "the users request was never sent");
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             let served = tokio::time::timeout(
                 Duration::from_secs(60),
-                fs.mkdir(&services, &filename("nfs-serves-meanwhile")),
+                fs.mkdir(&services, &filename(&format!("{name}-meanwhile"))),
             )
             .await;
             let still_waiting = !waiting.is_finished();
@@ -1256,21 +1265,40 @@ mod tests {
             let waited = waiting.await.expect("the waiting request");
             assert!(
                 still_waiting,
-                "the users mkdir did not wait for its record: {waited:?}"
+                "the users request did not wait for its record: {waited:?}"
             );
-            assert!(matches!(waited, Ok(())), "{waited:?}");
-            let users = fs.lookup(&root, &filename("users")).await.expect("users");
-            assert!(
-                fs.lookup(&users, &filename("nfs-waits-for-its-record"))
-                    .await
-                    .is_ok(),
-                "the waiting mkdir took effect"
-            );
+            waited.expect("the waiting request completes")
         });
         drop(runtime);
         drop(fs);
         drop(registration);
         native.close().expect("close the native cluster");
+        waited
+    }
+
+    /// A MKDIR whose shard's primary cannot be reached follows the shard's
+    /// record, its handle's attribute read included, without holding the
+    /// export: the wait is made with the service lane and the mutation
+    /// admission released.
+    #[test]
+    fn a_request_waiting_for_its_shard_record_leaves_the_export_serving() {
+        let (handle, attributes) =
+            waits_while_the_export_serves("nfs-record-wait-handback", |fs, users| async move {
+                fs.mkdir(&users, &filename("nfs-waits-for-its-record"))
+                    .await
+            });
+        assert!(matches!(attributes.type_, ftype3::NF3DIR), "{handle:?}");
+    }
+
+    /// A GETATTR follows the record of the shard its handle's object lives
+    /// in, as any other read does, without holding the export.
+    #[test]
+    fn an_attribute_read_waiting_for_its_shard_record_leaves_the_export_serving() {
+        let attributes =
+            waits_while_the_export_serves("nfs-getattr-record-wait", |fs, users| async move {
+                fs.getattr(&users).await
+            });
+        assert!(matches!(attributes.type_, ftype3::NF3DIR));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

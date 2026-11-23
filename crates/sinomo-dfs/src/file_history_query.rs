@@ -1355,11 +1355,86 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// The read uses the existing namespace command, authenticated sender and
     /// exact response fence. Its wait must not enter the mutation dispatcher.
+    /// Ask `expected`'s primary one metadata query. A query names one exact
+    /// record. One an attribute read makes follows that record like any
+    /// other read when it could not be delivered or its primary refused it
+    /// for authority: it is sent again on the re-send timer while the record
+    /// stands, and a newer record ends it with
+    /// [`DfsError::ShardRecordChanged`], so the attribute read plans again at
+    /// the new record. A query another operation planned is sent once.
     fn route_metadata_query(
         &mut self,
         expected: &DfsMetadataShardConfig,
         query: &DfsMetadataShardQuery,
         snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let mut expected = expected.clone();
+        let mut snapshot = snapshot.map(<[DfsMetadataShardConfig]>::to_vec);
+        let mut resend = crate::service_record_follow::DfsRecordFollowResend::new();
+        loop {
+            let (result, undelivered) =
+                self.route_metadata_query_once(&expected, query, snapshot.as_deref());
+            let refused_for_authority = matches!(
+                &result,
+                Ok(routed) if matches!(
+                    routed.result,
+                    DfsNamespaceResult::Rejected { current_primary_node_id: Some(_), .. }
+                )
+            );
+            // Only an attribute read plans again at a newer record; a query
+            // another operation planned is sent once, as that operation's
+            // plan stands.
+            if !self.attribute_read_replans
+                || (!undelivered && !(refused_for_authority && self.follows_record_changes()))
+            {
+                if undelivered {
+                    self.request_primary_verification(&expected);
+                }
+                return result;
+            }
+            match self.follow_undelivered_read(&expected, &mut resend)? {
+                crate::service_record_follow::DfsRecordFollowed::ResendDue(record)
+                    if record.shard_id == expected.shard_id
+                        && record.epoch == expected.epoch
+                        && record.primary_node_id == expected.primary_node_id =>
+                {
+                    // The same record, with the replica list the projection
+                    // has now.
+                    expected = record;
+                    snapshot = None;
+                }
+                crate::service_record_follow::DfsRecordFollowed::Newer(_)
+                | crate::service_record_follow::DfsRecordFollowed::ResendDue(_) => {
+                    return Err(DfsError::ShardRecordChanged {
+                        file_system_id: expected.file_system_id.clone(),
+                        shard_id: expected.shard_id.clone(),
+                        epoch: expected.epoch,
+                    });
+                }
+                crate::service_record_follow::DfsRecordFollowed::Woken
+                | crate::service_record_follow::DfsRecordFollowed::Ended => return result,
+            }
+        }
+    }
+
+    /// One attempt at a metadata query, and whether it went undelivered.
+    fn route_metadata_query_once(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        query: &DfsMetadataShardQuery,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> (Result<PendingRoutedNamespaceResult, DfsError>, bool) {
+        let mut undelivered = false;
+        let result = self.route_metadata_query_attempt(expected, query, snapshot, &mut undelivered);
+        (result, undelivered)
+    }
+
+    fn route_metadata_query_attempt(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        query: &DfsMetadataShardQuery,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+        undelivered: &mut bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         self.check_cancelled("metadata query")?;
         let snapshot = match snapshot {
@@ -1449,6 +1524,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
         })
         .transpose()?;
+        let lanes_released = lanes_released_read.is_some();
         // A query adds no deadline of its own when nothing is held across
         // its wait: a requester that delegates to its node's Main (a mount,
         // the CLI, a hosted client), or a read made with the request's lanes
@@ -1559,19 +1635,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.pending_routed_namespace_ops.remove(&request_id);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
         self.transport.set_operation_deadline(previous_deadline);
-        // One exact record answers this query, and the collection it belongs
-        // to plans again when that record changes, so the query itself is not
-        // sent again. One that could not be delivered still asks this node's
-        // candidate role to have the network verify the primary.
-        if let Err(failed) = &result
-            && (unroutable
-                || matches!(
-                    failed,
-                    DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
-                ))
-        {
-            self.request_primary_verification(expected);
-        }
+        // A query handed to a lanes-released read is answered by that read;
+        // only one this attempt sent itself can have gone undelivered.
+        *undelivered = !lanes_released
+            && matches!(&result, Err(failed) if unroutable
+                || matches!(failed, DfsError::Network { .. } | DfsError::NetworkDelivery { .. }));
         result
     }
 

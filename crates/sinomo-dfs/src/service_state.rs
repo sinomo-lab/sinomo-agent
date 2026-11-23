@@ -851,6 +851,12 @@ pub struct NetworkedDfsService<T> {
     /// The mounted adapter call running on this service, which waits for a
     /// newer shard record with its mount's lock released.
     pub(crate) mounted_call: Option<Box<crate::mounted_call_replay::DfsMountedCallScope>>,
+    /// A background pass runs on this service: a read that would wait for a
+    /// newer shard record is parked instead.
+    pub(crate) record_waits_parked: bool,
+    /// An attribute read is in progress that plans again when a shard
+    /// record it reads changes: its metadata queries follow their records.
+    pub(crate) attribute_read_replans: bool,
     pub(crate) writes: DfsWriteState,
     pub(crate) reads: DfsReadState,
     pub(crate) replication: DfsReplicationState,

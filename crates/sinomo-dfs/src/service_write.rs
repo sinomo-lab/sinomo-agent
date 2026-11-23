@@ -2912,6 +2912,59 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             let resend =
                 resend.get_or_insert_with(crate::service_record_follow::DfsRecordFollowResend::new);
+            if self.mounted_call_hands_back_waits() {
+                // The mount waits for the record with its lock released and
+                // runs the write again under the same id, so the primary
+                // answers that repeat with what this attempt did.
+                if let Some(carried) = self.take_mounted_probe_resend() {
+                    *resend = carried;
+                }
+                match self.record_change_or_watch(&evidence, resend) {
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::NotYet {
+                        watch,
+                        until,
+                    }) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(self.hand_back_mounted_write_wait(*resend, watch, until));
+                    }
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::Due(
+                        crate::service_record_follow::DfsRecordFollowed::Newer(record)
+                        | crate::service_record_follow::DfsRecordFollowed::ResendDue(record),
+                    )) => {
+                        let ambiguous = !(unroutable
+                            || matches!(
+                                error,
+                                DfsError::NetworkDelivery {
+                                    delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                                    ..
+                                }
+                            ));
+                        sent = match self.resend_pending_routed_write(request_id, &record) {
+                            Ok((sent, replaced)) => {
+                                if ambiguous {
+                                    earlier_ambiguous = true;
+                                    previous = replaced;
+                                }
+                                sent
+                            }
+                            Err(error) => {
+                                self.compact_pending_routed_write(request_id);
+                                return Err(error);
+                            }
+                        };
+                        primary_node_id = record.primary_node_id.clone();
+                        shard = record;
+                        continue;
+                    }
+                    Ok(crate::service_record_follow::DfsRecordChangeNow::Due(_)) => {
+                        break (unroutable, error);
+                    }
+                    Err(cancelled) => {
+                        self.compact_pending_routed_write(request_id);
+                        return Err(cancelled);
+                    }
+                }
+            }
             let record = loop {
                 let followed = self.await_shard_record_change(
                     &evidence,

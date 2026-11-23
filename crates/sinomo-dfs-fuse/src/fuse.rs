@@ -2742,11 +2742,20 @@ impl SifsFuseFileSystem {
         // FuseState while content upload, metadata publication, or a sync
         // barrier waits on disk/network.
         let write_options = self.write_options();
+        // One id for the syscall's write, kept across its runs: the primary
+        // answers each repeat with what the first attempt did.
+        let operation_id = format!("fuse_write_{}", dfs::DfsVersion::generate());
         let stat = self.run_mounted_mutation(
             FuseMountedMutationOperation::ImmediateWritePublication,
             |dfs| {
-                dfs.posix_write_file_at_for_object(object_id, offset, data, write_options.clone())
-                    .map_err(FuseMountedMutationError::from)
+                dfs.posix_write_file_at_for_object_with_operation_id(
+                    object_id,
+                    offset,
+                    data,
+                    write_options.clone(),
+                    &operation_id,
+                )
+                .map_err(FuseMountedMutationError::from)
             },
         )?;
         self.refresh_opened_object_stats(object_id, &stat)?;
@@ -4703,7 +4712,7 @@ fn run_advisory_lock_command_with_preflight(
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
-    preflight: impl FnOnce(
+    preflight: impl FnMut(
         &mut SifsService,
     ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
 ) -> std::result::Result<FuseLockCommandResult, libc::c_int> {
@@ -4726,7 +4735,7 @@ fn run_advisory_lock_command_with_preflight_and_entry_timeout(
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
-    preflight: impl FnOnce(
+    mut preflight: impl FnMut(
         &mut SifsService,
     ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
     service_entry_timed_out: &AtomicBool,
@@ -4734,35 +4743,56 @@ fn run_advisory_lock_command_with_preflight_and_entry_timeout(
     // Anchor before the first attempt. The authority reports a relative
     // duration after it has durably settled the transition; projecting that
     // duration from this earlier instant is conservative across request,
-    // response, and exact-retry delay and can never extend the server lease.
+    // response, exact-retry delay and record waits, and can never extend the
+    // server lease.
     let started_at = Instant::now();
     // The command adds no deadline of its own: the caller's, if it has one,
     // is the only bound in time.
     let deadline = dfs::MountedSifsCall::deadline();
     let operation = fuse_advisory_lock_mutation_operation(&command);
     let stable_operation_id = Some(command.request_id().0.clone());
-    run_fuse_service_mounted_mutation_with_lock_and_preflight(
-        handoff,
-        service.as_ref(),
-        operation,
-        stable_operation_id,
-        |service| match lock_service_within_deadline(service) {
-            Err(errno) if errno == libc::ETIMEDOUT => {
-                service_entry_timed_out.store(true, Ordering::Release);
-                Err(errno)
-            }
-            result => result,
-        },
-        preflight,
-        |service| {
-            run_advisory_lock_command_with_service(
-                service, path, object_id, command, started_at, deadline,
-            )
-            .map_err(|errno| {
-                FuseMountedMutationError::ambiguous(errno, "fuse-advisory-lock-command-error")
-            })
-        },
-    )
+    // A run that would wait for a newer shard record hands the wait back:
+    // the command waits with the service lane and its mutation admission
+    // released, and runs again under its own request id.
+    let mut replay = dfs::MountedSifsCallReplay::new();
+    loop {
+        let result = run_fuse_service_mounted_mutation_with_lock_and_preflight(
+            handoff,
+            service.as_ref(),
+            operation,
+            stable_operation_id.clone(),
+            |service| match lock_service_within_deadline(service) {
+                Err(errno) if errno == libc::ETIMEDOUT => {
+                    service_entry_timed_out.store(true, Ordering::Release);
+                    Err(errno)
+                }
+                result => result,
+            },
+            &mut preflight,
+            |service| {
+                replay.run(service, |service| {
+                    run_advisory_lock_command_with_service(
+                        service,
+                        path,
+                        object_id,
+                        command.clone(),
+                        started_at,
+                        deadline,
+                    )
+                    .map_err(|errno| {
+                        FuseMountedMutationError::ambiguous(
+                            errno,
+                            "fuse-advisory-lock-command-error",
+                        )
+                    })
+                })
+            },
+        );
+        match replay.take_record_wait() {
+            Some(wait) => wait.wait(),
+            None => return result,
+        }
+    }
 }
 
 /// Wait for the mount's service lane until the caller's deadline, if it has
@@ -7024,6 +7054,8 @@ mod errno_tests {
         cancellation: dfs::DfsCancellationFlag,
     ) -> SifsFuseFileSystem {
         let content_reads = service.mounted_content_read_context();
+        let write_replica_candidates =
+            fuse_write_replica_candidates(Vec::new(), service.node_id().clone());
         SifsFuseFileSystem {
             dfs: Arc::new(MountLock::new(service)),
             mounted_mutation_handoff: handoff,
@@ -7036,11 +7068,151 @@ mod errno_tests {
             presented_owner: None,
             attr_ttl: Duration::from_secs(1),
             entry_ttl: Duration::from_secs(1),
-            write_replica_candidates: Vec::new(),
+            write_replica_candidates,
             operation_budget: None,
             lock_mount_session_id: format!("fuse-test-{}", std::process::id()),
             lock_request_sequence: Arc::new(AtomicU64::new(1)),
             lock_renewer_stop: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A mount over a real native cluster whose users shard has a primary of
+    /// its own, with a real outbox and a test daemon.
+    struct HandbackMount {
+        native: Option<dfs::test_support::DfsTestRuntime>,
+        nodes: dfs::test_support::DfsTestSplitUsersPrimary,
+        fs: Option<SifsFuseFileSystem>,
+        daemon: Arc<TestDaemon>,
+        _root: sinomo_testdir::TestDir,
+    }
+
+    impl HandbackMount {
+        fn start(name: &str) -> Self {
+            let (native, nodes) =
+                dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
+            let root = sinomo_testdir::TestDir::new(name);
+            let store = dfs::MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+                .expect("open the mount's outbox");
+            let session = store
+                .open_host_mount_session(
+                    dfs::MountedSifsMutationAdapter::Fuse,
+                    format!("fuse-root:{name}"),
+                )
+                .expect("open the mount's session");
+            let daemon = TestDaemon::new(store.clone());
+            let handoff = Arc::new(FuseMountedMutationHandoff::new(
+                dfs::MountedSifsMutationHandoff::start(store, session, daemon.clone(), None)
+                    .expect("start the mount's handoff"),
+            ));
+            let cancellation = dfs::DfsCancellationFlag::new();
+            let (sync_peer, async_peer) = native
+                .peer_transports(&nodes.mount_node)
+                .expect("the mount node's peer transports");
+            let opened = dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+                native.data_dir(&nodes.mount_node).clone(),
+                sync_peer,
+                async_peer,
+                Some(cancellation.clone()),
+            )
+            .expect("open the mounted service");
+            let fs = mounted_test_file_system(opened.service, Some(handoff), cancellation);
+            Self {
+                native: Some(native),
+                nodes,
+                fs: Some(fs),
+                daemon,
+                _root: root,
+            }
+        }
+
+        fn fs(&self) -> &SifsFuseFileSystem {
+            self.fs.as_ref().expect("the mount is open")
+        }
+
+        fn native(&self) -> &dfs::test_support::DfsTestRuntime {
+            self.native.as_ref().expect("the cluster runs")
+        }
+
+        /// Every request from the mount to the users primary fails
+        /// undelivered until the faults are cleared.
+        fn fault_users_primary(&self) {
+            self.native()
+                .install_fault(dfs::test_support::DfsTestFaultRule {
+                    source: Some(self.nodes.mount_node.clone()),
+                    target: Some(self.nodes.users_primary.clone()),
+                    route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.to_string()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action:
+                        dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
+                });
+        }
+
+        /// Run `waiting` while the users primary cannot be reached: it hands
+        /// its record wait back, a mkdir on the healthy services shard
+        /// completes meanwhile, and once the primary is reached again
+        /// `waiting` completes the same call.
+        fn waits_while_the_mount_serves<R: Send>(
+            &self,
+            healthy: &'static str,
+            waiting: impl FnOnce() -> std::result::Result<R, libc::c_int> + Send,
+        ) -> R {
+            let handed_back = self.daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN);
+            self.fault_users_primary();
+            thread::scope(|scope| {
+                let waiting = scope.spawn(waiting);
+                // Each run that hands its wait back hands its work to the
+                // daemon.
+                eventually("the waiting syscall handed its record wait back", || {
+                    self.daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN) > handed_back
+                });
+                let (served, done) = std::sync::mpsc::channel();
+                let fs = self.fs();
+                let healthy = scope.spawn(move || {
+                    let result = handback_mkdir(fs, healthy);
+                    let _ = served.send(());
+                    result
+                });
+                let served_meanwhile = done.recv_timeout(Duration::from_secs(60)).is_ok();
+                let still_waiting = !waiting.is_finished();
+                self.native().clear_faults();
+                assert!(
+                    served_meanwhile,
+                    "the healthy shard's syscall waited behind the other"
+                );
+                assert_eq!(healthy.join().unwrap(), Ok(()));
+                assert!(still_waiting, "the syscall did not wait for its record");
+                // Once the primary answers, the waiting syscall completes the
+                // same call.
+                waiting
+                    .join()
+                    .unwrap()
+                    .expect("the waiting syscall completes")
+            })
+        }
+    }
+
+    fn handback_mkdir(
+        fs: &SifsFuseFileSystem,
+        path: &'static str,
+    ) -> std::result::Result<(), libc::c_int> {
+        fs.run_mounted_mutation(FuseMountedMutationOperation::Mkdir, |dfs| {
+            dfs.posix_mkdir_with_create_attrs(path, DfsPosixCreateAttrs::new(0o755, 0, 0))
+                .map(drop)
+                .map_err(FuseMountedMutationError::from)
+        })
+    }
+
+    impl Drop for HandbackMount {
+        fn drop(&mut self) {
+            drop(self.fs.take());
+            if let Some(native) = self.native.take()
+                && let Err(error) = native.close()
+                && !std::thread::panicking()
+            {
+                panic!("close the native cluster: {error}");
+            }
         }
     }
 
@@ -7050,84 +7222,90 @@ mod errno_tests {
     /// shard completes meanwhile.
     #[test]
     fn a_syscall_waiting_for_its_shard_record_leaves_the_mount_serving() {
-        let name = "fuse-record-wait-handback";
-        let (native, nodes) =
-            dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
-        let root = sinomo_testdir::TestDir::new(name);
-        let store = dfs::MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
-            .expect("open the mount's outbox");
-        let session = store
-            .open_host_mount_session(
-                dfs::MountedSifsMutationAdapter::Fuse,
-                format!("fuse-root:{name}"),
-            )
-            .expect("open the mount's session");
-        let daemon = TestDaemon::new(store.clone());
-        let handoff = Arc::new(FuseMountedMutationHandoff::new(
-            dfs::MountedSifsMutationHandoff::start(store, session, daemon.clone(), None)
-                .expect("start the mount's handoff"),
-        ));
-        let cancellation = dfs::DfsCancellationFlag::new();
-        let (sync_peer, async_peer) = native
-            .peer_transports(&nodes.mount_node)
-            .expect("the mount node's peer transports");
-        let opened = dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
-            native.data_dir(&nodes.mount_node).clone(),
-            sync_peer,
-            async_peer,
-            Some(cancellation.clone()),
-        )
-        .expect("open the mounted service");
-        let fs = mounted_test_file_system(opened.service, Some(handoff), cancellation);
-        let mkdir = |path: &'static str| {
-            fs.run_mounted_mutation(FuseMountedMutationOperation::Mkdir, |dfs| {
-                dfs.posix_mkdir_with_create_attrs(path, DfsPosixCreateAttrs::new(0o755, 0, 0))
-                    .map(drop)
-                    .map_err(FuseMountedMutationError::from)
-            })
-        };
-        // Every request from the mount to the users primary fails undelivered.
-        native.install_fault(dfs::test_support::DfsTestFaultRule {
-            source: Some(nodes.mount_node.clone()),
-            target: Some(nodes.users_primary.clone()),
-            route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.to_string()),
-            call_id: None,
-            origin: None,
-            remaining_hits: 32,
-            action: dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
-        });
-        thread::scope(|scope| {
-            let waiting = scope.spawn(|| mkdir("/users/fuse-waits-for-its-record"));
-            // Each run that hands its wait back hands its work to the daemon.
-            eventually("the users mkdir handed its record wait back", || {
-                daemon.attempts_of(TestDaemon::COMMIT_UNKNOWN) >= 1
-            });
-            let (served, done) = std::sync::mpsc::channel();
-            let healthy = scope.spawn(move || {
-                let result = mkdir("/services/fuse-serves-meanwhile");
-                let _ = served.send(());
-                result
-            });
-            let served_meanwhile = done.recv_timeout(Duration::from_secs(60)).is_ok();
-            let still_waiting = !waiting.is_finished();
-            native.clear_faults();
-            assert!(
-                served_meanwhile,
-                "the healthy shard's syscall waited behind the other"
-            );
-            assert_eq!(healthy.join().unwrap(), Ok(()));
-            assert!(still_waiting, "the users mkdir did not wait for its record");
-            // Once the primary answers, the waiting syscall completes the
-            // same call.
-            assert_eq!(waiting.join().unwrap(), Ok(()));
+        let mount = HandbackMount::start("fuse-record-wait-handback");
+        let fs = mount.fs();
+        mount.waits_while_the_mount_serves("/services/fuse-serves-meanwhile", || {
+            handback_mkdir(fs, "/users/fuse-waits-for-its-record")
         });
         assert!(
-            fs.stat_path("/users/fuse-waits-for-its-record", false)
+            mount
+                .fs()
+                .stat_path("/users/fuse-waits-for-its-record", false)
                 .is_ok(),
             "the waiting mkdir took effect"
         );
-        drop(fs);
-        native.close().expect("close the native cluster");
+    }
+
+    /// An immediate write keeps one operation id across the runs of its
+    /// syscall: its record wait is handed back like any other, and the write
+    /// lands once.
+    #[test]
+    fn an_immediate_write_waiting_for_its_shard_record_leaves_the_mount_serving() {
+        let mount = HandbackMount::start("fuse-write-record-wait-handback");
+        let path = "/users/fuse-written-while-waiting";
+        let created = mount
+            .fs()
+            .run_mounted_mutation(FuseMountedMutationOperation::Create, |dfs| {
+                dfs.posix_write_file(path, b"before", mount.fs().write_options())
+                    .map_err(FuseMountedMutationError::from)
+            })
+            .expect("create the file");
+        let fs = mount.fs();
+        mount.waits_while_the_mount_serves("/services/fuse-write-serves-meanwhile", || {
+            fs.publish_immediate_handle_write(
+                0,
+                &created.object_id,
+                0,
+                b"after!",
+                HandleSyncMode::None,
+                None,
+            )
+        });
+        let written = mount.fs().stat_path(path, false).expect("the written file");
+        assert_eq!(written.size_bytes, Some(6));
+        assert_ne!(written.version, created.version, "the write landed");
+    }
+
+    /// An advisory-lock command keeps its request id across the runs of its
+    /// syscall: its record wait is handed back like any other, and the lock
+    /// is granted once the primary is reached.
+    #[test]
+    fn an_advisory_lock_waiting_for_its_shard_record_leaves_the_mount_serving() {
+        let mount = HandbackMount::start("fuse-lock-record-wait-handback");
+        let path = "/users/fuse-locked-while-waiting";
+        let created = mount
+            .fs()
+            .run_mounted_mutation(FuseMountedMutationOperation::Create, |dfs| {
+                dfs.posix_write_file(path, b"locked", mount.fs().write_options())
+                    .map_err(FuseMountedMutationError::from)
+            })
+            .expect("create the file");
+        let command = dfs::DfsAdvisoryLockCommand::Acquire {
+            request_id: mount.fs().next_lock_request_id("acquire"),
+            session_id: mount.fs().lock_session_id(7),
+            mode: dfs::DfsAdvisoryLockMode::Exclusive,
+            blocking: false,
+            process_id: Some(7),
+        };
+        let fs = mount.fs();
+        let granted =
+            mount.waits_while_the_mount_serves("/services/fuse-lock-serves-meanwhile", || {
+                run_advisory_lock_command(
+                    fs.mounted_mutation_handoff.as_deref(),
+                    &fs.dfs,
+                    path,
+                    &created.object_id,
+                    command,
+                )
+            });
+        assert!(
+            matches!(
+                granted.outcome,
+                dfs::DfsAdvisoryLockOutcome::Acquired { .. }
+            ),
+            "{:?}",
+            granted.outcome
+        );
     }
 
     #[test]

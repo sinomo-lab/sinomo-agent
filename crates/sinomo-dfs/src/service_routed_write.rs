@@ -2905,14 +2905,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some((canonical, evidence, true)) = self.unresolved_routed_write(request_id) else {
             return Ok(RoutedWriteRecordFollow::NotFollowed);
         };
-        let record = match self.await_shard_record_change(
-            &evidence,
-            Some(resend),
-            crate::service_record_follow::DfsRecordWaitWake {
-                on_arrival: true,
-                at: None,
-            },
-        )? {
+        let followed = if self.mounted_call_hands_back_waits() {
+            // The mount waits for the record with its lock released and runs
+            // the write again under the same id.
+            if let Some(carried) = self.take_mounted_probe_resend() {
+                *resend = carried;
+            }
+            match self.record_change_or_watch(&evidence, resend)? {
+                crate::service_record_follow::DfsRecordChangeNow::Due(followed) => followed,
+                crate::service_record_follow::DfsRecordChangeNow::NotYet { watch, until } => {
+                    self.compact_pending_routed_write(&canonical);
+                    return Err(self.hand_back_mounted_write_wait(*resend, watch, until));
+                }
+            }
+        } else {
+            self.await_shard_record_change(
+                &evidence,
+                Some(resend),
+                crate::service_record_follow::DfsRecordWaitWake {
+                    on_arrival: true,
+                    at: None,
+                },
+            )?
+        };
+        let record = match followed {
             crate::service_record_follow::DfsRecordFollowed::Newer(record)
             | crate::service_record_follow::DfsRecordFollowed::ResendDue(record) => record,
             crate::service_record_follow::DfsRecordFollowed::Woken => {

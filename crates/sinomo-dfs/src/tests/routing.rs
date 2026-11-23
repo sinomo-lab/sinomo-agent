@@ -588,10 +588,18 @@ fn authoritative_stat_rejects_actual_corrupted_replies_and_restores_deadline() {
         cluster
             .observer
             .set_transport_operation_deadline(Some(deadline));
-        assert!(
-            cluster.observer.posix_stat_distributed(path).is_err(),
-            "accepted {change:?} reply"
-        );
+        let stat = cluster.observer.posix_stat_distributed(path);
+        if matches!(change, StatReplyFault::WrongTarget) {
+            // A reply addressed to another node never reaches the observer:
+            // its read was not answered, follows its record and is answered
+            // by the primary's next reply, which is correct.
+            assert!(
+                matches!(&stat, Ok(stat) if stat.path == path && stat.link_count == 2),
+                "accepted {change:?} reply: {stat:?}"
+            );
+        } else {
+            assert!(stat.is_err(), "accepted {change:?} reply");
+        }
         assert_eq!(
             captured.lock().unwrap().len(),
             1,

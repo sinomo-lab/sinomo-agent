@@ -15,17 +15,6 @@ const ROOTS: [&str; 4] = [
 ];
 const MAX_TASKS: usize = 1024;
 const RETRY_NANOS: u64 = 10 * 1_000_000_000;
-/// The cleanup pass's own budget. The pass runs on the node's shared browser
-/// service and holds its cleanup admission; past this budget it records where
-/// it stopped and resumes from that cursor on its next pass, instead of
-/// waiting on an unreachable shard primary.
-///
-/// Stopgap: replaced, and this budget removed, once a read without a budget
-/// ends on the network's no-path verdict for its primary and then follows the
-/// shard record as a mutation does, and background work parks such a read
-/// instead of holding its pass.
-const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct State {
     feeds: BTreeMap<String, Feed>,
@@ -285,6 +274,26 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
         max_sources: usize,
         now: u64,
     ) -> Result<DfsAttachmentMaintenanceReport, DfsError> {
+        // A background pass: a read whose primary cannot be reached is
+        // parked rather than waited for. The source or scan frame it served
+        // is deferred to its retry time, and the pass goes on with the rest.
+        self.with_record_waits_parked(|service| {
+            DfsAttachmentService::new(service).maintain_file_attachments_parked(
+                checkpoint,
+                shards,
+                max_sources,
+                now,
+            )
+        })
+    }
+
+    fn maintain_file_attachments_parked(
+        &mut self,
+        checkpoint: &Path,
+        shards: &[DfsMetadataShardConfig],
+        max_sources: usize,
+        now: u64,
+    ) -> Result<DfsAttachmentMaintenanceReport, DfsError> {
         let cache = cached(checkpoint)?;
         if cache.running.swap(true, Ordering::AcqRel) {
             return Ok(Default::default());
@@ -306,11 +315,6 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
             crate::background_observation::DfsBackgroundObservation::new("attachments", "cleanup");
         let reconcile = cache.reconcile.swap(false, Ordering::AcqRel);
         let hints = std::mem::take(&mut *cache.hints.lock().unwrap());
-        let requested = std::time::Instant::now() + PASS_BUDGET;
-        let previous_deadline = self.service.transport_operation_deadline();
-        self.service.set_transport_operation_deadline(Some(
-            previous_deadline.map_or(requested, |previous| previous.min(requested)),
-        ));
         let result = (|| {
             if reconcile {
                 state.scan_retry_at = None;
@@ -544,8 +548,6 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
             *cache.state.lock().unwrap() = state;
             Ok(report)
         })();
-        self.service
-            .set_transport_operation_deadline(previous_deadline);
         if result.is_err() {
             // The blocking owner retains work even if its async caller was
             // cancelled. Retry the uncommitted checkpoint and restore hints.

@@ -68,6 +68,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsAdvisoryLockOutcome> {
         let timeout: Option<Duration> = timeout.into();
+        // The command reads its object like an attribute read, and plans
+        // again when a record it read changes, under its own request id.
+        self.replan_on_record_change(|service| {
+            service.advisory_lock_for_object_once(path, object_id, command.clone(), timeout)
+        })
+    }
+
+    fn advisory_lock_for_object_once(
+        &mut self,
+        path: &str,
+        object_id: &DfsObjectId,
+        command: DfsAdvisoryLockCommand,
+        timeout: Option<Duration>,
+    ) -> Result<DfsAdvisoryLockOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if timeout.is_some_and(|timeout| timeout.is_zero()) {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {

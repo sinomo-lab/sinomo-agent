@@ -94,6 +94,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             next_request_id: 1,
             cancellation: None,
             mounted_call: None,
+            record_waits_parked: false,
+            attribute_read_replans: false,
         }
     }
 }

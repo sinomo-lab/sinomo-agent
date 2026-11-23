@@ -105,6 +105,9 @@ pub(crate) struct DfsMountedCallScope {
     handed_back: Option<MountedSifsRecordWait>,
     /// This run sent a change a later run could not answer again.
     unreplayable: bool,
+    /// Calls in progress whose every change goes under its caller's id, so
+    /// that a later run answers it again.
+    replayable_depth: usize,
 }
 
 /// One mounted adapter call, run until it no longer hands a record wait
@@ -141,9 +144,13 @@ impl MountedSifsCallReplay {
         if service.mounted_call.is_some() {
             return operation(service);
         }
+        // A write's handed-back wait may have left its arrival waker; the
+        // run that follows reads what arrived itself.
+        service.transport.set_incoming_arrival_waker(None);
         let mut scope = self.scope.take().unwrap_or_default();
         scope.cursor = 0;
         scope.unreplayable = false;
+        scope.replayable_depth = 0;
         service.mounted_call = Some(scope);
         let result = operation(service);
         let mut scope = service
@@ -246,10 +253,30 @@ impl<T> NetworkedDfsService<T> {
     /// Note a message the running mounted call sends.
     pub(crate) fn note_mounted_call_send(&mut self, message: &DfsNetworkMessage) {
         if let Some(scope) = self.mounted_call.as_mut()
+            && scope.replayable_depth == 0
             && message_changes_beyond_replay(message)
         {
             scope.unreplayable = true;
         }
+    }
+
+    /// Run `call`, whose every change goes under its caller's operation id:
+    /// a later run of the mounted call makes the same call under the same
+    /// id, and its primary answers that repeat with what the first attempt
+    /// did. Its changes therefore do not keep the run from handing a record
+    /// wait back.
+    pub(crate) fn with_replayable_mounted_effects<R>(
+        &mut self,
+        call: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(scope) = self.mounted_call.as_mut() {
+            scope.replayable_depth += 1;
+        }
+        let result = call(self);
+        if let Some(scope) = self.mounted_call.as_mut() {
+            scope.replayable_depth = scope.replayable_depth.saturating_sub(1);
+        }
+        result
     }
 }
 
@@ -359,6 +386,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         record_wait_handed_back()
+    }
+
+    /// Hand the record wait of a routed write back to the mount, keeping its
+    /// re-send timer for the next run. A message that arrives for the mount
+    /// while it waits, such as an answer to the write, ends the wait too.
+    /// Returns the cancellation that ends this run.
+    pub(crate) fn hand_back_mounted_write_wait(
+        &mut self,
+        resend: DfsRecordFollowResend,
+        watch: Box<dyn DfsConfigurationChangeWatch>,
+        until: Instant,
+    ) -> DfsError {
+        let wake_watch = watch.waker();
+        self.transport
+            .set_incoming_arrival_waker(Some(Arc::new(move || wake_watch())));
+        self.hand_back_mounted_probe_wait(resend, watch, until)
     }
 
     /// The re-send timer of the probe an earlier run handed back.

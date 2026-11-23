@@ -200,6 +200,24 @@ pub(crate) fn hear_primary_verification_hint(
     true
 }
 
+impl<T> NetworkedDfsService<T> {
+    /// Run `pass` as background work. A read in it whose primary cannot be
+    /// reached does not wait for the shard's record: it ends with
+    /// [`DfsError::RecordWaitParked`], and the pass goes on with its other
+    /// work and tries that read again later. Mutations follow the record as
+    /// they always do.
+    pub fn with_record_waits_parked<R>(&mut self, pass: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.record_waits_parked, true);
+        let result = pass(self);
+        self.record_waits_parked = previous;
+        result
+    }
+
+    pub(crate) fn record_waits_parked(&self) -> bool {
+        self.record_waits_parked
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Whether this service waits for record changes: it is a requester that
     /// delegates to its node's Main, as every mount, CLI and hosted client
@@ -489,33 +507,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: &DfsMetadataShardConfig,
         resend: &mut DfsRecordFollowResend,
     ) -> Result<bool, DfsError> {
+        Ok(!matches!(
+            self.follow_undelivered_read(shard, resend)?,
+            DfsRecordFollowed::Ended
+        ))
+    }
+
+    /// A read that could not be delivered to `shard`'s primary follows the
+    /// shard's record like a mutation: it asks for the primary's verification
+    /// and waits for a newer record or the re-send timer. A mount makes that
+    /// wait with its lock released; a background pass does not make it at
+    /// all, but parks the read, so the pass goes on with its other work. A
+    /// requester that does not wait reads its projection once.
+    ///
+    /// A read changes nothing, so a mount's next run sends it again; only its
+    /// re-send timer carries over.
+    pub(crate) fn follow_undelivered_read(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        resend: &mut DfsRecordFollowResend,
+    ) -> Result<DfsRecordFollowed, DfsError> {
         self.request_primary_verification(shard);
         if !self.follows_record_changes() {
-            return Ok(false);
+            return Ok(DfsRecordFollowed::Ended);
         }
         let evidence = DfsRecordChangeEvidence {
             dispatched: shard.clone(),
             floor_epoch: None,
         };
+        if self.record_waits_parked() {
+            return match self.record_change_due(
+                &evidence,
+                Some(&mut *resend),
+                DfsRecordWaitWake::default(),
+                self.transport.operation_deadline(),
+            )? {
+                Some(followed @ DfsRecordFollowed::Newer(_)) => Ok(followed),
+                _ => Err(crate::DfsError::RecordWaitParked {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    epoch: shard.epoch,
+                    primary_node_id: shard.primary_node_id.clone(),
+                }),
+            };
+        }
         if self.mounted_call_hands_back_waits() {
-            // A probe changes nothing, so the mount's next run sends it
-            // again; only its timer carries over.
             if let Some(carried) = self.take_mounted_probe_resend() {
                 *resend = carried;
             }
             return match self.record_change_or_watch(&evidence, resend)? {
-                DfsRecordChangeNow::Due(followed) => {
-                    Ok(!matches!(followed, DfsRecordFollowed::Ended))
-                }
+                DfsRecordChangeNow::Due(followed) => Ok(followed),
                 DfsRecordChangeNow::NotYet { watch, until } => {
                     Err(self.hand_back_mounted_probe_wait(*resend, watch, until))
                 }
             };
         }
-        Ok(!matches!(
-            self.await_newer_shard_record(&evidence, resend)?,
-            DfsRecordFollowed::Ended
-        ))
+        self.await_newer_shard_record(&evidence, resend)
     }
 
     /// Serve a requester's hint that it could not deliver to a shard's
@@ -695,6 +742,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         loop {
             if let Some((left, evidence)) = follow.waiting.take() {
+                if request_id.is_none()
+                    && self.record_waits_parked()
+                    && self.follows_record_changes()
+                {
+                    // A background pass parks a read rather than wait for
+                    // its record, and goes on with its other work.
+                    let deadline = self.transport.operation_deadline();
+                    match self.record_change_due(
+                        &evidence,
+                        Some(&mut follow.resend),
+                        DfsRecordWaitWake::default(),
+                        deadline,
+                    )? {
+                        Some(DfsRecordFollowed::Newer(record)) => {
+                            follow.primary = record.primary_node_id;
+                            continue;
+                        }
+                        _ => {
+                            return Err(DfsError::RecordWaitParked {
+                                file_system_id: evidence.dispatched.file_system_id.clone(),
+                                shard_id: evidence.dispatched.shard_id.clone(),
+                                epoch: evidence.dispatched.epoch,
+                                primary_node_id: evidence.dispatched.primary_node_id.clone(),
+                            });
+                        }
+                    }
+                }
                 let followed = match mounted.filter(|_| self.mounted_call_hands_back_waits()) {
                     Some(own_deadline) => {
                         match self.record_change_or_watch(&evidence, &mut follow.resend) {

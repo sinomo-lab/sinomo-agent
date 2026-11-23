@@ -462,6 +462,106 @@ fn native_caller_follows_the_record_past_a_partitioned_primary() {
     runtime.close().unwrap();
 }
 
+/// A read from `from`'s own client, with no budget, answered on the
+/// returned channel.
+fn stat_from(
+    runtime: &DfsTestRuntime,
+    from: &NodeId,
+    path: &'static str,
+) -> mpsc::Receiver<Result<crate::DfsStat, crate::DfsPosixError>> {
+    let data_dir = runtime.data_dir(from).clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut client = crate::runtime_host::open_dfs_runtime_service(
+            &data_dir,
+            Some(crate::test_runtime::executor().handle()),
+        )
+        .expect("the requester opens its client");
+        let _ = sender.send(client.posix_stat_distributed(path));
+    });
+    receiver
+}
+
+/// A read with no budget whose primary is partitioned. The network ends each
+/// attempt, and the read follows the record like a mutation: it waits while
+/// the primary is only unreachable and is answered once a member has taken
+/// over. A background pass parks the same read instead of waiting for the
+/// record, and goes on with its other work.
+#[test]
+fn native_read_without_a_budget_follows_the_record_past_a_partitioned_primary() {
+    let (runtime, config) = switched_with_kv_voters("native-read-follow-partitioned", Some((2, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/cut");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: true,
+            dfs: true,
+        },
+    );
+    let path = "/services/cut";
+    {
+        let mut client = crate::runtime_host::open_dfs_runtime_service(
+            runtime.data_dir(&b),
+            Some(crate::test_runtime::executor().handle()),
+        )
+        .expect("the background pass opens its client");
+        let started = Instant::now();
+        let parked = client.with_record_waits_parked(|client| client.posix_stat_distributed(path));
+        assert!(
+            matches!(
+                &parked,
+                Err(crate::DfsPosixError::Dfs(crate::DfsError::RecordWaitParked {
+                    primary_node_id,
+                    ..
+                })) if *primary_node_id == p
+            ),
+            "a background pass parks the read: {parked:?}"
+        );
+        assert!(started.elapsed() < STILL_WAITING, "parking does not wait");
+        // The pass goes on: its client still serves what does not need the
+        // unreachable primary.
+        assert!(
+            client
+                .with_record_waits_parked(
+                    |client| client.metadata_authorities(&config.file_system_id)
+                )
+                .is_ok()
+        );
+    }
+    let read = stat_from(&runtime, &b, path);
+    let started = Instant::now();
+    while !runtime.peer_verification_requests(&b).contains(&p) {
+        assert!(
+            started.elapsed() < EVENT_BOUND,
+            "a read that cannot be delivered asks the network to verify the primary"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        read.recv_timeout(STILL_WAITING).is_err(),
+        "the read waits for the record while the primary is only unreachable"
+    );
+    lose(&runtime, &[&b, &c], &p);
+    let stat = read
+        .recv_timeout(EVENT_BOUND * 2)
+        .expect("the read is answered once a member has taken over")
+        .expect("the read succeeds at the new primary");
+    assert_eq!(stat.path, path);
+    assert_ne!(record_from(&runtime, &config, &b).shard.primary_node_id, p);
+    heal(&runtime, &config, &p, [&b, &c]);
+    runtime.close().unwrap();
+}
+
 /// Slow but reachable primary: its replies to the caller are held past the
 /// network's liveness interval. The caller, which set no budget, does not
 /// give up: its one call is answered, the write applied once, and nobody
