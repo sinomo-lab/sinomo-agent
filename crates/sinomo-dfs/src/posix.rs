@@ -558,6 +558,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             return Err(DfsError::from_network(error));
                         }
                     }
+                    // A wait handed back to the mount keeps the write's body:
+                    // the primary holds the write, and the call's next run
+                    // waits for its answer again.
+                    Err(error) if self.mounted_call_handed_back() => return Err(error),
                     Err(error) => {
                         self.compact_pending_routed_write(&intent_id);
                         return Err(error);
@@ -1699,6 +1703,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// [`Self::posix_write_file_with_create_attrs`] under a durable operation
+    /// identity.
+    pub fn posix_write_file_with_create_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            false,
+            false,
+            Some(operation_id.to_string()),
+        )
+    }
+
     /// Create a new regular file with its final POSIX attributes.
     ///
     /// Unlike [`Self::posix_write_file_with_create_attrs`], this operation is
@@ -2143,6 +2172,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(attrs),
             true,
             true,
+        )
+    }
+
+    /// [`Self::posix_create_file_following_symlink_with_attrs`] under a
+    /// durable operation identity.
+    pub fn posix_create_file_following_symlink_with_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            &[],
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            true,
+            true,
+            Some(operation_id.to_string()),
         )
     }
 
@@ -3412,20 +3465,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        self.posix_write_file_bytes_checked_parent_attempts(
-            path,
-            bytes,
-            options,
-            check_parent,
-            touch_parent_on_create,
-            replay_response_journal,
-            create_attrs,
-            exclusive_create,
-            follow_final_for_exclusive_create,
-            operation_id,
-            true,
-        )?
-        .ok_or_else(|| DfsPosixError::Conflict {
+        let write = |service: &mut Self, operation_id| {
+            service.posix_write_file_bytes_checked_parent_attempts(
+                path,
+                bytes,
+                options,
+                check_parent,
+                touch_parent_on_create,
+                replay_response_journal,
+                create_attrs,
+                exclusive_create,
+                follow_final_for_exclusive_create,
+                operation_id,
+                true,
+            )
+        };
+        let written = if operation_id.is_some() {
+            // Every change goes under the caller's id: a mounted call's next
+            // run answers it again, and its record waits are handed back.
+            self.with_replayable_mounted_effects(|service| write(service, operation_id))
+        } else {
+            write(self, operation_id)
+        };
+        written?.ok_or_else(|| DfsPosixError::Conflict {
             path: path.to_string(),
             reason: "committed write did not report its stat".into(),
         })
@@ -5414,7 +5476,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        self.posix_truncate_file_expected_object(path, None, len, options)
+        self.posix_truncate_file_expected_object(path, None, len, options, None)
     }
 
     /// Truncate through a stable opened-object identity, rejecting a path
@@ -5426,13 +5488,81 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        self.truncate_file_for_object_as(object_id, len, options, None)
+    }
+
+    /// [`Self::posix_truncate_file`] as the caller's operation
+    /// `operation_id`. Every attempt targets the version the id selects, so
+    /// the primary answers a repeat with what the first attempt did, and an
+    /// attempt made after the truncate committed finds it committed. A mount
+    /// mints one id per syscall and keeps it across the syscall's runs.
+    pub fn posix_truncate_file_with_operation_id(
+        &mut self,
+        path: &str,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        self.replan_on_record_change(|service| {
+            service.with_replayable_mounted_effects(|service| {
+                let _namespace_plan = service.namespace_execution.begin_planning();
+                service.posix_truncate_file_expected_object(
+                    path,
+                    None,
+                    len,
+                    options.clone(),
+                    Some(operation_id),
+                )
+            })
+        })
+    }
+
+    /// [`Self::posix_truncate_file_for_object`] as the caller's operation
+    /// `operation_id` (see [`Self::posix_truncate_file_with_operation_id`]).
+    pub fn posix_truncate_file_for_object_with_operation_id(
+        &mut self,
+        object_id: &DfsObjectId,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        // The truncate reads its object like an attribute read, and plans
+        // again when a record it read changes.
+        self.replan_on_record_change(|service| {
+            service.with_replayable_mounted_effects(|service| {
+                let _namespace_plan = service.namespace_execution.begin_planning();
+                service.truncate_file_for_object_as(
+                    object_id,
+                    len,
+                    options.clone(),
+                    Some(operation_id),
+                )
+            })
+        })
+    }
+
+    fn truncate_file_for_object_as(
+        &mut self,
+        object_id: &DfsObjectId,
+        len: u64,
+        options: DfsWriteOptions,
+        operation_id: Option<&str>,
+    ) -> Result<DfsStat> {
         let object = self
             .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });
         }
-        self.posix_truncate_file_expected_object(&object.path, Some(object_id), len, options)
+        self.posix_truncate_file_expected_object(
+            &object.path,
+            Some(object_id),
+            len,
+            options,
+            operation_id,
+        )
     }
 
     fn posix_truncate_file_expected_object(
@@ -5441,6 +5571,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_object_id: Option<&DfsObjectId>,
         len: u64,
         options: DfsWriteOptions,
+        operation_id: Option<&str>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -5461,6 +5592,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
+        let stable_target = operation_id.map(|operation_id| {
+            stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+        });
+        if stable_target.as_ref() == Some(&object.version) {
+            // A repeat of a truncate that committed.
+            return self.committed_write_stat(&path);
+        }
         let base_version = object.version.clone();
         let mut current = match self.posix_patch_current_bytes(&path, &object)? {
             NetworkedDfsReadOutcome::Found {
@@ -5477,7 +5615,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             path: format!("{path}@len={len}"),
         })?;
         current.resize(len, 0);
-        let target_version = next_version(&object.version);
+        let target_version = stable_target.unwrap_or_else(|| next_version(&object.version));
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
@@ -5509,7 +5647,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 dispatch: DfsWriteDispatch::AwaitResponse,
                 replay_response_journal: true,
-                operation_id: None,
+                operation_id: operation_id.map(str::to_owned),
             },
         )?;
         let outcome = if options.wait_for_commit {

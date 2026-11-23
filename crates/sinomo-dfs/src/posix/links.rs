@@ -7,6 +7,7 @@
 use super::now_unix_nanos;
 use crate::namespace::{initial_version, next_version};
 use crate::DfsNamespaceTransaction;
+use crate::intent::{stable_create_object_id, stable_write_target_version};
 use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{
     apply_posix_create_attrs, new_posix_metadata_object, recreated_posix_metadata_object,
@@ -47,8 +48,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.with_posix_commit_operation_deadline(|service| {
             service.with_metadata_lookup_cache_mut(|service| {
                 service.posix_symlink_with_create_attrs_with_current_deadline(
-                    target, link_path, options, attrs,
+                    target, link_path, options, attrs, None,
                 )
+            })
+        })
+    }
+
+    /// [`Self::posix_symlink_with_create_attrs`] as the caller's operation
+    /// `operation_id`. The link's object and version are the ones the id
+    /// selects, so every attempt makes the same link, the primary answers a
+    /// repeat with what the first attempt did, and an attempt made after the
+    /// link was created finds it created. A mount mints one id per syscall
+    /// and keeps it across the syscall's runs.
+    pub fn posix_symlink_with_create_attrs_and_operation_id(
+        &mut self,
+        target: &str,
+        link_path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        // Every change goes under the caller's id: a mounted call's next run
+        // answers it again, and its record waits are handed back.
+        self.with_replayable_mounted_effects(|service| {
+            service.with_posix_commit_operation_deadline(|service| {
+                service.with_metadata_lookup_cache_mut(|service| {
+                    service.posix_symlink_with_create_attrs_with_current_deadline(
+                        target,
+                        link_path,
+                        options,
+                        attrs,
+                        Some(operation_id),
+                    )
+                })
             })
         })
     }
@@ -59,6 +93,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         link_path: &str,
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
+        operation_id: Option<&str>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         validate_posix_symlink_target(target)?;
@@ -93,7 +128,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Resolving parent links deliberately skips the final entry. Its local
         // replica may still precede an acknowledged unlink, so select that
         // exact entry from its authority without following a dangling target.
+        let stable_object_id = operation_id
+            .map(|operation_id| stable_create_object_id(&self.node_id, &link_path, operation_id));
         let mut object = match self.lookup_sifs_path_direct_distributed_synced(&link_path)? {
+            Some(object)
+                if object.kind == DfsObjectKind::Symlink
+                    && stable_object_id.as_ref() == Some(&object.object_id)
+                    && operation_id.is_some_and(|operation_id| {
+                        object.version
+                            == stable_write_target_version(
+                                &self.node_id,
+                                &object.object_id,
+                                operation_id,
+                            )
+                    }) =>
+            {
+                // A repeat of this link's creation that committed.
+                return self.committed_write_stat(&link_path);
+            }
             Some(object) if object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }
@@ -105,6 +157,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(object_id) = stable_object_id.clone() {
+                    object.object_id = object_id;
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
@@ -113,6 +168,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     new_posix_metadata_object(&self.node_id, &link_path, DfsObjectKind::Symlink);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(object_id) = stable_object_id.clone() {
+                    object.object_id = object_id;
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
@@ -123,7 +181,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.remove_transient_object_metadata(&object.object_id);
             return Err(error.into());
         }
-        let target_version = next_version(&object.version);
+        let target_version = operation_id
+            .map(|operation_id| {
+                stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+            })
+            .unwrap_or_else(|| next_version(&object.version));
         let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -144,6 +206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidates,
             options.policy,
             options.foreground_replica_repair,
+            operation_id.map(str::to_owned),
         );
         let outcome = match outcome {
             Ok(outcome) => outcome,

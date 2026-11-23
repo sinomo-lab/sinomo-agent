@@ -562,6 +562,101 @@ fn native_read_without_a_budget_follows_the_record_past_a_partitioned_primary() 
     runtime.close().unwrap();
 }
 
+/// An object read asks every shard for the object and ends at the shard
+/// that holds it: a shard whose primary the requester cannot reach is not
+/// waited for when another shard answers. Its answer is waited for only when
+/// no other shard decides, as for an object no shard holds, and the read is
+/// answered once that primary is reached.
+#[test]
+fn native_object_read_waits_only_for_a_shard_whose_answer_it_needs() {
+    let (runtime, split) =
+        crate::test_support::split_users_primary_cluster("native-fan-out-needed").unwrap();
+    let held = runtime
+        .client(&split.users_primary)
+        .unwrap()
+        .posix_mkdir("/users/fan-out")
+        .expect("the users shard holds the directory");
+    let shards = runtime.metadata_shards().unwrap();
+    let primary_of = |id: &str| {
+        shards
+            .iter()
+            .find(|shard| shard.shard_id == id)
+            .unwrap()
+            .primary_node_id
+            .clone()
+    };
+    // A shard the read asks before the users shard, whose primary the mount
+    // reaches over the network.
+    let far = [primary_of("root"), primary_of("services")]
+        .into_iter()
+        .find(|primary| *primary != split.mount_node && *primary != split.users_primary)
+        .expect("a shard ahead of users has a primary on another node");
+    let mut service = mounted(&runtime, &split.mount_node);
+    let asked = || {
+        runtime
+            .rpc_observations()
+            .iter()
+            .filter(|call| {
+                call.source == split.mount_node
+                    && call.target == far
+                    && call.route == crate::DFS_DATA_NAMESPACE_ROUTE
+            })
+            .count()
+    };
+    let before = asked();
+    runtime.install_fault(FaultRule {
+        source: Some(split.mount_node.clone()),
+        target: Some(far.clone()),
+        route: Some(crate::DFS_DATA_NAMESPACE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: FaultAction::TransientRouteFailureBeforeDispatch,
+    });
+    std::thread::scope(|scope| {
+        let (sender, found) = mpsc::channel();
+        let service = &mut service;
+        let object_id = held.object_id.clone();
+        scope.spawn(move || {
+            let _ = sender.send(service.posix_stat_object(&object_id));
+        });
+        let stat = found
+            .recv_timeout(STILL_WAITING)
+            .expect("the read does not wait for a shard it does not need")
+            .expect("the read succeeds")
+            .expect("the users shard holds the object");
+        assert_eq!(stat.object_id, held.object_id);
+        assert_eq!(stat.path, "/users/fan-out");
+    });
+    assert!(
+        asked() > before,
+        "the read asked the unreachable shard first"
+    );
+
+    std::thread::scope(|scope| {
+        let (sender, answered) = mpsc::channel();
+        let service = &mut service;
+        let absent = sinomo_core::Id::generate();
+        scope.spawn(move || {
+            let _ = sender.send(service.posix_stat_object(&absent));
+        });
+        assert!(
+            answered.recv_timeout(STILL_WAITING).is_err(),
+            "no other shard decides: the read waits for the unreachable one"
+        );
+        runtime.clear_faults();
+        assert_eq!(
+            answered
+                .recv_timeout(EVENT_BOUND)
+                .expect("the read is answered once the primary is reached")
+                .expect("the read succeeds"),
+            None
+        );
+    });
+    drop(service);
+    runtime.close().unwrap();
+}
+
 /// Slow but reachable primary: its replies to the caller are held past the
 /// network's liveness interval. The caller, which set no budget, does not
 /// give up: its one call is answered, the write applied once, and nobody
@@ -1170,6 +1265,110 @@ fn native_syncs_locks_and_unreplayed_mutations_keep_one_operation_id_per_call() 
     runtime.close().unwrap();
 }
 
+/// A truncate, a create and a symlink made under a caller's operation id
+/// are the same operation each time the caller makes them: a repeat after
+/// the first committed is answered with what it did, as a mount's next run
+/// of the syscall is, and makes nothing new. A link under another id finds
+/// the path taken.
+#[test]
+fn native_truncates_creates_and_links_under_one_id_are_answered_again() {
+    let (runtime, config) = switched("native-follow-internal-ids", None);
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/internal");
+    }
+    let options = write_options(&config, None);
+    let mut client = runtime.client(&c).unwrap();
+    let file = "/services/internal/file.txt";
+    let written = client
+        .posix_write_file(file, b"truncated later", options.clone())
+        .expect("the file to truncate is written");
+
+    let truncate = || {
+        runtime
+            .client(&c)
+            .unwrap()
+            .posix_truncate_file_with_operation_id(file, 9, options.clone(), "truncate-path")
+            .expect("the truncate by path commits")
+    };
+    let first = truncate();
+    assert_eq!(first.size_bytes, Some(9));
+    assert_ne!(first.version, written.version);
+    let again = truncate();
+    assert_eq!(
+        again.version, first.version,
+        "the repeat made no new version"
+    );
+
+    let mut by_object = |len| {
+        client.posix_truncate_file_for_object_with_operation_id(
+            &written.object_id,
+            len,
+            options.clone(),
+            "truncate-object",
+        )
+    };
+    let first = by_object(4).expect("the truncate by object commits");
+    assert_eq!(first.size_bytes, Some(4));
+    let again = by_object(4).expect("its repeat is answered");
+    assert_eq!(
+        again.version, first.version,
+        "the repeat made no new version"
+    );
+
+    let attrs = crate::DfsPosixCreateAttrs::new(0o644, 0, 0);
+    let created = "/services/internal/created.txt";
+    let first = client
+        .posix_create_file_with_attrs_and_operation_id(created, options.clone(), attrs, "create")
+        .expect("the create commits");
+    let again = client
+        .posix_create_file_with_attrs_and_operation_id(created, options.clone(), attrs, "create")
+        .expect("its repeat is answered, not refused as existing");
+    assert_eq!(
+        (again.object_id, again.version),
+        (first.object_id, first.version)
+    );
+
+    let link = "/services/internal/link";
+    let attrs = crate::DfsPosixCreateAttrs::symlink_default();
+    let first = client
+        .posix_symlink_with_create_attrs_and_operation_id(
+            "file.txt",
+            link,
+            options.clone(),
+            attrs,
+            "link",
+        )
+        .expect("the link is made");
+    let again = client
+        .posix_symlink_with_create_attrs_and_operation_id(
+            "file.txt",
+            link,
+            options.clone(),
+            attrs,
+            "link",
+        )
+        .expect("its repeat is answered, not refused as existing");
+    assert_eq!(
+        (again.object_id, again.version),
+        (first.object_id.clone(), first.version)
+    );
+    assert!(matches!(
+        client.posix_symlink_with_create_attrs_and_operation_id(
+            "file.txt",
+            link,
+            options.clone(),
+            attrs,
+            "another-link",
+        ),
+        Err(crate::DfsPosixError::AlreadyExists { .. })
+    ));
+    assert_eq!(client.posix_readlink_distributed(link).unwrap(), "file.txt");
+    drop(client);
+    runtime.close().unwrap();
+}
+
 /// A routed write its primary answered `Pending`, whose primary is then lost.
 /// The primary could not stage a second copy, so it answered with what it
 /// held and nothing more comes from it. Returns the runtime, the shard, the
@@ -1271,6 +1470,159 @@ fn pending_write_whose_primary_is_lost(
     });
     runtime.clear_faults();
     (runtime, config, options, outcome)
+}
+
+/// A mounted call's write whose primary answered `Pending` hands its wait
+/// for the commit back to the mount: the mount's lock is free while the
+/// primary holds the write, and the call's next runs send nothing for it.
+/// When a member takes over from the lost primary, the same write goes under
+/// its id to that member, which answers the call.
+#[test]
+fn native_mounted_pending_write_hands_its_wait_back_and_is_sent_once() {
+    let (runtime, config) = switched_with_kv_voters("native-follow-mounted-held", Some((2, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/held");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    // The primary cannot stage a second copy: it holds the write below W.
+    for target in [&b, &c] {
+        for route in [
+            crate::DFS_DATA_STAGE_BLOB_ROUTE,
+            crate::DFS_DATA_STAGE_PATCH_ROUTE,
+            crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(FaultRule {
+                source: Some(p.clone()),
+                target: Some(target.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: FaultAction::BudgetExhausted,
+            });
+        }
+    }
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let operation = "mounted-held-write";
+    let path = "/services/held/file.txt";
+    let options = write_options(&config, Some((2, 3)));
+    // Cancelled only if the call is still running when the test has seen
+    // what it needs, so that a failing test ends.
+    let cancel = crate::DfsCancellationFlag::new();
+    let (sync, asynchronous) = runtime.peer_transports(&c).unwrap();
+    let service = crate::MountedSifsLock::new(
+        crate::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+            runtime.data_dir(&c).clone(),
+            sync,
+            asynchronous,
+            Some(cancel.clone()),
+        )
+        .expect("the mounted client opens")
+        .service,
+    );
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    let (answer, answered) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut replay = crate::MountedSifsCallReplay::new();
+            loop {
+                runs.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let result = replay.run(&mut *service.lock().unwrap(), |service| {
+                    service.posix_write_file_with_operation_id(
+                        path,
+                        b"held",
+                        options.clone(),
+                        operation,
+                    )
+                });
+                match replay.take_record_wait() {
+                    Some(wait) => wait.wait(),
+                    None => {
+                        let _ = answer.send(result);
+                        return;
+                    }
+                }
+            }
+        });
+        let started = Instant::now();
+        while sends_to(&runtime, &c, &p, operation) == 0 && started.elapsed() < EVENT_BOUND {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let early = answered.recv_timeout(STILL_WAITING).ok();
+        let lock_free = service
+            .lock_until(Some(Instant::now() + Duration::from_secs(5)))
+            .is_ok();
+        let sends_while_held = sends_to(&runtime, &c, &p, operation);
+        let runs_while_held = runs.load(std::sync::atomic::Ordering::Acquire);
+        // The primary is lost and a member takes over: the held wait sees
+        // the record change, and the same write goes under its id to the
+        // member that took over.
+        let waited = early.is_none();
+        let mut outcome = early;
+        if outcome.is_none() {
+            runtime.partition_node(
+                &p,
+                Partition {
+                    kv: true,
+                    dfs: true,
+                },
+            );
+            lose(&runtime, &[&b, &c], &p);
+            outcome = answered.recv_timeout(EVENT_BOUND * 2).ok();
+        }
+        if outcome.is_none() {
+            cancel.cancel();
+        }
+        assert!(
+            waited,
+            "the primary holds the write below W: the call waits; {outcome:?}"
+        );
+        assert!(
+            lock_free,
+            "the mount's lock is free while the call waits for the commit"
+        );
+        assert!(runs_while_held > 1, "the call handed its wait back");
+        assert_eq!(
+            sends_while_held, 1,
+            "the call's later runs do not send a write its primary holds"
+        );
+        let outcome = outcome.unwrap_or_else(|| {
+            panic!(
+                "the call follows the record to the member that took over; calls {:?}\n{}",
+                calls_from(&runtime, &c),
+                event_log(&runtime, &[&b, &c])
+            )
+        });
+        // The call ended on what the member that took over answered: its
+        // result, or that member's own refusal, never a failed delivery to
+        // the old primary.
+        assert!(
+            !matches!(
+                &outcome,
+                Err(crate::DfsPosixError::Dfs(crate::DfsError::NetworkDelivery { message, .. }))
+                    if !message.contains("the write committed")
+            ) && !matches!(
+                &outcome,
+                Err(crate::DfsPosixError::Dfs(crate::DfsError::Network { .. }))
+            ),
+            "the member that took over answered the call: {outcome:?}"
+        );
+        assert_eq!(
+            sends_to(&runtime, &c, &p, operation),
+            1,
+            "the lost primary was sent the write once"
+        );
+    });
+    drop(service);
+    heal(&runtime, &config, &p, [&b, &c]);
+    runtime.close().unwrap();
 }
 
 /// The settle wait of a write its primary answered `Pending` observes the

@@ -464,6 +464,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// [`Self::record_change_or_watch`] for a wait that has no re-send timer:
+    /// it ends at `wake_at`, when a message arrives or when the record
+    /// changes.
+    pub(crate) fn record_change_or_watch_until(
+        &mut self,
+        evidence: &DfsRecordChangeEvidence,
+        wake_at: Instant,
+    ) -> Result<DfsRecordChangeNow, DfsError> {
+        let deadline = self.transport.operation_deadline();
+        let wake = DfsRecordWaitWake {
+            on_arrival: true,
+            at: Some(wake_at),
+        };
+        let watch = self
+            .control_plane
+            .as_ref()
+            .and_then(|control_plane| control_plane.watch_configuration_changes());
+        let Some(watch) = watch else {
+            return self
+                .await_shard_record_change(evidence, None, wake)
+                .map(DfsRecordChangeNow::Due);
+        };
+        Ok(
+            match self.record_change_due(evidence, None, wake, deadline)? {
+                Some(followed) => DfsRecordChangeNow::Due(followed),
+                None => DfsRecordChangeNow::NotYet {
+                    watch,
+                    until: deadline.map_or(wake_at, |deadline| deadline.min(wake_at)),
+                },
+            },
+        )
+    }
+
     /// A request from this node could not be delivered to `shard`'s primary:
     /// ask this node's candidate role to have the network verify it. The
     /// demand is a hint, kept in memory by the Main that runs the keeper.

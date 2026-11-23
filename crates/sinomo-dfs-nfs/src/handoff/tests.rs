@@ -320,3 +320,101 @@ fn a_refused_error_record_goes_to_recovery_while_the_export_serves() {
             .run_operation("nfs.test-next", None, &service, |_service| Ok(()));
     assert!(next.is_ok(), "the export keeps serving mutations");
 }
+
+/// A request that waits for its shard record keeps one outbox marker across
+/// its runs: the marker is armed once, nothing is committed while the
+/// request waits, and the daemon is handed the request's work once, when it
+/// ends.
+#[test]
+fn a_waiting_request_keeps_one_outbox_marker_across_its_runs() {
+    let name = "nfs-record-wait-one-marker";
+    let (native, nodes) =
+        dfs::test_support::split_users_primary_cluster(name).expect("native cluster");
+    let registration =
+        sinomo_vfs_sifs::test_support::NativeMountedFixture::register(&native, &nodes.mount_node);
+    let outbox = sinomo_testdir::TestDir::new(&format!("{name}-outbox"));
+    let store = dfs::MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(outbox.path()))
+        .expect("open the export's outbox");
+    let session = store
+        .open_host_mount_session(dfs::MountedSifsMutationAdapter::Nfs, "nfs:one-marker")
+        .expect("open the export's host-mount session");
+    let daemon = TestDaemon::new(store.clone());
+    let closing = dfs::DfsCancellationFlag::new();
+    let handoff = NfsMountedMutationHandoff::start(store, session, daemon.clone(), &closing)
+        .expect("start the export's handoff");
+    let service = dfs::MountedSifsLock::new(
+        open_registered(native.data_dir(&nodes.mount_node), Some(closing))
+            .expect("registered native SIFS owner")
+            .expect("open the export's service")
+            .service,
+    );
+    let sent = || {
+        native
+            .rpc_observations()
+            .iter()
+            .filter(|call| {
+                call.source == nodes.mount_node
+                    && call.target == nodes.users_primary
+                    && call.route == dfs::DFS_DATA_NAMESPACE_ROUTE
+            })
+            .count()
+    };
+    let steps = || {
+        [
+            TestDaemon::ARM,
+            TestDaemon::COMMIT_APPLIED,
+            TestDaemon::COMMIT_UNKNOWN,
+        ]
+        .map(|step| daemon.attempts_of(step))
+    };
+    let [armed, applied, unknown] = steps();
+    let before = sent();
+    native.install_fault(dfs::test_support::DfsTestFaultRule {
+        source: Some(nodes.mount_node.clone()),
+        target: Some(nodes.users_primary.clone()),
+        route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.to_string()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: dfs::test_support::DfsTestFaultAction::TransientRouteFailureBeforeDispatch,
+    });
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            handoff.run_operation("nfs.mkdir", None, &service, |service| {
+                service.posix_mkdir_with_create_attrs(
+                    "/users/nfs-one-marker",
+                    dfs::DfsPosixCreateAttrs::new(0o755, 0, 0),
+                )
+            })
+        });
+        let until = Instant::now() + Duration::from_secs(20);
+        while sent() == before {
+            assert!(Instant::now() < until, "the request was never sent");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Long enough for several re-send intervals, each of which runs the
+        // request again.
+        std::thread::sleep(Duration::from_secs(3));
+        let still_waiting = !waiting.is_finished();
+        let ran_again = sent() > before + 2;
+        let while_waiting = steps();
+        native.clear_faults();
+        let stat = waiting
+            .join()
+            .expect("the waiting request")
+            .expect("the waiting request completes");
+        assert!(still_waiting, "the request waits for its record");
+        assert!(ran_again, "the request ran again on its re-send timer");
+        assert_eq!(
+            while_waiting,
+            [armed + 1, applied, unknown],
+            "one marker, nothing committed"
+        );
+        assert_eq!(stat.path, "/users/nfs-one-marker");
+    });
+    assert_eq!(steps(), [armed + 1, applied + 1, unknown]);
+    drop(service);
+    drop(handoff);
+    drop(registration);
+    native.close().expect("close the native cluster");
+}

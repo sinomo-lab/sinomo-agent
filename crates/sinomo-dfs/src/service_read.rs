@@ -486,8 +486,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Read `object_id` from the hinted shard's authority, then from every
     /// authority, since the object may have moved since the hint was taken. A
-    /// hinted shard whose storage is closed cannot answer now; the fan-out
-    /// over every authority then decides (see
+    /// hinted shard whose storage is closed or whose primary was not reached
+    /// cannot answer now; the fan-out over every authority then decides (see
     /// [`crate::file_history_query::DfsAuthorityFanOut`]).
     pub(crate) fn current_object_from_hinted_authority(
         &mut self,
@@ -495,11 +495,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         hinted_shard: Option<DfsMetadataShardConfig>,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
         if let Some(shard) = hinted_shard
             && let Some(crate::DfsMetadataQueryResult::CurrentObject {
                 object: Some(current),
             }) = self.query_metadata_authority_in_fan_out(
-                &mut crate::file_history_query::DfsAuthorityFanOut::default(),
+                &mut fan_out,
                 &shard,
                 crate::DfsMetadataSelection::CurrentObject {
                     object_id: object_id.clone(),
@@ -511,7 +512,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Ok(Some(*current));
         }
-        self.current_object_from_authority(file_system_id, object_id)
+        self.current_object_in_fan_out(&mut fan_out, file_system_id, object_id)
     }
 
     fn observed_authority_read_object(&self, mut object: DfsObjectMetadata) -> DfsObjectMetadata {

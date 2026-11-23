@@ -4,7 +4,7 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const ROOTS: [&str; 4] = [
@@ -28,6 +28,9 @@ struct State {
     // already reconciles from the beginning, so this deadline is local.
     #[serde(skip)]
     scan_retry_at: Option<u64>,
+    // The shard record the failed managed-directory page parked on.
+    #[serde(skip)]
+    scan_parked: Option<ParkedOn>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct Feed {
@@ -44,6 +47,50 @@ struct Task {
     source: DfsAttachmentSource,
     after: Option<DfsDirectoryPageCursor>,
     due: u64,
+    // The shard record this source's read parked on.
+    #[serde(skip)]
+    parked: Option<ParkedOn>,
+}
+
+/// The shard record a background read parked on because its primary could
+/// not be reached. The read is tried again as soon as the current record
+/// for that shard differs; its retry time is only a fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParkedOn {
+    file_system_id: DfsFileSystemId,
+    shard_id: String,
+    epoch: u64,
+    primary_node_id: sinomo_core::node::NodeId,
+}
+
+impl ParkedOn {
+    fn of(error: &DfsPosixError) -> Option<Self> {
+        match error {
+            DfsPosixError::Dfs(DfsError::RecordWaitParked {
+                file_system_id,
+                shard_id,
+                epoch,
+                primary_node_id,
+            }) => Some(Self {
+                file_system_id: file_system_id.clone(),
+                shard_id: shard_id.clone(),
+                epoch: *epoch,
+                primary_node_id: primary_node_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn changed_in(&self, shards: &[DfsMetadataShardConfig]) -> bool {
+        shards
+            .iter()
+            .find(|shard| {
+                shard.file_system_id == self.file_system_id && shard.shard_id == self.shard_id
+            })
+            .is_none_or(|shard| {
+                shard.epoch != self.epoch || shard.primary_node_id != self.primary_node_id
+            })
+    }
 }
 
 struct Cached {
@@ -53,6 +100,10 @@ struct Cached {
     running: AtomicBool,
     reconcile: AtomicBool,
     notify: Arc<tokio::sync::Notify>,
+    // Counts configuration publications. A pass that parked a read on a
+    // record a publication may already have replaced runs again.
+    publications: AtomicU64,
+    pass_publications: AtomicU64,
 }
 
 fn state_path(data_dir: &sinomo_core::local::SinomoDataDir) -> PathBuf {
@@ -104,6 +155,8 @@ fn cached(path: &Path) -> Result<Arc<Cached>, DfsError> {
         running: AtomicBool::new(false),
         reconcile: AtomicBool::new(true),
         notify: Arc::new(tokio::sync::Notify::new()),
+        publications: AtomicU64::new(0),
+        pass_publications: AtomicU64::new(0),
     });
     if cache.len() >= 64 {
         let old = cache
@@ -159,7 +212,30 @@ pub fn checkpoint_path(data_dir: &sinomo_core::local::SinomoDataDir) -> PathBuf 
 pub fn begin_pass(data_dir: &sinomo_core::local::SinomoDataDir) {
     if let Ok(cache) = cached(&state_path(data_dir)) {
         cache.wake.store(false, Ordering::Release);
+        cache.pass_publications.store(
+            cache.publications.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         cache.state.lock().unwrap().next_due = Some(0);
+    }
+}
+
+/// The node published a new DFS configuration. A source or managed-directory
+/// page whose read parked on an unreachable shard primary is tried again if
+/// its shard's record changed; the pass compares each parked record with the
+/// current shard records it is given. A publication that leaves every parked
+/// record as it was sends nothing.
+pub fn configuration_published(data_dir: &sinomo_core::local::SinomoDataDir) {
+    if let Ok(cache) = cached(&state_path(data_dir)) {
+        cache.publications.fetch_add(1, Ordering::AcqRel);
+        let parked = {
+            let state = cache.state.lock().unwrap();
+            state.scan_parked.is_some() || state.tasks.iter().any(|task| task.parked.is_some())
+        };
+        if parked {
+            cache.wake.store(true, Ordering::Release);
+            cache.notify.notify_one();
+        }
     }
 }
 
@@ -239,6 +315,7 @@ fn enqueue(state: &mut State, source: DfsAttachmentSource, now: u64) -> bool {
         source,
         after: None,
         due: now,
+        parked: None,
     });
     true
 }
@@ -318,6 +395,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
         let result = (|| {
             if reconcile {
                 state.scan_retry_at = None;
+                state.scan_parked = None;
                 state.scan_root = 0;
                 state.frames.clear();
                 state.feeds.clear();
@@ -328,6 +406,26 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                     state.frames.clear();
                 }
                 state.known_catalogs = true;
+            }
+            // A read parked on a record that has since changed goes to the
+            // primary the current record names now, not at its retry time.
+            if state
+                .scan_parked
+                .as_ref()
+                .is_some_and(|parked| parked.changed_in(shards))
+            {
+                state.scan_parked = None;
+                state.scan_retry_at = None;
+            }
+            for task in &mut state.tasks {
+                if task
+                    .parked
+                    .as_ref()
+                    .is_some_and(|parked| parked.changed_in(shards))
+                {
+                    task.parked = None;
+                    task.due = task.due.min(now);
+                }
             }
             let local_shards = if shards.is_empty() {
                 vec![DfsMetadataShardConfig {
@@ -478,9 +576,11 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                         report.errors.push(e.to_string());
                         state.frames.push(frame);
                         state.scan_retry_at = Some(now.saturating_add(RETRY_NANOS));
+                        state.scan_parked = ParkedOn::of(&e);
                         break;
                     }
                 };
+                state.scan_parked = None;
                 if let Some(after) = page.next_cursor {
                     frame.after = Some(after);
                     state.frames.push(frame);
@@ -513,6 +613,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                     8,
                 ) {
                     Ok((after, due, reclaimed)) => {
+                        task.parked = None;
                         report.sources_processed += 1;
                         report.reclaimed_payloads += reclaimed;
                         task.after = after;
@@ -528,6 +629,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                     Err(error) => {
                         report.errors.push(error.to_string());
                         task.due = now.saturating_add(RETRY_NANOS);
+                        task.parked = ParkedOn::of(&error);
                         state.tasks.push_back(task);
                     }
                 }
@@ -545,7 +647,16 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                 .chain((queue_has_room && feed_more).then_some(now))
                 .min();
             crate::checkpoint::write_sobj_atomic(checkpoint, &state)?;
+            let parked =
+                state.scan_parked.is_some() || state.tasks.iter().any(|task| task.parked.is_some());
             *cache.state.lock().unwrap() = state;
+            let publications = cache.publications.load(Ordering::Acquire);
+            let read_at = cache.pass_publications.swap(publications, Ordering::AcqRel);
+            if parked && publications != read_at {
+                // A publication arrived after this pass read its shard
+                // records: compare the parked records with the newer ones.
+                cache.wake.store(true, Ordering::Release);
+            }
             Ok(report)
         })();
         if result.is_err() {

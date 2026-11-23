@@ -357,9 +357,9 @@ fn run_with_service_state<R>(
 }
 
 /// Run one mutation until it no longer hands back a wait for a newer shard
-/// record. Each run goes through the daemon handoff on its own, so between
-/// runs the request holds neither the service lane nor the mutation
-/// admission; the next run continues the same call.
+/// record. Between runs the request holds neither the service lane nor the
+/// mutation admission; the next run continues the same call, inside the same
+/// daemon handoff when the export has one.
 fn run_mutation<R>(
     service: &ExportLock<MountedSifsService>,
     handoff: Option<&NfsMountedMutationHandoff>,
@@ -367,20 +367,18 @@ fn run_mutation<R>(
     stable_operation_id: Option<String>,
     mut mutation: impl FnMut(&mut MountedSifsService) -> std::result::Result<R, DfsPosixError>,
 ) -> std::result::Result<R, nfsstat3> {
+    if let Some(handoff) = handoff {
+        return handoff
+            .run_operation(operation, stable_operation_id, service, mutation)
+            .map_err(map_posix_error);
+    }
     let mut replay = dfs::MountedSifsCallReplay::new();
     loop {
-        let result = match handoff {
-            Some(handoff) => handoff
-                .run_operation(operation, stable_operation_id.clone(), service, |service| {
-                    replay.run(service, &mut mutation)
-                })
+        let result = match dfs::MountedSifsCall::lock_service(service) {
+            Ok(mut service) => replay
+                .run(&mut *service, &mut mutation)
                 .map_err(map_posix_error),
-            None => match dfs::MountedSifsCall::lock_service(service) {
-                Ok(mut service) => replay
-                    .run(&mut *service, &mut mutation)
-                    .map_err(map_posix_error),
-                Err(_) => Err(nfsstat3::NFS3ERR_IO),
-            },
+            Err(_) => Err(nfsstat3::NFS3ERR_IO),
         };
         match replay.take_record_wait() {
             Some(wait) => wait.wait(),
@@ -576,13 +574,17 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let stat_kind = stat.kind.clone();
+        // One id for the request's truncate, kept across its runs: the
+        // primary answers each repeat with what the first attempt did.
+        let operation_id = format!("nfs_truncate_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.setattr", None, move |service| {
                 if let Nfs3Option::Some(size) = setattr.size {
-                    stat = service.posix_truncate_file_for_object(
+                    stat = service.posix_truncate_file_for_object_with_operation_id(
                         &stat.object_id,
                         size,
                         write_options.clone(),
+                        &operation_id,
                     )?;
                 }
                 if let Nfs3Option::Some(mode) = setattr.mode {
@@ -674,9 +676,15 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let attrs = create_attrs(&attr, false);
+        let operation_id = format!("nfs_create_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.create", None, move |service| {
-                service.posix_create_file_with_attrs(&path, write_options.clone(), attrs)
+                service.posix_create_file_with_attrs_and_operation_id(
+                    &path,
+                    write_options.clone(),
+                    attrs,
+                    &operation_id,
+                )
             })
             .await?;
         let handle = self
@@ -813,13 +821,15 @@ impl NfsFileSystem for SifsNfsFileSystem {
                 ))
             })
             .await?;
+        let operation_id = format!("nfs_symlink_{}", dfs::DfsVersion::generate());
         let stat = self
             .mutate(deadline, "nfs.symlink", None, move |service| {
-                service.posix_symlink_with_create_attrs(
+                service.posix_symlink_with_create_attrs_and_operation_id(
                     &target,
                     &path,
                     write_options.clone(),
                     attrs,
+                    &operation_id,
                 )
             })
             .await?;

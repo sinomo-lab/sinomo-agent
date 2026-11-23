@@ -296,7 +296,8 @@ pub struct DfsBrowserBackend {
     data_dir: SinomoDataDir,
     host: Arc<dyn DfsBrowserServiceHost>,
     node_id: sinomo_core::node::NodeId,
-    service: Mutex<crate::MountedSifsService>,
+    /// A waiter sleeps until the holder releases the service; nothing polls.
+    service: crate::MountedSifsLock<crate::MountedSifsService>,
     replica_control_plane: Mutex<Option<Box<dyn crate::DfsControlPlaneKvClient>>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     stat_cache: Mutex<HashMap<String, DfsBrowserCachedStat>>,
@@ -463,7 +464,7 @@ pub(crate) fn release_browser_backends(data_dir: &SinomoDataDir) {
 /// served request, its waits observe that request's budget and departure
 /// until the borrow ends.
 struct BrowserRead<'a> {
-    service: std::sync::MutexGuard<'a, crate::MountedSifsService>,
+    service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>,
     served: Option<(
         crate::service_core::DfsServedRequestRestore,
         crate::served_request::DfsServedRequestExecution,
@@ -471,7 +472,7 @@ struct BrowserRead<'a> {
 }
 
 impl<'a> BrowserRead<'a> {
-    fn enter(mut service: std::sync::MutexGuard<'a, crate::MountedSifsService>) -> Self {
+    fn enter(mut service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>) -> Self {
         let served = ServedBrowserWork::current().map(|served| {
             let execution = served.enter_execution();
             (service.enter_served_request(&served), execution)
@@ -502,7 +503,7 @@ impl Drop for BrowserRead<'_> {
 }
 
 struct BrowserMutation<'a> {
-    service: std::sync::MutexGuard<'a, crate::MountedSifsService>,
+    service: crate::MountedSifsLockGuard<'a, crate::MountedSifsService>,
     tracker: crate::DfsCommittedWorkTracker,
     previous: Option<crate::DfsCommittedWorkTracker>,
     served_request: Option<crate::service_core::DfsServedRequestRestore>,
@@ -1027,7 +1028,7 @@ impl DfsBrowserBackend {
             data_dir,
             host,
             node_id,
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(replica_control_plane),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -1105,7 +1106,7 @@ impl DfsBrowserBackend {
 
     pub fn lock_service(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, crate::MountedSifsService>, ServiceError> {
+    ) -> Result<crate::MountedSifsLockGuard<'_, crate::MountedSifsService>, ServiceError> {
         self.service.lock().map_err(|source| {
             ServiceError::Service(format!("DFS browser service lock failed: {source}"))
         })
@@ -1153,28 +1154,21 @@ impl DfsBrowserBackend {
     }
 
     fn lock_service_for_read(&self) -> Result<BrowserRead<'_>, ServiceError> {
-        let started = Instant::now();
-        loop {
-            match self.service.try_lock() {
-                Ok(service) => return Ok(BrowserRead::enter(service)),
-                Err(std::sync::TryLockError::Poisoned(source)) => {
-                    return Err(ServiceError::Service(format!(
-                        "DFS browser service lock failed: {source}"
-                    )));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let Some(remaining) = DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT
-                        .checked_sub(started.elapsed())
-                        .filter(|remaining| !remaining.is_zero())
-                    else {
-                        return Err(ServiceError::Service(format!(
-                            "DFS browser service is busy after waiting {}ms; retry the read",
-                            DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT.as_millis()
-                        )));
-                    };
-                    std::thread::sleep(Duration::from_millis(1).min(remaining));
-                }
+        // The read sleeps until the holder releases the service, or until
+        // its admission bound passes.
+        match self.service.lock_until(Some(
+            Instant::now() + DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT,
+        )) {
+            Ok(service) => Ok(BrowserRead::enter(service)),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                Err(ServiceError::Service(format!(
+                    "DFS browser service is busy after waiting {}ms; retry the read",
+                    DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT.as_millis()
+                )))
             }
+            Err(source) => Err(ServiceError::Service(format!(
+                "DFS browser service lock failed: {source}"
+            ))),
         }
     }
 
@@ -4644,7 +4638,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: host.clone(),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4708,7 +4702,7 @@ mod tests {
             data_dir,
             host: Arc::new(UnusedHost::default()),
             node_id: node_id.clone(),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4753,7 +4747,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4853,7 +4847,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -4944,7 +4938,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -5139,6 +5133,50 @@ mod tests {
         );
     }
 
+    /// A browser read waits for the service on its release, not on a poll:
+    /// it enters as soon as the holder releases it, and is refused as busy
+    /// only at its admission bound.
+    #[test]
+    fn a_browser_read_enters_when_the_service_is_released_and_is_refused_at_its_bound() {
+        let (native, nodes) =
+            crate::test_runtime::DfsTestRuntime::start_cluster("browser-read-condition-wait", 1)
+                .unwrap();
+        let data = Arc::new(native.data_dir(&nodes[0]).clone());
+        let runtime = native.runtime_handle();
+        let backend =
+            DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &runtime).unwrap();
+        let held = backend.service.lock().unwrap();
+        let (started, entered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let backend = &backend;
+            let read = scope.spawn(move || {
+                let _ = started.send(Instant::now());
+                backend.with_read_service(|_| Ok(Instant::now()))
+            });
+            let started = entered.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let released = Instant::now();
+            drop(held);
+            let read_at = read.join().unwrap().expect("the read enters once released");
+            assert!(read_at >= released, "the read waited for the holder");
+            assert!(
+                read_at.duration_since(started) < DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT,
+                "the read entered at the release, within its bound"
+            );
+        });
+        let held = backend.service.lock().unwrap();
+        let started = Instant::now();
+        let refused = backend.with_read_service(|_| Ok(()));
+        assert!(
+            matches!(&refused, Err(ServiceError::Service(message)) if message.contains("busy")),
+            "{refused:?}"
+        );
+        assert!(started.elapsed() >= DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT);
+        drop(held);
+        drop(backend);
+        native.close().unwrap();
+    }
+
     #[test]
     fn hosted_write_releases_both_browser_locks_while_the_owner_executes() {
         struct Sink;
@@ -5251,7 +5289,7 @@ mod tests {
             node_id: node,
             data_dir: (*data_dir).clone(),
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(None),
             stat_cache: Mutex::new(HashMap::new()),
@@ -5371,7 +5409,7 @@ mod tests {
             node_id: service.node_id().clone(),
             data_dir,
             host: Arc::new(UnusedHost::default()),
-            service: Mutex::new(service),
+            service: crate::MountedSifsLock::new(service),
             replica_control_plane: Mutex::new(None),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),

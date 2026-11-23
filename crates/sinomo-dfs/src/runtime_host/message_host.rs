@@ -4677,9 +4677,13 @@ pub(crate) async fn handle_daemon_dfs_message_async(
 
 /// Dispatch the existing owned phase after service/admission release. The
 /// registered host joins its actual blocking child even when its caller leaves.
+///
+/// A read made with the request's lanes released is the request's own: when
+/// `requester` leaves, the read's call ends with it.
 pub(super) async fn dispatch_daemon_dfs_remote_namespace_phase(
     data_dir: &SinomoDataDir,
     phase: Box<crate::source_adoption::RemoteNamespacePhase>,
+    requester: Option<sinomo_dfs::DfsCancellationFlag>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Box<crate::source_adoption::CompletedRemoteNamespacePhase>, DaemonError> {
     let task_owner = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DaemonError::Parse {
@@ -4687,7 +4691,14 @@ pub(super) async fn dispatch_daemon_dfs_remote_namespace_phase(
     })?;
     let data_owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))?;
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let read_requester = requester.filter(|_| {
+        matches!(
+            *phase,
+            crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(_)
+        )
+    });
     let task = runtime.spawn_blocking(move || {
+        let _requester = crate::node_transport::DfsSendCancellationScope::enter(read_requester);
         let result = phase.dispatch().map(Box::new);
         drop(data_owner);
         let _ = result_tx.send(result);
@@ -6092,7 +6103,13 @@ async fn handle_served_daemon_dfs_message(
                 // The selected service mutex, checkout and mutation admission
                 // have all ended. Only the actual source fences/owner remain.
                 completed_remote_phase = Some(
-                    dispatch_daemon_dfs_remote_namespace_phase(&data_dir, phase, runtime).await?,
+                    dispatch_daemon_dfs_remote_namespace_phase(
+                        &data_dir,
+                        phase,
+                        Some(served.cancellation().clone()),
+                        runtime,
+                    )
+                    .await?,
                 );
                 command = original;
                 metadata_authority_preflight = Some(

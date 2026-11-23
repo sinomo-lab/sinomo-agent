@@ -496,7 +496,8 @@ pub fn module_registration() -> sinomo_module::ModuleRegistration {
             ),
         )
         .subscribe_event(namespace_subscription())
-        .subscribe_event(cluster_control_subscription());
+        .subscribe_event(cluster_control_subscription())
+        .subscribe_event(configuration_subscription());
     registration.component = descriptor;
     registration
 }
@@ -528,6 +529,11 @@ pub fn component_factory()
             .map_err(|error| {
                 sinomo_module::ComponentError::component(&caller.component_id, error)
             })?;
+        let configuration_events = event_client
+            .subscribe(&configuration_subscription())
+            .map_err(|error| {
+                sinomo_module::ComponentError::component(&caller.component_id, error)
+            })?;
         mount_attachment_maintenance(
             scope,
             Arc::new(context.data_dir().clone()),
@@ -537,6 +543,7 @@ pub fn component_factory()
             Arc::clone(&feature_runtime),
             namespace_events,
             cluster_events,
+            configuration_events,
         );
         let service = HostedFeatureService {
             runtime,
@@ -580,6 +587,15 @@ fn cluster_control_subscription() -> sinomo_module::ComponentEventSubscription {
         sinomo_module::COMPONENT_HOST_CLUSTER_CONTROL_CHANGED_EVENT_KIND,
         sinomo_module::COMPONENT_HOST_EVENT_SCHEMA_ID,
         sinomo_module::COMPONENT_HOST_EVENT_SCHEMA_VERSION,
+    )
+}
+/// A shard record change reaches the cleanup worker as a configuration
+/// publication: a read parked on that shard's former primary is tried again.
+fn configuration_subscription() -> sinomo_module::ComponentEventSubscription {
+    sinomo_module::ComponentEventSubscription::new(
+        DFS_CONFIGURATION_PUBLISHED_EVENT_KIND,
+        DFS_CONFIGURATION_EVENT_SCHEMA_ID,
+        DFS_CONFIGURATION_EVENT_SCHEMA_VERSION,
     )
 }
 fn namespace_subscription() -> sinomo_module::ComponentEventSubscription {
@@ -641,6 +657,7 @@ fn mount_attachment_maintenance(
     feature_runtime: Arc<AttachmentRuntime>,
     mut namespace_events: sinomo_module::ComponentEventReceiver,
     mut cluster_events: sinomo_module::ComponentEventReceiver,
+    mut configuration_events: sinomo_module::ComponentEventReceiver,
 ) {
     let mut shutdown = scope.shutdown_receiver();
     let owner_runtime = runtime.clone();
@@ -703,6 +720,14 @@ fn mount_attachment_maintenance(
                         Err(sinomo_module::ComponentEventReceiveError::Closed) => break,
                         Err(sinomo_module::ComponentEventReceiveError::Lagged { .. }) => crate::attachment_maintenance::request_reconciliation(&data_dir),
                         Ok(_) => crate::attachment_maintenance::notify(&data_dir),
+                    }
+                }
+                // A lagged stream may have dropped a publication; the pass
+                // compares parked records with the current ones either way.
+                event = configuration_events.recv() => {
+                    match event {
+                        Err(sinomo_module::ComponentEventReceiveError::Closed) => break,
+                        _ => crate::attachment_maintenance::configuration_published(&data_dir),
                     }
                 }
             }

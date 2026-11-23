@@ -16,9 +16,10 @@
 //! longer needs is not answered with another call's answer. The call that
 //! handed its wait back resumes where it stopped: with its operation id, its
 //! body, its re-send timer, what its earlier attempts left and its own
-//! budget. Once a run has
-//! sent a change this replay cannot answer again, such as a content write, it
-//! keeps waiting where it is.
+//! budget. A write whose primary answered that it holds the write is not
+//! sent again: the next run waits for the primary's answer again. Once a run
+//! has sent a change this replay cannot answer again, such as a content write
+//! made without its caller's id, it keeps waiting where it is.
 
 use crate::service_record_follow::{
     DfsFollowedNamespaceRoute, DfsNamespaceFollow, DfsRecordFollowResend,
@@ -108,6 +109,10 @@ pub(crate) struct DfsMountedCallScope {
     /// Calls in progress whose every change goes under its caller's id, so
     /// that a later run answers it again.
     replayable_depth: usize,
+    /// The routed writes whose primary holds them and whose wait for the
+    /// primary's answer a run handed back, by request id. Their bodies stay
+    /// with the requester until the call ends.
+    held_writes: Vec<String>,
 }
 
 /// One mounted adapter call, run until it no longer hands a record wait
@@ -158,6 +163,13 @@ impl MountedSifsCallReplay {
             .take()
             .expect("a mounted call's run keeps its scope");
         self.record_wait = scope.handed_back.take();
+        if self.record_wait.is_none() {
+            // The call ended: a held write it no longer waits for keeps only
+            // what a late answer needs.
+            for request_id in std::mem::take(&mut scope.held_writes) {
+                service.compact_pending_routed_write(&request_id);
+            }
+        }
         self.scope = Some(scope);
         result
     }
@@ -402,6 +414,76 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.transport
             .set_incoming_arrival_waker(Some(Arc::new(move || wake_watch())));
         self.hand_back_mounted_probe_wait(resend, watch, until)
+    }
+
+    /// Hand the wait for the answer to a routed write its primary holds
+    /// back to the mount. The write keeps its body, and the call's next run
+    /// sends nothing for it (see [`Self::mounted_held_routed_write`]). A
+    /// message that arrives for the mount, such as the primary's answer, ends
+    /// the wait. Returns the cancellation that ends this run.
+    pub(crate) fn hand_back_mounted_held_write_wait(
+        &mut self,
+        request_id: &str,
+        watch: Box<dyn DfsConfigurationChangeWatch>,
+        until: Instant,
+    ) -> DfsError {
+        let wake_watch = watch.waker();
+        self.transport
+            .set_incoming_arrival_waker(Some(Arc::new(move || wake_watch())));
+        let cancellation = self.cancellation.clone();
+        if let Some(scope) = self.mounted_call.as_mut() {
+            if !scope.held_writes.iter().any(|held| held == request_id) {
+                scope.held_writes.push(request_id.to_owned());
+            }
+            scope.handed_back = Some(MountedSifsRecordWait {
+                watch,
+                until,
+                cancellation,
+            });
+        }
+        record_wait_handed_back()
+    }
+
+    /// The outcome a run of a mounted call takes for the routed write
+    /// `request_id` it is about to send under `shard`'s record, when an
+    /// earlier run sent that write and its primary holds it. The run sends
+    /// nothing: it takes the primary's answer if one arrived, and otherwise
+    /// waits for that answer again. `None` when the call holds no such write,
+    /// or when the write is unanswered and the record the run plans with is
+    /// another one, so that the write goes to the primary that record names.
+    pub(crate) fn mounted_held_routed_write(
+        &self,
+        request_id: &str,
+        shard: &crate::DfsMetadataShardConfig,
+    ) -> Option<Result<crate::NetworkedDfsWriteOutcome, DfsError>> {
+        let scope = self.mounted_call.as_ref()?;
+        if !scope.held_writes.iter().any(|held| held == request_id) {
+            return None;
+        }
+        let pending = self.writes.pending_routed_writes.get(request_id)?;
+        if pending.canonical_request_id != request_id {
+            return None;
+        }
+        if let Some(answered) = &pending.result {
+            return Some(answered.clone());
+        }
+        let sent_under = &pending.authority_shard;
+        (pending.follow.is_none()
+            && pending.command.is_some()
+            && sent_under.file_system_id == shard.file_system_id
+            && sent_under.shard_id == shard.shard_id
+            && sent_under.epoch == shard.epoch
+            && sent_under.primary_node_id == shard.primary_node_id)
+            .then(|| {
+                Ok(crate::NetworkedDfsWriteOutcome::Pending {
+                    intent_id: pending
+                        .remote_intent_id
+                        .clone()
+                        .unwrap_or_else(|| pending.canonical_request_id.clone()),
+                    durable_receipts: pending.durable_receipts,
+                    required_receipts: pending.required_receipts,
+                })
+            })
     }
 
     /// The re-send timer of the probe an earlier run handed back.

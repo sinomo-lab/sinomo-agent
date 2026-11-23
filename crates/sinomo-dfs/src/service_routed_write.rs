@@ -2961,14 +2961,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some((canonical, evidence, false)) = self.unresolved_routed_write(request_id) else {
             return Ok(RoutedWriteRecordFollow::NotFollowed);
         };
-        match self.await_shard_record_change(
-            &evidence,
-            None,
-            crate::service_record_follow::DfsRecordWaitWake {
-                on_arrival: true,
-                at: Some(wake_at),
-            },
-        )? {
+        let followed = if self.mounted_call_hands_back_waits() {
+            // The mount waits for the primary's answer with its lock
+            // released. The primary holds the write, so the call's next run
+            // does not send it again: it waits for the answer again.
+            match self.record_change_or_watch_until(&evidence, wake_at)? {
+                crate::service_record_follow::DfsRecordChangeNow::Due(followed) => followed,
+                crate::service_record_follow::DfsRecordChangeNow::NotYet { watch, until } => {
+                    return Err(self.hand_back_mounted_held_write_wait(&canonical, watch, until));
+                }
+            }
+        } else {
+            self.await_shard_record_change(
+                &evidence,
+                None,
+                crate::service_record_follow::DfsRecordWaitWake {
+                    on_arrival: true,
+                    at: Some(wake_at),
+                },
+            )?
+        };
+        match followed {
             crate::service_record_follow::DfsRecordFollowed::Newer(record) => {
                 self.dispatch_held_routed_write(&canonical, &record, true)?;
                 Ok(RoutedWriteRecordFollow::Resent)

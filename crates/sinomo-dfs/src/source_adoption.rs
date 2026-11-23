@@ -2082,6 +2082,41 @@ impl RemoteNamespacePhase {
     }
 }
 
+/// Call `target`. When `requester` is set, the call is driven as a future and
+/// ends as soon as the requester leaves: the serving node sees its stream end.
+fn call_until_requester_leaves(
+    transport: &dyn sinomo_module::ComponentObjectRpcTransport,
+    runtime: &tokio::runtime::Handle,
+    target: &sinomo_core::node::NodeId,
+    call: sinomo_core::network::ObjectRpcCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    requester: Option<crate::DfsCancellationFlag>,
+) -> std::result::Result<sinomo_core::network::ObjectRpcResult, sinomo_core::network::NetworkError>
+{
+    let Some(requester) = requester else {
+        return transport.call(target, call, options, true);
+    };
+    let run = || {
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = requester.cancelled() => Err(sinomo_core::network::NetworkError::delivery_failed(
+                    "read with lanes released",
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    "the requester left before the read was answered",
+                )),
+                result = transport.call_async(target, call, options, true) => result,
+            }
+        })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run)
+        }
+        _ => run(),
+    }
+}
+
 impl RemoteTargetNamespacePhase {
     fn source_offer(&self) -> Result<Option<&DfsSourceAdoptionOffer>> {
         match &self.command.operation {
@@ -2203,11 +2238,13 @@ impl RemoteTargetNamespacePhase {
             }),
             None => (options, call),
         };
-        let mut result = match self.actor.transport.call(
+        let mut result = match call_until_requester_leaves(
+            self.actor.transport.as_ref(),
+            &self.actor.runtime,
             &self.pending.primary_node_id,
             call,
             options,
-            true,
+            crate::node_transport::current_dfs_send_cancellation(),
         ) {
             Ok(result) => result,
             Err(cause) => {
@@ -2547,5 +2584,99 @@ mod guarded_kernel_terminal_tests {
         );
         drop(actor);
         runtime.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod requester_departure_tests {
+    use super::*;
+
+    /// A carrier whose call is never answered.
+    struct SilentCarrier;
+
+    impl sinomo_module::ComponentObjectRpcTransport for SilentCarrier {
+        fn call(
+            &self,
+            _target: &NodeId,
+            _call: sinomo_core::network::ObjectRpcCall,
+            _options: sinomo_core::network::ClusterObjectRpcOptions,
+            _observe: bool,
+        ) -> std::result::Result<
+            sinomo_core::network::ObjectRpcResult,
+            sinomo_core::network::NetworkError,
+        > {
+            Err(sinomo_core::network::NetworkError::delivery_failed(
+                "silent carrier",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                "the blocking call is not the one a leaving requester drives",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            _target: &'a NodeId,
+            _call: sinomo_core::network::ObjectRpcCall,
+            _options: sinomo_core::network::ClusterObjectRpcOptions,
+            _observe: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            sinomo_core::network::ObjectRpcResult,
+                            sinomo_core::network::NetworkError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A read made with its request's lanes released ends when its requester
+    /// leaves, not at its budget or the network's verdict.
+    #[test]
+    fn a_read_with_lanes_released_ends_when_its_requester_leaves() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let requester = crate::DfsCancellationFlag::new();
+        let leaving = requester.clone();
+        let handle = runtime.handle().clone();
+        let read = std::thread::spawn(move || {
+            let call = sinomo_core::network::ObjectRpcCall {
+                request: sinomo_core::network::ObjectRpcRequest::from_encoded_body(
+                    crate::DFS_DATA_NAMESPACE_ROUTE,
+                    "dfs",
+                    Vec::new(),
+                ),
+                body: sinomo_core::network::ObjectRpcBodySource::empty(),
+            };
+            call_until_requester_leaves(
+                &SilentCarrier,
+                &handle,
+                &NodeId::generate(),
+                call,
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+                Some(requester),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!read.is_finished(), "the read waits for its answer");
+        let left = std::time::Instant::now();
+        leaving.cancel();
+        let ended = read.join().unwrap();
+        assert!(left.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            matches!(
+                &ended,
+                Err(error) if error.delivery_state()
+                    == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+            ),
+            "{:?}",
+            ended.as_ref().err()
+        );
     }
 }

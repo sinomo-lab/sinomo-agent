@@ -198,6 +198,17 @@ pub enum DfsError {
         shard_id: String,
         epoch: u64,
     },
+    /// A read that asked every shard found no deciding answer and needs the
+    /// answer of a shard whose primary it did not reach. That shard's record
+    /// stands and its re-send time came: the read asks every shard again.
+    #[error(
+        "metadata shard {shard_id} at epoch {epoch} is due to be asked again; the read plans again"
+    )]
+    ShardAnswerDue {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+    },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
     #[error("path already exists: {path}")]

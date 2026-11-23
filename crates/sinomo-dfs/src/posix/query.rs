@@ -351,8 +351,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Run an attribute read again each time it ends because a shard record
-    /// it read changed: each run plans at the current records. Every run
-    /// after the first follows a record change, so the reads never spin.
+    /// it read changed, or because a shard whose answer it needs is due to
+    /// be asked again: each run plans at the current records. Every run
+    /// after the first follows a record change or a re-send time, so the
+    /// reads never spin.
     pub(super) fn replan_on_record_change<R>(
         &mut self,
         mut read: impl FnMut(&mut Self) -> Result<R>,
@@ -360,13 +362,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Only a read that plans again lets its metadata queries follow their
         // records; one planned inside another operation keeps its plan.
         let previous = std::mem::replace(&mut self.attribute_read_replans, true);
+        if !previous {
+            self.attribute_read_resend = None;
+        }
         let result = loop {
             match read(self) {
-                Err(DfsPosixError::Dfs(DfsError::ShardRecordChanged { .. })) => {}
+                Err(DfsPosixError::Dfs(
+                    DfsError::ShardRecordChanged { .. } | DfsError::ShardAnswerDue { .. },
+                )) => {}
                 result => break result,
             }
         };
         self.attribute_read_replans = previous;
+        if !previous {
+            self.attribute_read_resend = None;
+        }
         result
     }
 

@@ -96,6 +96,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             mounted_call: None,
             record_waits_parked: false,
             attribute_read_replans: false,
+            attribute_read_resend: None,
         }
     }
 }

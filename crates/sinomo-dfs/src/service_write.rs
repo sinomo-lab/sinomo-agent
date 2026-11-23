@@ -779,6 +779,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         candidate_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         foreground_replica_repair: bool,
+        operation_id: Option<String>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
@@ -801,7 +802,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 dispatch: DfsWriteDispatch::AwaitResponse,
                 replay_response_journal: true,
-                operation_id: None,
+                operation_id,
             },
         )
     }
@@ -3210,6 +3211,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence = if !detach_request
@@ -3444,6 +3450,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: DfsMetadataShardConfig,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = operation_id.unwrap_or_else(|| self.next_request_id());
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let (hash, size, attachment, attachment_bytes, patch_attachment) = match source {
             DfsPatchSource::Bytes(bytes) => {
                 let bytes = bytes::Bytes::copy_from_slice(bytes);
@@ -3582,6 +3593,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence = if !detach_request
@@ -3729,6 +3745,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let capture_started = Instant::now();
         let manifest = self.content.put_object_version_from_reader(
             request.object_id.as_str(),
@@ -3817,6 +3838,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => self.next_request_id(),
         };
+        // A write an earlier run of this mounted call sent, whose primary
+        // holds it, is not sent again: the run takes or awaits its answer.
+        if let Some(held) = self.mounted_held_routed_write(&request_id, &shard) {
+            return held;
+        }
         let primary_node_id = shard.primary_node_id.clone();
         let (command_content_hash, command_content_size_bytes) = if captured_size == 0 {
             (None, None)

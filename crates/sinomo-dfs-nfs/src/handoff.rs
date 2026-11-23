@@ -136,17 +136,23 @@ impl NfsMountedMutationHandoff {
     /// export's re-sender and the request ends with an I/O error; the export
     /// keeps serving. The service lock is held only while the mutation runs,
     /// never across a wait for the daemon.
+    ///
+    /// A run that hands back a wait for a newer shard record runs again after
+    /// that wait, which the request makes holding neither the service lock
+    /// nor its mutation admission. The marker stays armed across the runs, so
+    /// a waiting request writes nothing to the outbox: the daemon is handed
+    /// the work of every run once, when the request ends.
     pub(crate) fn run_operation<R>(
         &self,
         operation: &'static str,
         stable_operation_id: Option<String>,
         service: &ServiceLock,
-        mutation: impl FnOnce(
+        mut mutation: impl FnMut(
             &mut dfs::MountedSifsService,
         ) -> std::result::Result<R, dfs::DfsPosixError>,
     ) -> std::result::Result<R, dfs::DfsPosixError> {
         let deadline = dfs::MountedSifsCall::deadline();
-        let _admission = self.admit().map_err(handoff_posix_error)?;
+        let mut admission = Some(self.admit().map_err(handoff_posix_error)?);
         // A full outbox is not a refusal: wait for a marker's release.
         let mut prepared = None;
         let mut stable_operation_id = Some(stable_operation_id);
@@ -187,23 +193,42 @@ impl NfsMountedMutationHandoff {
                 return Err(ended_error("Arm", ended));
             }
         }
-        let report = {
-            let mut service = match dfs::MountedSifsCall::lock_service(service) {
-                Ok(service) => service,
-                Err(error) => {
-                    self.finish_no_write(
-                        lease,
-                        &arm_request_id,
-                        "nfs-service-not-entered",
-                        deadline,
-                    )?;
-                    return Err(handoff_posix_error(DfsNfsError::Dfs(error.to_string())));
-                }
-            };
-            service.capture_mounted_mutation(mutation)
+        let mut entered = match dfs::MountedSifsCall::lock_service(service) {
+            Ok(service) => service,
+            Err(error) => {
+                self.finish_no_write(lease, &arm_request_id, "nfs-service-not-entered", deadline)?;
+                return Err(handoff_posix_error(DfsNfsError::Dfs(error.to_string())));
+            }
         };
-        let captured = dfs::MountedSifsMutationCapturedWork::new(report.committed_work);
-        match report.outcome {
+        let mut replay = dfs::MountedSifsCallReplay::new();
+        let mut committed_work = dfs::DfsCommittedWork::default();
+        let outcome = loop {
+            let report =
+                entered.capture_mounted_mutation(|service| replay.run(service, &mut mutation));
+            drop(entered);
+            committed_work.merge(report.committed_work);
+            let Some(wait) = replay.take_record_wait() else {
+                break report.outcome;
+            };
+            drop(admission.take());
+            wait.wait();
+            let reentered = self.admit().and_then(|admitted| {
+                dfs::MountedSifsCall::lock_service(service)
+                    .map(|service| (admitted, service))
+                    .map_err(|error| DfsNfsError::Dfs(error.to_string()))
+            });
+            match reentered {
+                Ok((admitted, service)) => {
+                    admission = Some(admitted);
+                    entered = service;
+                }
+                // The runs before may have written: what they left is handed
+                // to the daemon as observed.
+                Err(error) => break Err(handoff_posix_error(error)),
+            }
+        };
+        let captured = dfs::MountedSifsMutationCapturedWork::new(committed_work);
+        match outcome {
             Ok(value) => {
                 self.finish_captured(lease, &arm_request_id, captured, deadline)?;
                 Ok(value)

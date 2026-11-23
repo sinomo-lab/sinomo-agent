@@ -857,6 +857,9 @@ pub struct NetworkedDfsService<T> {
     /// An attribute read is in progress that plans again when a shard
     /// record it reads changes: its metadata queries follow their records.
     pub(crate) attribute_read_replans: bool,
+    /// The re-send timer of that attribute read, carried across its runs
+    /// while it waits for a shard whose answer it needs.
+    pub(crate) attribute_read_resend: Option<crate::service_record_follow::DfsRecordFollowResend>,
     pub(crate) writes: DfsWriteState,
     pub(crate) reads: DfsReadState,
     pub(crate) replication: DfsReplicationState,
@@ -892,7 +895,8 @@ pub struct DfsCommittedWork {
 }
 
 impl DfsCommittedWork {
-    pub(crate) fn merge(&mut self, work: Self) {
+    /// Add the work edges `work` records to these.
+    pub fn merge(&mut self, work: Self) {
         self.publish_metadata |= work.publish_metadata;
         self.repair_maintenance |= work.repair_maintenance;
         self.namespace_maintenance |= work.namespace_maintenance;
