@@ -3533,9 +3533,13 @@ fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
         assert_eq!(prepare.shard_id, completed.authority_shard_id);
         assert!(
             backend
-                .prepared_operation_for_request(&requester, request_id)
+                .prepared_operations_for_request(
+                    &completed.authority_shard_id,
+                    &requester,
+                    request_id
+                )
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         if no_op {
             // Every current v7 semantic effect is sealed in prepare + commit.

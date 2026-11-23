@@ -56,20 +56,6 @@ pub(crate) fn directory_child_authority_shards<'a>(
         .collect())
 }
 
-fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) -> bool {
-    matches!(
-        operation,
-        DfsNamespaceOperation::Mkdir { .. }
-            | DfsNamespaceOperation::MkdirWithAttrs { .. }
-            | DfsNamespaceOperation::MkdirAtNoLinks { .. }
-            | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(_)
-            | DfsNamespaceOperation::MkdirAll { .. }
-            | DfsNamespaceOperation::ConditionalUnlink { .. }
-            | DfsNamespaceOperation::ConditionalRmdir { .. }
-            | DfsNamespaceOperation::ConditionalRename { .. }
-    )
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A live assignment-boundary directory needs no child/parent mutation.
     /// Observe it at its current owner before requesting that wider footprint.
@@ -874,9 +860,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    /// Keep caller-owned stable admission when routing discovers local
-    /// authority, including after a lost response. Direct execution would lose
-    /// the original durable identity and could create an untracked mutation.
+    /// Run a call whose shard record now names this node under the call's
+    /// own durable admission, as the primary serves any request: an attempt
+    /// an earlier primary applied, or prepared on the write set this node
+    /// belongs to, is answered from that request's rows rather than run a
+    /// second time. Operations without durable admission keep their own
+    /// repeat rule and run directly.
     fn execute_routed_namespace_operation_locally(
         &mut self,
         operation_id: Option<&str>,
@@ -885,14 +874,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let (Some(id), DfsNamespaceOperation::WriteFile { .. }) = (operation_id, operation) {
             return self.local_browser_write_reply(id.to_owned(), operation.clone());
         }
-        if let Some(operation_id) =
-            operation_id.filter(|_| namespace_operation_uses_stable_admission(operation))
-        {
-            self.execute_local_primary_namespace_operation_with_request_id(
-                operation_id.to_string(),
+        if let Some(operation_id) = operation_id.filter(|_| {
+            crate::service_routed_namespace::namespace_operation_uses_durable_request_admission(
+                operation,
+            )
+        }) {
+            let (result, coordination) = self.execute_local_primary_namespace_reply(
+                sifs_file_system_id(),
+                operation_id.to_owned(),
                 operation.clone(),
             )?;
-            return Ok(None);
+            return match result {
+                DfsNamespaceResult::Applied => Ok(coordination),
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            };
         }
         self.execute_posix_coordination_operation_local(operation)
     }
@@ -921,18 +920,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsPosixError::Dfs)?;
         let routed = match followed {
             DfsFollowedNamespaceRoute::Settled(routed) => routed,
-            // Authority moved to this node, which runs the step itself.
+            // Authority moved to this node, which runs the step itself:
+            // starting a job under the call's admission, resuming one by its
+            // durable job.
             DfsFollowedNamespaceRoute::LocalAuthority => {
                 return match &operation {
-                    DfsNamespaceOperation::RenameDirectoryBounded {
-                        from,
-                        to,
-                        max_steps,
-                    } => self.posix_rename_directory_bounded(
-                        from,
-                        to,
-                        usize::try_from(*max_steps).unwrap_or(usize::MAX),
-                    ),
+                    DfsNamespaceOperation::RenameDirectoryBounded { .. } => match self
+                        .execute_routed_namespace_operation_locally(
+                            Some(&operation_id),
+                            &operation,
+                        )? {
+                        Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
+                        _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                            message: "bounded namespace job omitted its typed receipt".to_string(),
+                        })),
+                    },
                     DfsNamespaceOperation::ResumeNamespaceJobBounded {
                         job_id, max_steps, ..
                     } => self.posix_resume_namespace_job_bounded(

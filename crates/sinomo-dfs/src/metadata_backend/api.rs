@@ -169,15 +169,24 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .current_tables_snapshot()?
             .prepared_operation_reservations(payload))
     }
-    fn prepared_operation_for_request(
+    fn prepared_operations_for_request(
         &self,
+        shard_id: &DfsMetadataShardId,
         requester: &NodeId,
         request_id: &str,
-    ) -> Result<Option<DfsPreparedOperationRecord>> {
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request prepares on shard {} do not live on backend shard {}",
+                shard_id.0, self.shard_id.0
+            )));
+        }
         let tables = self.current_tables_snapshot()?;
         Ok(tables
-            .prepared_operation_for_request(requester, request_id)?
-            .cloned())
+            .prepared_operations_for_request(requester, request_id)?
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1616,11 +1625,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let request = tables.namespace_requests.get(&request_key).cloned();
         let receipt = tables.namespace_request_receipts.get(&request_key).cloned();
         let prepared = tables
-            .prepared_operation_for_request(requester_node_id, request_id)?
-            .cloned();
+            .prepared_operations_for_request(requester_node_id, request_id)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let history_expired = request.is_none()
             && receipt.is_none()
-            && prepared.is_none()
+            && prepared.is_empty()
             && tables.namespace_request_history_expired(requester_node_id, request_id);
         Ok(DfsNamespaceRequestAdmissionSnapshot {
             request,

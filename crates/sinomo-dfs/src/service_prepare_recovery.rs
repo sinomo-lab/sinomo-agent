@@ -19,8 +19,27 @@ pub(crate) struct DfsPreparedRecoveryPass {
     pub(crate) first_unknown: Option<DfsError>,
 }
 
+/// Journal order on each shard: a prepare recovers after the prepares its
+/// primary made before it, as a request's admission before its completion.
 fn sort_prepared_operations(prepares: &mut [DfsPreparedOperationRecord]) {
-    prepares.sort_by(|left, right| left.digest.operation_id.cmp(&right.digest.operation_id));
+    prepares.sort_by(|left, right| {
+        (
+            &left.digest.shard_id,
+            left.digest.prepare_sequence,
+            &left.digest.operation_id,
+        )
+            .cmp(&(
+                &right.digest.shard_id,
+                right.digest.prepare_sequence,
+                &right.digest.operation_id,
+            ))
+    });
+}
+
+/// The operation id under which a shard's current primary aborts a row
+/// prepare its request's final outcome made obsolete.
+fn retired_admission_operation_id(original: &str) -> String {
+    format!("retire-admission:{original}")
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -100,33 +119,123 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(pass)
     }
 
+    /// Recover the live prepares of at most `max_requests` of `requests`,
+    /// each on its authority shard, and return how many requests recovered
+    /// any. A request's prepares recover in journal order, its row prepares
+    /// first; the first whose commit outcome stays unknown ends that
+    /// request's turn, since what follows it depends on it.
     pub(crate) fn recover_durable_namespace_prepares_for_requests(
         &mut self,
-        requests: &BTreeSet<(NodeId, String)>,
-        max_prepares: usize,
+        requests: &BTreeSet<(DfsMetadataShardId, NodeId, String)>,
+        max_requests: usize,
     ) -> Result<usize, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(0);
         };
-        let mut records = Vec::new();
-        for (requester, request) in requests {
-            if let Some(record) = backend.prepared_operation_for_request(requester, request)? {
-                records.push(record);
+        let mut pending = Vec::new();
+        for (shard_id, requester, request) in requests {
+            if pending.len() >= max_requests {
+                break;
+            }
+            let mut records =
+                backend.prepared_operations_for_request(shard_id, requester, request)?;
+            if !records.is_empty() {
+                sort_prepared_operations(&mut records);
+                pending.push(records);
             }
         }
-        sort_prepared_operations(&mut records);
         let mut recovered = 0;
-        for record in records.into_iter().take(max_prepares) {
-            // An unknown outcome leaves the request pending; its admission
-            // answers the caller with that unknown outcome. Cancellation
-            // still stops this caller, which keeps the unfinished turn.
-            match self.recover_one_prepared_operation(record) {
-                Ok(done) => recovered += usize::from(done),
-                Err(error) if error.is_commit_outcome_unknown() && !error.is_cancellation() => {}
-                Err(error) => return Err(error),
+        for records in pending {
+            let mut done_any = false;
+            for record in records {
+                // An unknown outcome leaves the request pending; its admission
+                // answers the caller with that unknown outcome. Cancellation
+                // still stops this caller, which keeps the unfinished turn.
+                match self.recover_one_prepared_operation(record) {
+                    Ok(done) => done_any |= done,
+                    Err(error) if error.is_commit_outcome_unknown() && !error.is_cancellation() => {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
+            recovered += usize::from(done_any);
         }
         Ok(recovered)
+    }
+
+    /// Abort `record` if it is a row prepare of a request whose final
+    /// outcome the shard already holds: a request's receipt and its
+    /// completed row are final, so a row prepare that would replace either
+    /// can never commit. Only the shard's current primary, at `epoch`, does
+    /// so. Returns whether `record` was such a prepare.
+    fn retire_obsolete_namespace_admission(
+        &mut self,
+        record: &DfsPreparedOperationRecord,
+        epoch: u64,
+    ) -> Result<bool, DfsError> {
+        let rows = record
+            .metadata_effects
+            .iter()
+            .filter_map(|effect| match effect {
+                DfsPreparedMetadataEffect::PutNamespaceRequest { request } => {
+                    Some(request.as_ref().clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let backend = self
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "namespace admission recovery requires the current backend".into(),
+            })?;
+        let mut obsolete = false;
+        for row in &rows {
+            let outcome = backend.namespace_request_admission_snapshot(
+                &record.digest.shard_id,
+                &row.requester_node_id,
+                &row.request_id,
+            )?;
+            if crate::metadata_backend::prepared_operation::namespace_request_row_replaces_final_outcome(
+                outcome.receipt.is_some(),
+                outcome.request.as_ref(),
+                row,
+            ) {
+                obsolete = true;
+                break;
+            }
+        }
+        if !obsolete {
+            return Ok(false);
+        }
+        let operation_id = retired_admission_operation_id(&record.digest.operation_id);
+        if let Some(retiring) = backend.prepared_operation_record(&operation_id)? {
+            // An earlier retirement whose own commit is unknown, or that an
+            // earlier primary prepared, recovers as any other prepare.
+            if retiring.status == DfsPreparedOperationStatus::Prepared {
+                return self.recover_one_prepared_operation(retiring);
+            }
+            return Ok(true);
+        }
+        self.publish_metadata_effects_on_shard(
+            DfsPreparedOperationScope {
+                file_system_id: record.digest.file_system_id.clone(),
+                shard_id: record.digest.shard_id.clone(),
+                owner_epoch: epoch,
+                operation_id,
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![DfsPreparedMetadataEffect::ResolvePreparedOperation {
+                digest: record.digest.clone(),
+                status: DfsPreparedOperationStatus::Aborted,
+            }],
+        )?;
+        Ok(true)
     }
 
     pub(crate) fn recover_one_prepared_operation(
@@ -152,6 +261,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if self.control_plane.is_none() {
             if record.digest.owner_epoch == 0 {
+                if self.retire_obsolete_namespace_admission(&record, 0)? {
+                    return Ok(true);
+                }
                 let committed = self.commit_stored_prepared_operation(&record.digest)?;
                 self.finish_recovered_prepared_publication(
                     &committed.payload,
@@ -171,6 +283,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let shard = context.shard;
         if shard.primary_node_id != self.node_id || shard.epoch < record.digest.owner_epoch {
             return Ok(false);
+        }
+        if self.retire_obsolete_namespace_admission(&record, shard.epoch)? {
+            return Ok(true);
         }
         if shard.epoch != record.digest.owner_epoch {
             let operation_id = crate::metadata_records::recovery_operation_id(

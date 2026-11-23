@@ -161,8 +161,13 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
     let pending = users_owner
         .metadata_backend()
         .unwrap()
-        .prepared_operation_for_request(&requester, PENDING)
+        .prepared_operations_for_request(
+            &crate::DfsMetadataShardId::new(users.shard_id.clone()),
+            &requester,
+            PENDING,
+        )
         .unwrap()
+        .pop()
         .expect("the actual failed mkdir must retain its pending request and hidden prepare");
     let saved = pending.digest.clone();
     let payload = pending.payload.clone();

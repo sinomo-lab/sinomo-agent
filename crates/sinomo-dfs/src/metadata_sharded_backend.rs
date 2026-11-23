@@ -4746,26 +4746,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         Ok(records)
     }
-    fn prepared_operation_for_request(
+    fn prepared_operations_for_request(
         &self,
+        shard_id: &DfsMetadataShardId,
         requester: &NodeId,
         request_id: &str,
-    ) -> Result<Option<DfsPreparedOperationRecord>> {
-        let mut found = None;
-        for scanned in self.shards.scan() {
-            if let Some(record) = scanned?
-                .1
-                .prepared_operation_for_request(requester, request_id)?
-            {
-                if found.is_some() {
-                    return Err(MetadataBackendError::Serde(
-                        "request has competing physical shard owners".into(),
-                    ));
-                }
-                found = Some(record);
-            }
-        }
-        Ok(found)
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        self.shard_backend(shard_id)?
+            .prepared_operations_for_request(shard_id, requester, request_id)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6708,7 +6696,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(shard_id)?;
         let mut request = None;
         let mut receipt = None;
-        let mut prepared = None;
+        let mut prepared = Vec::new();
         let mut history_expired = false;
         // A scan: the admission shard itself opened above, and a request
         // admitted under a closed shard addresses it.
@@ -6735,17 +6723,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 }
                 receipt = Some(found);
             }
-            if let Some(found) = local.prepared {
-                if prepared.is_some() {
+            if !local.prepared.is_empty() {
+                if !prepared.is_empty() {
                     return Err(MetadataBackendError::Serde(format!(
                         "pending namespace request {requester_node_id}/{request_id} owns prepared transactions on multiple local shards"
                     )));
                 }
-                prepared = Some(found);
+                prepared = local.prepared;
             }
             history_expired |= local.history_expired;
         }
-        if request.is_some() || receipt.is_some() || prepared.is_some() {
+        if request.is_some() || receipt.is_some() || !prepared.is_empty() {
             history_expired = false;
         }
         Ok(DfsNamespaceRequestAdmissionSnapshot {

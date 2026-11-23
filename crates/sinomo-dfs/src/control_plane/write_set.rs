@@ -60,6 +60,8 @@ mod takeover_loss_native_tests;
 #[cfg(test)]
 mod takeover_native_tests;
 #[cfg(test)]
+mod successor_retry_native_tests;
+#[cfg(test)]
 mod tests;
 
 /// Persisted format of [`DfsMetadataShardWriteSet`]. Readers reject any other

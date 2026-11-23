@@ -2023,6 +2023,19 @@ pub(super) fn validate_metadata_effect_content_bindings(
     Ok(())
 }
 
+/// Whether putting `row` would replace a request's final outcome: its
+/// receipt, or a completed row it differs from. A request completes once.
+pub(crate) fn namespace_request_row_replaces_final_outcome(
+    receipt_exists: bool,
+    existing: Option<&crate::DfsNamespaceRequestRecord>,
+    row: &crate::DfsNamespaceRequestRecord,
+) -> bool {
+    receipt_exists
+        || existing.is_some_and(|existing| {
+            existing.status == crate::DfsNamespaceRequestStatus::Completed && existing != row
+        })
+}
+
 fn validate_metadata_effects(
     tables: &DfsMetadataTables,
     record: &DfsPreparedOperationRecord,
@@ -2373,6 +2386,22 @@ fn validate_metadata_effects(
                     return Err(MetadataBackendError::Serde(
                         "prepared resolution digest/scope/phase mismatch".into(),
                     ));
+                }
+            }
+            E::PutNamespaceRequest { request } => {
+                let key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                );
+                if namespace_request_row_replaces_final_outcome(
+                    tables.namespace_request_receipts.contains_key(&key),
+                    tables.namespace_requests.get(&key),
+                    request,
+                ) {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request {}/{} already holds its final outcome",
+                        request.requester_node_id, request.request_id
+                    )));
                 }
             }
             _ => {}

@@ -526,7 +526,8 @@ pub struct DfsMetadataHistoryEffectsPlan {
 pub struct DfsNamespaceRequestAdmissionSnapshot {
     pub request: Option<DfsNamespaceRequestRecord>,
     pub receipt: Option<DfsNamespaceRequestReceipt>,
-    pub prepared: Option<DfsPreparedOperationRecord>,
+    /// The request's live prepares on its authority shard, in journal order.
+    pub prepared: Vec<DfsPreparedOperationRecord>,
     pub history_expired: bool,
 }
 
@@ -955,11 +956,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .collect())
     }
 
-    fn prepared_operation_for_request(
+    /// The live prepares of one request on its authority shard, in journal
+    /// order: the row prepares that admit it, then the prepare that
+    /// completes it.
+    fn prepared_operations_for_request(
         &self,
+        shard_id: &DfsMetadataShardId,
         requester_node_id: &sinomo_core::node::NodeId,
         request_id: &str,
-    ) -> Result<Option<crate::DfsPreparedOperationRecord>>;
+    ) -> Result<Vec<crate::DfsPreparedOperationRecord>>;
 
     /// Shared observation-only view of already-held native storage. This performs
     /// no IO, opens no backend and conveys no writer or publication authority.

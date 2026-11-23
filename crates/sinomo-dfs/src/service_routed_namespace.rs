@@ -332,7 +332,9 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
     )
 }
 
-fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOperation) -> bool {
+pub(crate) fn namespace_operation_uses_durable_request_admission(
+    operation: &DfsNamespaceOperation,
+) -> bool {
     !namespace_operation_requires_fresh_authority(operation)
         && !matches!(
             operation,
@@ -393,6 +395,47 @@ fn namespace_prepare_matches_routed_command(
     attachment_matches
         && prepare.file_system_id == command.file_system_id
         && prepare.shard_id == *shard_id
+}
+
+/// Whether `prepare` is one of this command's own prepares: the prepare that
+/// completes it, or a row prepare that admits it under the same command.
+fn namespace_prepare_belongs_to_routed_command(
+    prepare: &DfsPreparedOperationRecord,
+    requester_node_id: &NodeId,
+    command: &DfsNamespaceCommand,
+    shard_id: &DfsMetadataShardId,
+    command_digest: &str,
+) -> bool {
+    if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some() {
+        return namespace_prepare_matches_routed_command(
+            &prepare.payload,
+            requester_node_id,
+            command,
+            shard_id,
+            command_digest,
+        );
+    }
+    prepare.file_system_id == command.file_system_id
+        && prepare.shard_id == *shard_id
+        && prepare
+            .payload
+            .metadata_effects
+            .iter()
+            .filter_map(|effect| match effect {
+                DfsPreparedMetadataEffect::PutNamespaceRequest { request } => Some(request),
+                _ => None,
+            })
+            .filter(|request| {
+                request.requester_node_id == *requester_node_id
+                    && request.request_id == command.request_id
+            })
+            .all(|request| {
+                request.file_system_id == command.file_system_id
+                    && request.authority_shard_id == *shard_id
+                    && request.command_digest == command_digest
+                    && request.operation_id
+                        == namespace_request_operation_id(requester_node_id, &command.request_id)
+            })
 }
 
 pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOperation) -> bool {
@@ -679,7 +722,7 @@ fn classify_stable_namespace_operation(
             },
         };
     }
-    if let Some(prepare) = snapshot.prepared.as_ref() {
+    if let Some(prepare) = snapshot.prepared.last() {
         if !namespace_prepare_matches_routed_command(
             &prepare.payload,
             requester_node_id,
@@ -1569,6 +1612,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .map(|request| {
                     (
+                        request.authority_shard_id.clone(),
                         request.requester_node_id.clone(),
                         request.request_id.clone(),
                     )
@@ -1738,7 +1782,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A live write-set continuation has already matched the exact native
         // digest and command. Let its final prepare reach the guarded commit
         // below instead of rediscovering it as an unrelated interrupted write.
-        let continuing_final = prepared.as_ref().is_some_and(|record| {
+        let continuing_final = |record: &DfsPreparedOperationRecord| {
             Some(&record.digest) == continuation
                 && record.completed_request_completion.is_some()
                 && namespace_prepare_matches_routed_command(
@@ -1748,11 +1792,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &shard_id,
                     &digest,
                 )
-        });
-        if let Some(mut existing) = existing {
-            if existing.file_system_id != command.file_system_id
-                || existing.command_digest != digest
-            {
+        };
+        // The request's live prepares, in journal order: the row prepares
+        // that admit it and the prepare that completes it. A successor
+        // holds them when the request's earlier primary prepared them on
+        // the write set and was lost before their commit reached it.
+        let live = prepared
+            .into_iter()
+            .filter(|record| !continuing_final(record))
+            .collect::<Vec<_>>();
+        if let Some(existing) = existing.as_ref()
+            && (existing.file_system_id != command.file_system_id
+                || existing.command_digest != digest)
+        {
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: format!(
+                    "namespace request id {}/{} was already used for a different command",
+                    requester_node_id, command.request_id
+                ),
+                posix_error: namespace_reconciliation_conflict(
+                    command,
+                    "durable operation id was already bound to a different command; reconcile the original outcome",
+                ),
+            });
+        }
+        if !live.is_empty() {
+            if live.iter().any(|record| {
+                !namespace_prepare_belongs_to_routed_command(
+                    record,
+                    requester_node_id,
+                    command,
+                    &shard_id,
+                    &digest,
+                )
+            }) {
                 return Ok(DurableNamespaceRequestAdmission::Reject {
                     reason: format!(
                         "namespace request id {}/{} was already used for a different command",
@@ -1764,51 +1837,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ),
                 });
             }
-            if existing.status == DfsNamespaceRequestStatus::Pending {
-                let owns_prepare = prepared.is_some() && !continuing_final;
-                if owns_prepare {
-                    if !recovering {
-                        let request_key = BTreeSet::from([(
-                            requester_node_id.clone(),
-                            command.request_id.clone(),
-                        )]);
-                        self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
-                        let recovered = self
-                            .metadata_backend
-                            .as_mut()
-                            .expect("metadata backend checked above")
-                            .namespace_request_admission_snapshot(
-                                &shard_id,
-                                requester_node_id,
-                                &command.request_id,
-                            )?;
-                        if let Some(recovered_request) = recovered.request {
-                            existing = recovered_request;
-                        } else if let Some(receipt) = recovered.receipt {
-                            return Ok(DurableNamespaceRequestAdmission::Replay {
-                                result: receipt.result,
-                                posix_coordination_result: receipt.posix_coordination_result,
-                            });
-                        } else {
-                            return Err(DfsError::Metadata {
-                                message: format!(
-                                    "request-owned namespace prepare lost admission {}/{} during recovery",
-                                    requester_node_id, command.request_id
-                                ),
-                            });
-                        }
-                    }
-                    if existing.status == DfsNamespaceRequestStatus::Pending {
-                        return Ok(DurableNamespaceRequestAdmission::Reject {
-                            reason: format!(
-                                "namespace request {}/{} has a durable hidden prepare awaiting recovery",
-                                requester_node_id, command.request_id
-                            ),
-                            posix_error: prepared.as_ref().map(namespace_prepare_outcome_unknown),
-                        });
-                    }
-                }
+            if !recovering {
+                // Decide from what those prepares record: recover them,
+                // row prepares first, then admit again.
+                let request_key = BTreeSet::from([(
+                    shard_id.clone(),
+                    requester_node_id.clone(),
+                    command.request_id.clone(),
+                )]);
+                self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
+                return self.admit_durable_namespace_request(
+                    requester_node_id,
+                    command,
+                    shard_id,
+                    true,
+                    continuation,
+                );
             }
+            let awaiting = live.last().expect("live prepares checked above");
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: format!(
+                    "namespace request {}/{} has a durable hidden prepare awaiting recovery",
+                    requester_node_id, command.request_id
+                ),
+                posix_error: Some(namespace_prepare_outcome_unknown(awaiting)),
+            });
+        }
+        if let Some(existing) = existing {
             return match existing.status {
                 DfsNamespaceRequestStatus::Completed => {
                     let Some(result) = existing.result else {
@@ -1833,45 +1888,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                 }
             };
-        }
-        if let Some(prepare) = prepared.filter(|_| !continuing_final) {
-            if !namespace_prepare_matches_routed_command(
-                &prepare.payload,
-                requester_node_id,
-                command,
-                &shard_id,
-                &digest,
-            ) {
-                return Ok(DurableNamespaceRequestAdmission::Reject {
-                    reason: format!(
-                        "namespace request id {}/{} was already used for a different command",
-                        requester_node_id, command.request_id
-                    ),
-                    posix_error: namespace_reconciliation_conflict(
-                        command,
-                        "durable operation id was already bound to a different command; reconcile the original outcome",
-                    ),
-                });
-            }
-            if !recovering {
-                let request_key =
-                    BTreeSet::from([(requester_node_id.clone(), command.request_id.clone())]);
-                self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
-                return self.admit_durable_namespace_request(
-                    requester_node_id,
-                    command,
-                    shard_id,
-                    true,
-                    None,
-                );
-            }
-            return Ok(DurableNamespaceRequestAdmission::Reject {
-                reason: format!(
-                    "namespace request {}/{} has a durable hidden prepare awaiting recovery",
-                    requester_node_id, command.request_id
-                ),
-                posix_error: Some(namespace_prepare_outcome_unknown(&prepare)),
-            });
         }
         if history_expired {
             return Ok(DurableNamespaceRequestAdmission::Reject {

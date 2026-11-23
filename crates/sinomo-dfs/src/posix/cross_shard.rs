@@ -2407,7 +2407,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if matches!(operation, DfsNamespaceOperation::AdoptHardlinkAlias { .. })
             && self.publication_execution.current().is_none()
         {
-            return self.route_namespace_operation_with_result(primary, operation);
+            // Under the job's phase id, as the owned phase sends it: a
+            // repeat is answered from the request it recorded.
+            return match job {
+                Some(job) => self.route_namespace_operation_with_request_id_and_result(
+                    Self::cross_shard_job_phase_operation_id(job, phase),
+                    primary,
+                    operation,
+                ),
+                None => self.route_namespace_operation_with_result(primary, operation),
+            };
         }
         if matches!(
             operation,

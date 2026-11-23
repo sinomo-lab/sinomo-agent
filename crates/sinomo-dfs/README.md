@@ -77,9 +77,16 @@ exact authority shard. A request-owned hidden prepare commits the namespace
 transaction and canonical terminal result in one table batch. Startup and
 reactive maintenance resume admissions interrupted before a prepare, while
 prepared transactions and durable namespace jobs follow their existing
-recovery paths. A completed record replays its result across restart, reuse
-with a different semantic operation is rejected, and `Pending` is an internal
-automatically recovering state rather than an operator action.
+recovery paths. A request's prepares are its admission, whether they record
+its row or complete it: a primary that holds them, the request's own or the
+member that took over its shard, recovers them in journal order before it
+admits a repeat, so the repeat is never admitted beside them. A caller whose
+shard record comes to name its own node runs the call there under the same
+admission. A completed record replays its result across restart and is
+final: no later row replaces it, and recovery aborts a row prepare it has
+superseded. Reuse with a different semantic operation is rejected, and
+`Pending` is an internal automatically recovering state rather than an
+operator action.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
