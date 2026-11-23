@@ -1609,6 +1609,7 @@ mod tests {
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             status: DfsWriteIntentStatus::Committed,
             content_hash: None,
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

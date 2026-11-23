@@ -494,7 +494,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Pending transfer ownership belongs to the current metadata primary,
     /// independently of the historical requesting node. Reconstruct it from
     /// the exact durable intent after a service-lane change or process restart;
-    /// neither a peer-provided stamp nor receipt count grants this role.
+    /// neither a peer-provided stamp nor receipt count grants this role. The
+    /// primary at an epoch above the one the write opened at owns it too: it
+    /// took the shard over and adopts the write at its own epoch.
     pub(crate) fn local_pending_write_authority_shard(
         &mut self,
         record: &DfsWriteIntentRecord,
@@ -525,7 +527,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|shard| {
                 shard.primary_node_id == self.node_id
                     && shard.file_system_id == record.file_system_id
-                    && shard.epoch == record.owner_epoch
+                    && shard.epoch >= record.owner_epoch
+            }))
+    }
+
+    /// Adopt an open write this node owns at an epoch above the one it
+    /// opened at: one `PutIntent` raises the row to this node's epoch, and
+    /// the resident intent follows the row. A write whose final prepare the
+    /// shard holds recovers that prepare instead. Returns the row as it now
+    /// stands.
+    pub(crate) fn adopt_open_write_at_current_epoch(
+        &mut self,
+        mut record: DfsWriteIntentRecord,
+    ) -> Result<DfsWriteIntentRecord, DfsError> {
+        let Some(shard) = self.local_pending_write_authority_shard(&record)? else {
+            return Ok(record);
+        };
+        if shard.epoch == record.owner_epoch {
+            return Ok(record);
+        }
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        self.adopt_prepared_write_intent_for_recovery(&mut record, Some(&shard_id))?;
+        if record.owner_epoch == shard.epoch {
+            self.coordinator
+                .adopt_intent_at_epoch(&record.intent_id, record.owner_epoch);
+        }
+        Ok(record)
+    }
+
+    /// The content size a write's row records: the size its row already
+    /// recorded, or the size of the live transfer that opened it.
+    fn recorded_write_content_size(
+        &self,
+        existing: Option<&DfsWriteIntentRecord>,
+        intent_id: &str,
+        content_hash: &str,
+    ) -> Option<u64> {
+        existing
+            .filter(|existing| existing.content_hash.as_deref() == Some(content_hash))
+            .and_then(|existing| existing.content_size_bytes)
+            .or_else(|| {
+                self.writes
+                    .pending_writes
+                    .get(intent_id)
+                    .filter(|pending| {
+                        pending.content_hash == content_hash && pending.size_bytes > 0
+                    })
+                    .map(|pending| pending.size_bytes)
+            })
+    }
+
+    /// The size of an open write's content: the size its row recorded, or
+    /// the size of matching content this node holds. A write whose size is
+    /// unknown has no transfer until a retry brings its verified content.
+    fn open_write_content_size(
+        &self,
+        record: &DfsWriteIntentRecord,
+        content_hash: &str,
+    ) -> Result<Option<u64>, DfsError> {
+        if let Some(size) = record.content_size_bytes {
+            return Ok(Some(size));
+        }
+        Ok(self
+            .pending_write_size_hint(&record.object_id, &record.target_version, content_hash)?
+            .or_else(|| {
+                self.local_object_version_manifest_size_if_matches(
+                    &record.object_id,
+                    &record.target_version,
+                    content_hash,
+                )
             }))
     }
 
@@ -533,7 +603,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         record: DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
-        let intent_id = record.intent_id.as_str();
+        let intent_id = record.intent_id.clone();
+        let intent_id = intent_id.as_str();
         if matches!(record.status, DfsWriteIntentStatus::PreconditionFailed { .. }) {
             self.coordinator.restore_intent(distributed_intent_from_record(&record))?;
             self.remove_pending_write_state(intent_id);
@@ -598,6 +669,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             false
         };
+        // An open write whose adoption recovered its final prepare is no
+        // longer open: that recovery owns its outcome.
+        let open = crate::intent::write_intent_status_is_active(&record.status);
+        let record = self.adopt_open_write_at_current_epoch(record)?;
+        if open && !crate::intent::write_intent_status_is_active(&record.status) {
+            return Ok(());
+        }
         let is_local_authoritative_pending = if !is_local_coordinator
             && !is_local_desired_replica_with_content
             && !is_local_authoritative_repair
@@ -613,10 +691,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Ok(());
         }
-        let size_bytes = self
-            .pending_write_size_hint(&record.object_id, &record.target_version, &content_hash)?
-            .or(local_manifest_size)
-            .unwrap_or(0);
+        let Some(size_bytes) = self.open_write_content_size(&record, &content_hash)? else {
+            return Ok(());
+        };
         if let Some(pending) = self.writes.pending_writes.get(intent_id) {
             if pending.object_id != record.object_id
                 || pending.version != record.target_version
@@ -942,6 +1019,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "intent persistence requires a current backend".into(),
             })?
             .get_intent(&intent.object_id, &intent.intent_id)?;
+        if let Some(content_hash) = content_hash {
+            record.content_size_bytes = self.recorded_write_content_size(
+                existing.as_ref(),
+                &intent.intent_id,
+                content_hash,
+            );
+        }
         if existing.is_none() && intent.state == DfsWriteIntentState::Aborted {
             existing = self.unpublished_write_intent_for_abort(&object, intent, content_hash)?;
         }
@@ -1076,6 +1160,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "intent persistence requires a current backend".into(),
             })?
             .get_intent(&intent.object_id, &intent.intent_id)?;
+        record.content_size_bytes =
+            self.recorded_write_content_size(existing.as_ref(), &intent.intent_id, content_hash);
         let mut effects = Vec::new();
         if let Some(existing) = existing.as_ref() {
             record.created_at = existing.created_at;
@@ -1642,6 +1728,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(content_hash),
             Some(base_object.clone()),
         );
+        pending_intent_record.content_size_bytes = Some(content_size_bytes);
         if let Some(existing) = self
             .metadata_backend
             .as_ref()
@@ -1678,6 +1765,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if crate::intent::DfsWriteIdentity::of_record(&existing)
                 != crate::intent::DfsWriteIdentity::of_record(&pending_intent_record)
                 || existing.content_hash != pending_intent_record.content_hash
+                || existing
+                    .content_size_bytes
+                    .is_some_and(|size| size != content_size_bytes)
             {
                 return Err(DfsError::Metadata {
                     message: "staged write differs from its captured nonterminal intent".into(),
@@ -1693,6 +1783,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(committed_object.clone()),
         );
         intent_record.created_at = pending_intent_record.created_at;
+        intent_record.content_size_bytes = Some(content_size_bytes);
         // Each sealed W receipt publishes at the slot generation its stage
         // send planned against, so a withdrawal after that plan fails the
         // prepared publication's generation compare. A copy staged without a
@@ -2280,6 +2371,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(object))
     }
 
+    /// A desired target of an open write that holds the write's exact
+    /// content, as the primary that took the write over does once a retry
+    /// left its content here, counts that copy: its receipt is recorded and
+    /// published with the write's row.
+    fn record_held_copy_of_open_write(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        let Some(resident) = self.coordinator.intent(&intent.intent_id).cloned() else {
+            return Ok(());
+        };
+        if resident.state != DfsWriteIntentState::AwaitingReceipts
+            || !resident.desired_replica_nodes.contains(&self.node_id)
+            || self
+                .coordinator
+                .receipts_for_intent(&resident.intent_id)
+                .iter()
+                .any(|receipt| receipt.replica_node_id == self.node_id)
+            || self.local_object_version_manifest_size_if_matches(
+                &resident.object_id,
+                &resident.target_version,
+                content_hash,
+            ) != Some(content_size_bytes)
+        {
+            return Ok(());
+        }
+        let updated = self
+            .coordinator
+            .record_durable_receipt(&resident.intent_id, self.node_id.clone())?;
+        self.put_metadata_intent_and_receipts(
+            &updated,
+            content_hash,
+            std::slice::from_ref(&self.node_id.clone()),
+        )
+    }
+
     /// Resume only existing publication checkpoints before consuming a real
     /// receipt. This phase never re-enters staging or commit readiness: those
     /// remain the caller's normal next steps after its receipt is recorded.
@@ -2354,6 +2483,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into(),
             });
         }
+        self.record_held_copy_of_open_write(intent, content_hash, content_size_bytes)?;
         self.try_apply_committed_intent_if_ready(&intent.intent_id)?;
         if self.should_stage_missing_replicas_after_write(&intent.intent_id) {
             self.stage_missing_desired_replicas_for_intent(&intent.intent_id, object)?;

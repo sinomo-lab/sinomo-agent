@@ -6440,6 +6440,7 @@ fn pending_write_intent_for_test(
         desired_replica_node_ids,
         status: DfsWriteIntentStatus::ReceiptsPending,
         content_hash: Some("blake3:pending-write".to_string()),
+        content_size_bytes: None,
         object_metadata: None,
         touch_parent_on_create: false,
         create_predecessor_object_id: None,

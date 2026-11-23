@@ -504,6 +504,7 @@ pub(crate) fn retained_repair_intent(
         policy: plan.policy.clone(),
         status: DfsWriteIntentStatus::Committed,
         content_hash: version.content_hash.clone(),
+        content_size_bytes: None,
         object_metadata: None,
         touch_parent_on_create: false,
         create_predecessor_object_id: None,

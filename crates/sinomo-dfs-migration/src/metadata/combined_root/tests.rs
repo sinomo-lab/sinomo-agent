@@ -277,6 +277,7 @@ fn staging_write(bound: &str, object: &DfsObjectMetadata) -> (DfsWriteIntentReco
         policy: DfsReplicationPolicy::new(1, 1).unwrap(),
         status: DfsWriteIntentStatus::Staging,
         content_hash: None,
+        content_size_bytes: None,
         object_metadata: Some(object.clone()),
         touch_parent_on_create: false,
         create_predecessor_object_id: None,

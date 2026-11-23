@@ -1115,11 +1115,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .expect("create event requires metadata");
         let path = crate::posix_path::normalized_posix_path_key(&object.path)
             .unwrap_or_else(|| object.path.clone());
-        let visible =
-            self.authoritative_metadata_object_for_path(&command.request.file_system_id, &path)?;
+        let visible = self
+            .authoritative_metadata_object_for_path(&command.request.file_system_id, &path)?
+            .filter(|current| current.kind != DfsObjectKind::Tombstone);
+        if visible.is_none() && !committed {
+            // The create is still open and nothing has taken its path: it
+            // commits under its own path check.
+            return Ok(());
+        }
         if let Some(current) = visible
             && current.object_id == command.request.object_id
-            && current.kind != DfsObjectKind::Tombstone
         {
             let same_event = current.last_modified_by_event_id.as_ref() == Some(&expected_event);
             let same_version = current.version == command.request.target_version;
@@ -1176,6 +1181,104 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Self::validate_recorded_write_retry(&record.payload, intent, hash, size)
+    }
+
+    /// Keep the content a same-id retry of an open write carries when this
+    /// node now owns the write and holds none of its content: the primary
+    /// the write opened at may have been the only node holding it. The
+    /// content is the write's own, verified against the hash its row or its
+    /// prepared opening recorded, so the write resumes from it here.
+    fn bind_retry_content_to_open_write(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsDistributedWriteCommand,
+        preingested_blob: &mut Option<ContentStoreQuarantinedBlob>,
+    ) -> Result<(), DfsError> {
+        if !command.publication.is_current()
+            || command.patch.is_some()
+            || requester_node_id != &command.request.requesting_node_id
+            || self.metadata_backend.is_none()
+            || self.transport.delegates_local_namespace_authority()
+        {
+            return Ok(());
+        }
+        let object = match self.current_object_for_write(&command.request.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => match command.object_metadata.as_ref() {
+                Some(object)
+                    if object.object_id == command.request.object_id
+                        && object.file_system_id == command.request.file_system_id =>
+                {
+                    object.clone()
+                }
+                _ => return Ok(()),
+            },
+            Err(error) => return Err(error),
+        };
+        let scope = match self.metadata_effect_scope_for_object(&object, command.request_id.clone())
+        {
+            Ok(scope) => scope,
+            Err(DfsError::StaleOwnerEpoch { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let intent_id = stable_write_intent_id(
+            requester_node_id,
+            &command.request.object_id,
+            &command.request_id,
+        );
+        let observed = self
+            .metadata_backend
+            .as_ref()
+            .expect("backend checked above")
+            .write_operation_admission_snapshot(
+                &scope.shard_id,
+                &object.file_system_id,
+                &object.object_id,
+                &intent_id,
+            )?;
+        let content_hash = routed_write_command_content_hash(command);
+        let open = observed
+            .intent
+            .filter(|intent| crate::intent::write_intent_status_is_active(&intent.status))
+            .or_else(|| {
+                observed.prepared.iter().find_map(|prepared| {
+                    prepared_intent_for_write(prepared, &object.object_id, &intent_id).cloned()
+                })
+            });
+        let Some(open) = open.filter(|open| {
+            open.content_hash.as_deref() == Some(content_hash.as_str())
+                && open.target_version == command.request.target_version
+                && open.owner_epoch < scope.owner_epoch
+        }) else {
+            return Ok(());
+        };
+        if self
+            .local_object_version_manifest_size_if_matches(
+                &open.object_id,
+                &open.target_version,
+                &content_hash,
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        if command.content_hash.is_none() {
+            self.store_command_bytes(
+                &open.object_id,
+                &open.target_version,
+                &content_hash,
+                &command.bytes,
+            )?;
+        } else if let Some(blob) =
+            preingested_blob.take_if(|blob| blob.content_hash == content_hash)
+        {
+            self.content.bind_quarantined_blob(
+                open.object_id.as_str(),
+                open.target_version.as_str(),
+                blob,
+            )?;
+        }
+        Ok(())
     }
 
     /// A restart may retain the original prepare before any applied intent
@@ -1253,17 +1356,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             } else {
                 validate_retained_write_opening(&prepared, original, &intent, content_hash)?;
-                if self.pending_write_size_hint(
-                    &object.object_id,
-                    &original.target_version,
-                    content_hash,
-                )? != Some(content_size_bytes)
+                // The retry's content is verified against the opening's hash;
+                // a size the opening recorded must agree with it.
+                if original
+                    .content_size_bytes
+                    .is_some_and(|size| size != content_size_bytes)
                 {
-                    return Err(DfsError::WriteReconciliationRequired {
+                    return Err(DfsError::WriteOperationIdConflict {
                         operation_id: command.request_id.clone(),
                         object_id: object.object_id.clone(),
-                        reason: "retained opening has no exact transfer size/source for this retry"
-                            .into(),
                     });
                 }
             }
@@ -1780,6 +1881,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .prepare_routed_patch_command(&mut command, &mut preingested_blob)
             .map(|manifest| patch_manifest = manifest)
         {
+            closed_storage_write_refusal(&error).unwrap_or_else(|| {
+                DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                    current_primary_node_id: None,
+                }
+            })
+        } else if let Err(error) = self.bind_retry_content_to_open_write(
+            &requester_node_id,
+            &command,
+            &mut preingested_blob,
+        ) {
             closed_storage_write_refusal(&error).unwrap_or_else(|| {
                 DfsDistributedWriteResult::Rejected {
                     reason: error.to_string(),
@@ -3879,6 +3991,7 @@ mod stable_reconciliation_tests {
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             status: DfsWriteIntentStatus::Committed,
             content_hash: Some(content_hash.to_string()),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

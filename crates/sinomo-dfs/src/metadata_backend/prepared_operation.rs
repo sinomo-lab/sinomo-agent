@@ -947,6 +947,7 @@ pub(crate) fn validate_preparation_against_tables(
             .is_some_and(|existing| {
                 let mut expected = existing.clone();
                 expected.owner_epoch = intent.owner_epoch;
+                agree_on_unrecorded_content_size(&mut expected, intent);
                 expected != *intent
             })
             || tables
@@ -1244,6 +1245,7 @@ fn validate_precondition_failure_effect(
         if intent.object_metadata.is_none() {
             expected.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut expected, intent);
         if expected == *intent {
             return Ok(());
         }
@@ -1254,6 +1256,7 @@ fn validate_precondition_failure_effect(
     let mut expected = previous.clone();
     expected.status = intent.status.clone();
     expected.updated_at = intent.updated_at;
+    agree_on_unrecorded_content_size(&mut expected, intent);
     if !matches!(
         previous.status,
         DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
@@ -1427,6 +1430,7 @@ fn validate_failed_intent_source_binding(
         if intent.object_metadata.is_none() {
             previous.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut previous, intent);
         if previous == *intent {
             return Ok(());
         }
@@ -1807,6 +1811,7 @@ fn validate_committed_intent_content(
         if intent.object_metadata.is_none() {
             previous.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut previous, intent);
         if previous == *intent {
             return Ok(());
         }
@@ -1828,6 +1833,7 @@ fn validate_committed_intent_content(
         if intent.object_metadata.is_none() {
             captured.object_metadata = None;
         }
+        agree_on_unrecorded_content_size(&mut captured, intent);
         captured == *intent
     }) {
         return Ok(());
@@ -2034,6 +2040,18 @@ pub(crate) fn namespace_request_row_replaces_final_outcome(
         || existing.is_some_and(|existing| {
             existing.status == crate::DfsNamespaceRequestStatus::Completed && existing != row
         })
+}
+
+/// Two records of one write agree on its content size unless both record
+/// one and they differ: a record that does not carry the size, such as a
+/// compact receipt's, agrees with any.
+fn agree_on_unrecorded_content_size(
+    previous: &mut crate::DfsWriteIntentRecord,
+    intent: &crate::DfsWriteIntentRecord,
+) {
+    if previous.content_size_bytes.is_none() || intent.content_size_bytes.is_none() {
+        previous.content_size_bytes = intent.content_size_bytes;
+    }
 }
 
 fn validate_metadata_effects(
@@ -2448,6 +2466,7 @@ fn validate_intent_effect(
         identity.updated_at = intent.updated_at;
         identity.object_metadata = intent.object_metadata.clone();
         identity.owner_epoch = intent.owner_epoch;
+        agree_on_unrecorded_content_size(&mut identity, intent);
         if identity != *intent
             || intent.owner_epoch < previous.owner_epoch
             || (!matches!(

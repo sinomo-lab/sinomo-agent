@@ -862,6 +862,16 @@ impl DistributedEventualCoordinator {
         Ok(())
     }
 
+    /// The primary that owns an open write at a later epoch adopts it at
+    /// that epoch; the resident intent follows its durable row.
+    pub(crate) fn adopt_intent_at_epoch(&mut self, intent_id: &str, epoch: u64) {
+        if let Some(intent) = self.intents.get_mut(intent_id)
+            && intent.owner_epoch < epoch
+        {
+            intent.owner_epoch = epoch;
+        }
+    }
+
     pub fn observe_restored_intent_id(&mut self, intent_id: &str) {
         self.advance_next_intent_id(intent_id);
     }

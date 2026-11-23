@@ -521,6 +521,12 @@ them.
   prepared-change recovery at the new epoch (`recover:<operation>:<epoch>`)
   and hydration. Activation runs once per epoch per process, and again after a
   restart.
+- **Open writes.** The new primary owns the shard's open content writes. It
+  adopts each at its own epoch, one row update, and builds the write's transfer
+  from the row, whose content size the write recorded when it opened. The
+  write's bytes come from a receipt holder or from the caller's same-id retry,
+  whose content is checked against the row's hash, never from the lost
+  primary; the retry then finishes the write once.
 
 Alignment uses a prefix probe that names the epoch start and
 `epoch_start_alignment = <epoch>`, answered on the direct journal-batch route

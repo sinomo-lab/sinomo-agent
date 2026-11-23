@@ -1698,7 +1698,6 @@ fn native_pending_write_goes_under_its_id_to_the_member_that_took_over() {
 /// once across that primary's loss: the member that took over answers the
 /// same operation id with the write's one commit.
 #[test]
-#[ignore = "the member that took over refuses a same-id write whose intent the lost primary replicated: it compares the intents including the owner epoch (service_commit.rs, recover_prepared_intent_opening_publication) and has no transfer descriptor for the replicated intent"]
 fn native_pending_write_completes_once_past_a_lost_primary() {
     let path = "/services/pending/held.txt";
     let operation = "follow-pending";

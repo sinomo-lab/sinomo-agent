@@ -3576,6 +3576,7 @@ mod intent_index_rollback_tests {
             policy: DfsReplicationPolicy::new(1, 1).unwrap(),
             status: DfsWriteIntentStatus::ReceiptsPending,
             content_hash: Some(crate::content_hash(b"rollback index fixture")),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: false,
             create_predecessor_object_id: None,

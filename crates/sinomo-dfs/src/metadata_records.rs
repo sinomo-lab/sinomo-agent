@@ -421,6 +421,7 @@ impl DfsWriteIntentReceipt {
             policy: self.policy.clone(),
             status: self.status.clone(),
             content_hash: self.content_hash.clone(),
+            content_size_bytes: None,
             object_metadata: None,
             touch_parent_on_create: self.touch_parent_on_create,
             create_predecessor_object_id: self.create_predecessor_object_id.clone(),
