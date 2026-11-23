@@ -78,9 +78,9 @@ pub(crate) fn validate_retained_write_opening(
         || !record.payload.transaction.versions.is_empty()
         || record.payload.completed_request.is_some()
         || record.payload.completed_request_completion.is_some()
-        || crate::intent::distributed_intent_from_record(original) != *intent
+        || crate::intent::DfsWriteIdentity::of_record(original)
+            != crate::intent::DfsWriteIdentity::of_intent(intent)
         || original.content_hash.as_deref() != Some(content_hash)
-        || record.digest.owner_epoch != original.owner_epoch
     {
         return Err(DfsError::WriteReconciliationRequired {
             operation_id: intent.operation_id.clone().unwrap_or_else(|| intent.intent_id.clone()),

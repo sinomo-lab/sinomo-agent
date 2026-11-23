@@ -36,12 +36,6 @@ fn sort_prepared_operations(prepares: &mut [DfsPreparedOperationRecord]) {
     });
 }
 
-/// The operation id under which a shard's current primary aborts a row
-/// prepare its request's final outcome made obsolete.
-fn retired_admission_operation_id(original: &str) -> String {
-    format!("retire-admission:{original}")
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn certified_local_recovery_shard(
         &mut self,
@@ -212,7 +206,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !obsolete {
             return Ok(false);
         }
-        let operation_id = retired_admission_operation_id(&record.digest.operation_id);
+        let operation_id =
+            crate::metadata_records::retired_admission_operation_id(&record.digest.operation_id);
         if let Some(retiring) = backend.prepared_operation_record(&operation_id)? {
             // An earlier retirement whose own commit is unknown, or that an
             // earlier primary prepared, recovers as any other prepare.

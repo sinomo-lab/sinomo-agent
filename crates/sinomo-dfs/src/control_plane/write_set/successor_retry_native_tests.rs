@@ -466,20 +466,24 @@ fn native_recovery_aborts_a_row_prepare_its_completed_request_superseded() {
                 .unwrap()
         );
     }
-    let statuses = [row.clone(), format!("retire-admission:{row}")]
-        .into_iter()
-        .filter_map(|operation| {
-            prepared_record(&runtime, &p, &config, &operation)
-                .map(|record| (operation, record.status))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let statuses = [
+        row.clone(),
+        crate::metadata_records::retired_admission_operation_id(&row),
+    ]
+    .into_iter()
+    .filter_map(|operation| {
+        prepared_record(&runtime, &p, &config, &operation).map(|record| (operation, record.status))
+    })
+    .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         statuses.get(&row),
         Some(&DfsPreparedOperationStatus::Aborted),
         "{statuses:?}"
     );
     assert_eq!(
-        statuses.get(&format!("retire-admission:{row}")),
+        statuses.get(&crate::metadata_records::retired_admission_operation_id(
+            &row
+        )),
         Some(&DfsPreparedOperationStatus::Committed),
         "{statuses:?}"
     );

@@ -1675,16 +1675,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "staged write changed its captured base identity".into(),
                 });
             }
-            pending_intent_record.object_metadata = existing.object_metadata.clone();
-            pending_intent_record.created_at = existing.created_at;
-            pending_intent_record.updated_at = existing.updated_at;
-            let mut expected = existing;
-            expected.owner_epoch = pending_intent_record.owner_epoch;
-            if expected != pending_intent_record {
+            if crate::intent::DfsWriteIdentity::of_record(&existing)
+                != crate::intent::DfsWriteIdentity::of_record(&pending_intent_record)
+                || existing.content_hash != pending_intent_record.content_hash
+            {
                 return Err(DfsError::Metadata {
                     message: "staged write differs from its captured nonterminal intent".into(),
                 });
             }
+            pending_intent_record.object_metadata = existing.object_metadata.clone();
+            pending_intent_record.created_at = existing.created_at;
+            pending_intent_record.updated_at = existing.updated_at;
         }
         let mut intent_record = write_intent_record(
             &committed_intent,
@@ -1842,14 +1843,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .ok_or_else(|| DfsError::Metadata {
                             message: "write preparation has no exact target".into(),
                         })?;
-                    if recorded.file_system_id != intent.file_system_id
-                        || recorded.object_id != intent.object_id
-                        || recorded.intent_id != intent.intent_id
-                        || recorded.base_version != intent.base_version
-                        || recorded.target_version != intent.target_version
-                        || recorded.owner_epoch != intent.owner_epoch
-                        || recorded.policy != intent.policy
-                        || recorded.publication != intent.publication
+                    if crate::intent::DfsWriteIdentity::of_record(recorded)
+                        != crate::intent::DfsWriteIdentity::of_intent(intent)
                         || recorded.content_hash.as_deref() != Some(content_hash)
                         || target.path != base_object.path
                         || target.kind != base_object.kind
@@ -2134,20 +2129,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsError::Metadata {
                 message: "recorded write has no exact target".into(),
             })?;
-        if recorded.intent_id != intent.intent_id
-            || recorded.file_system_id != intent.file_system_id
-            || recorded.object_id != intent.object_id
-            || recorded.base_version != intent.base_version
-            || recorded.target_version != intent.target_version
-            || recorded.owner_epoch != intent.owner_epoch
-            || recorded.coordinator_node_id != intent.requesting_node_id
-            || recorded.policy != intent.policy
-            || recorded.publication != intent.publication
-            || recorded.operation_id != intent.operation_id
-            || recorded.operation_order_token != intent.operation_order_token
-            || recorded.touch_parent_on_create != intent.touch_parent_on_create
-            || recorded.create_predecessor_object_id != intent.create_predecessor_object_id
-            || recorded.desired_replica_node_ids != intent.desired_replica_nodes
+        if crate::intent::DfsWriteIdentity::of_record(recorded)
+            != crate::intent::DfsWriteIdentity::of_intent(intent)
             || recorded.content_hash.as_deref() != Some(content_hash)
             || target.version != intent.target_version
             || target.content_hash.as_deref() != Some(content_hash)
@@ -2273,9 +2256,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         let actual = crate::intent::distributed_intent_from_record(&stored);
-        let mut expected = intent.clone();
-        expected.state = actual.state.clone();
-        if expected != actual || stored.content_hash.as_deref() != Some(content_hash) {
+        if crate::intent::DfsWriteIdentity::of_intent(intent)
+            != crate::intent::DfsWriteIdentity::of_record(&stored)
+            || stored.content_hash.as_deref() != Some(content_hash)
+        {
             return Err(DfsError::WriteOperationIdConflict {
                 operation_id: intent
                     .operation_id

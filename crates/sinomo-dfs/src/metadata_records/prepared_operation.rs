@@ -262,6 +262,12 @@ pub(crate) fn recovery_operation_id(original: &str, epoch: u64) -> String {
     format!("recover:{original}:{epoch}")
 }
 
+/// The id under which a shard's primary aborts `original`, a row prepare of
+/// a request whose final outcome the shard already holds.
+pub(crate) fn retired_admission_operation_id(original: &str) -> String {
+    format!("retire-admission:{original}")
+}
+
 /// The id of the prepare that `replacement`, a body at `epoch`, recovers, if
 /// `replacement` is that prepare's recovery id at `epoch`.
 pub(crate) fn recovered_operation_id(replacement: &str, epoch: u64) -> Option<&str> {

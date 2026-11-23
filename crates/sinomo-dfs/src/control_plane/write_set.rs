@@ -63,6 +63,8 @@ mod takeover_native_tests;
 mod successor_retry_native_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_identity_native_tests;
 
 /// Persisted format of [`DfsMetadataShardWriteSet`]. Readers reject any other
 /// value, so a record written by a later protocol fails closed.
