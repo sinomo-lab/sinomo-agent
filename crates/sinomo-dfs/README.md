@@ -533,6 +533,16 @@ them.
   answered from the row too: it aborts an open write once, a repeat is
   answered as that abort, and a write that committed first is answered with
   its commit.
+- **Parent-count participants.** A directory move's participant on the shard
+  recovers under its own id, never a `recover:` id: activation's recovery
+  re-issues the participant's latest prepared phase as
+  `<participant>:<phase>:epoch:<epoch>`, with the earlier attempts superseded,
+  and the coordinator's re-sent phase does the same or is answered from what
+  recovery committed. The new primary needs no handoff evidence for this,
+  since a re-issue only commits a phase the coordinator prepared; it reserves
+  at its epoch when the parent's version is unchanged, and an aborting plan
+  retires the reservations it prepared at any epoch. The participant's answer
+  is certified against the write set.
 
 Alignment uses a prefix probe that names the epoch start and
 `epoch_start_alignment = <epoch>`, answered on the direct journal-batch route

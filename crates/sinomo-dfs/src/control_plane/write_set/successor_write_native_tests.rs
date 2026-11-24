@@ -55,6 +55,30 @@ fn owned_shard(name: &str) -> (DfsTestRuntime, DfsMetadataShardConfig) {
     (runtime, config)
 }
 
+/// Each call `from` made with `operation` as its request: its target,
+/// route and last phase, and its error.
+fn write_calls_from(
+    runtime: &DfsTestRuntime,
+    from: &NodeId,
+    operation: &str,
+) -> Vec<(
+    NodeId,
+    String,
+    crate::test_runtime::RpcPhase,
+    Option<String>,
+)> {
+    let mut latest = std::collections::BTreeMap::new();
+    for call in runtime.rpc_observations() {
+        if &call.source == from && call.dfs_request_id.as_deref() == Some(operation) {
+            latest.insert(call.call_id, call);
+        }
+    }
+    latest
+        .into_values()
+        .map(|call| (call.target, call.route, call.phase, call.outcome_error))
+        .collect()
+}
+
 /// The primary cannot stage content to either member.
 fn cannot_stage(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig) {
     for target in &config.replica_node_ids {
@@ -136,7 +160,8 @@ fn pending_past_a_lost_primary(
     lose(runtime, &[&b, &c], &p);
     let outcome = receiver.recv_timeout(EVENT_BOUND * 2).unwrap_or_else(|_| {
         panic!(
-            "{operation} is answered once a member has taken over\n{}",
+            "{operation} is answered once a member has taken over; C's calls {:?}\n{}",
+            write_calls_from(runtime, &c, operation),
             event_log(runtime, &[&b, &c])
         )
     });

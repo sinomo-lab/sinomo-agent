@@ -19,8 +19,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &participant.expected.path,
             &participant.participant_id,
         )?;
-        self.sync_metadata_shard_to_quorum(&target, None)?;
-        Ok(())
+        // A write-set shard certifies against its write set, as a directory
+        // sync does: a configured member outside it, such as a lost primary,
+        // is not waited for.
+        match self.sync_metadata_shard_to_write_set(&target, None)? {
+            Some(crate::service_sync::DfsWriteSetSync::Certified(_)) => Ok(()),
+            Some(crate::service_sync::DfsWriteSetSync::BelowFloor { write_set, floor }) => {
+                Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "parent participant's write set of {write_set} is below its floor {floor}"
+                    ),
+                }))
+            }
+            None => {
+                self.sync_metadata_shard_to_quorum(&target, None)?;
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn execute_parent_count_participant(
@@ -154,19 +169,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(invalid("actual coordinator does not declare this parent"));
         }
         let state = match action {
+            // The shard's current primary reserves at any epoch at or after
+            // the declared one; the parent's version decides below.
             Action::Reserve if plan.phase == Phase::Preparing => {
-                if current_parent_scope != participant.parent_scope {
-                    let qualified = self
-                        .activated_metadata_handoff_for_current_owner(&current_parent_scope)?
-                        .is_some_and(|(freeze, _)| {
-                            freeze.retiring_epoch >= participant.parent_scope.epoch
-                        });
-                    if !qualified {
-                        return Ok(Outcome::Rejected {
-                            reason: Rejection::AssignmentChanged,
-                        });
-                    }
-                }
                 let backend = self.metadata_backend.as_ref().expect("checked backend");
                 if backend
                     .get_object_on_shard(&scope.shard_id, &participant.expected.object_id)?
@@ -265,16 +270,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 "abort encountered a possibly issued non-reservation phase",
                             ));
                         }
-                        if reserve.owner_epoch != current_parent_scope.epoch
-                            && !self.prepared_operation_has_retired_authority_evidence(
-                                &current_parent_scope,
-                                &reserve.digest,
-                            )?
-                        {
-                            return Err(invalid(
-                                "abort cannot retire an unqualified old-epoch reservation",
-                            ));
-                        }
+                        // The plan is aborting: it retires every reservation
+                        // it prepared, at any epoch.
                         payload.metadata_effects.push(
                             crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
                                 digest: reserve.digest,
@@ -863,13 +860,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if state != desired {
                     return Err(invalid("parent replacement cannot retire another phase"));
                 }
-                if record.owner_epoch >= active.epoch
-                    || !self
-                        .prepared_operation_has_retired_authority_evidence(active, &record.digest)?
-                {
-                    return Err(invalid(
-                        "parent phase has no certified retired-prefix no-commit evidence",
-                    ));
+                // The shard's current primary re-issues what an earlier
+                // epoch's primary prepared: the replacement only commits the
+                // coordinator's own prepared phase.
+                if record.owner_epoch >= active.epoch {
+                    return Err(invalid("parent phase attempt is not from an earlier epoch"));
                 }
                 retiring.push(record);
             }
@@ -898,6 +893,93 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(invalid("parent replacement predecessor omits an original dependency"));
         }
         Ok(Some(replacement))
+    }
+
+    /// The participant phase whose prepare recovery re-issues: an abort
+    /// retires the reservations it was prepared over, and an apply follows
+    /// its committed reservation, so the latest prepared phase decides.
+    fn latest_prepared_parent_phase(&self, participant: &Participant) -> Result<Option<Action>> {
+        let mut latest = None;
+        let mut after = None;
+        loop {
+            let (records, next) = self.parent_phase_family_page(participant, after.as_deref())?;
+            for record in records {
+                if record.status != crate::DfsPreparedOperationStatus::Prepared {
+                    continue;
+                }
+                let action = match phase_state_for_record(participant, &record)? {
+                    State::Reserved => Action::Reserve,
+                    State::Applied => Action::Apply,
+                    State::Aborted => Action::Abort,
+                };
+                let rank = |action: &Action| match action {
+                    Action::Reserve => 0,
+                    Action::Apply => 1,
+                    Action::Abort => 2,
+                };
+                if latest
+                    .as_ref()
+                    .is_none_or(|latest| rank(&action) > rank(latest))
+                {
+                    latest = Some(action);
+                }
+            }
+            let Some(next) = next else {
+                break;
+            };
+            after = Some(next);
+        }
+        Ok(latest)
+    }
+
+    /// Recover a participant's phase that an earlier epoch's primary
+    /// prepared: the shard's current primary re-issues the participant's
+    /// latest prepared phase under the participant's own id at its epoch,
+    /// superseding the earlier attempts, and commits it. A phase prepared at
+    /// this epoch is the coordinator's to send again. Returns whether it
+    /// re-issued.
+    pub(crate) fn recover_parent_count_participant_prepare(
+        &mut self,
+        record: &crate::DfsPreparedOperationRecord,
+        participant: &Participant,
+    ) -> std::result::Result<bool, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "parent recovery has no native backend".into(),
+            })?;
+        // An earlier body of this recovery pass may have resolved it.
+        if backend
+            .prepared_operation_record(&record.digest.operation_id)?
+            .is_none_or(|current| current.status != crate::DfsPreparedOperationStatus::Prepared)
+        {
+            return Ok(false);
+        }
+        let Some(context) = self.retained_metadata_replica_context(
+            &record.digest.file_system_id,
+            &record.digest.shard_id,
+        )?
+        else {
+            return Ok(false);
+        };
+        let shard = context.shard;
+        if shard.primary_node_id != self.node_id || shard.epoch <= record.digest.owner_epoch {
+            return Ok(false);
+        }
+        let reissue = (|| -> Result<Option<crate::DfsPreparedOperationPayload>> {
+            let Some(action) = self.latest_prepared_parent_phase(participant)? else {
+                return Ok(None);
+            };
+            self.parent_phase_attempt(participant, &shard, &action)
+        })()
+        .map_err(crate::service_routed_namespace::dfs_error_from_posix_namespace_sync)?;
+        let Some(payload) = reissue else {
+            return Ok(false);
+        };
+        let committed = self.publish_prepared_operation(payload)?;
+        self.finish_recovered_prepared_publication(&committed.payload, committed.published)?;
+        Ok(true)
     }
 }
 

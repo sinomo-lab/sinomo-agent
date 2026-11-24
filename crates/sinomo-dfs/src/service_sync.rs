@@ -480,52 +480,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(rebound)
     }
 
-    /// Existing activated membership proof and exact canonical descendant;
-    /// observation only, never an independent author certificate.
-    pub(crate) fn activated_metadata_handoff_for_current_owner(
-        &mut self, active: &DfsMetadataShardConfig,
-    ) -> Result<Option<(crate::DfsMetadataShardWriteFreeze, DfsMetadataPrefixProof)>, DfsError> {
-        if active.primary_node_id != self.node_id { return Ok(None); }
-        self.refresh_control_plane_latest()?;
-        let Some(control_plane) = self.control_plane.as_mut() else { return Ok(None); };
-        let (pending, proof, write_set_shard) = {
-            let store = DfsControlPlaneStore::new(control_plane.as_mut());
-            if store.get_metadata_shard(&active.file_system_id, &active.shard_id)?.as_ref() != Some(active) { return Ok(None); }
-            (store.get_metadata_shard_membership_handoff(&active.file_system_id, &active.shard_id)?,
-             store.get_metadata_shard_membership_handoff_proof(&active.file_system_id, &active.shard_id)?,
-             // A write-set shard recruits and removes members within the
-             // activated epoch; the rebind accepts that same replica drift.
-             store.get_metadata_shard_write_set_state(active)?.switched().is_some())
-        };
-        let Some(proof) = proof else { return Ok(None); };
-        // Converted images are a separate provenance boundary; only the
-        // membership transfer proves this unchanged native journal lineage.
-        if !matches!(proof.cause, crate::DfsMetadataShardHandoffCause::Membership)
-            || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
-                &proof.retiring_shard, &proof.desired_shard, &proof.acknowledged_node_ids.iter().cloned().collect(),
-            ) { return Ok(None); }
-        let Some(backend) = self.metadata_backend.as_deref_mut() else { return Ok(None); };
-        let evidence = completed_metadata_handoff_evidence(backend, &self.node_id, active, pending.as_ref(), Some(&proof), write_set_shard)?;
-        Ok(evidence.filter(|(freeze, _)| freeze.activated_epoch == Some(active.epoch)))
-    }
-
-    /// A local Prepared status or a larger epoch alone cannot retire a phase.
-    pub(crate) fn prepared_operation_has_retired_authority_evidence(
-        &mut self, active: &DfsMetadataShardConfig, digest: &crate::DfsPreparedOperationDigest,
-    ) -> Result<bool, DfsError> {
-        if digest.file_system_id != active.file_system_id || digest.shard_id.0 != active.shard_id
-            || digest.owner_epoch >= active.epoch { return Ok(false); }
-        let Some((freeze, current_prefix)) = self.activated_metadata_handoff_for_current_owner(active)? else { return Ok(false); };
-        if digest.owner_epoch > freeze.retiring_epoch || digest.prepare_sequence > freeze.journal_sequence { return Ok(false); }
-        let Some(backend) = self.metadata_backend.as_deref() else { return Ok(false); };
-        let Some(Some(original)) = backend.prepared_operation_record_at_prefix(
-            &digest.shard_id, &current_prefix, &digest.operation_id,
-        )? else { return Ok(false); };
-        original.validate()?;
-        Ok(original.digest == *digest && original.status == crate::DfsPreparedOperationStatus::Prepared
-            && original.committed_entry.is_none())
-    }
-
     /// Bind only this physical shard. A fresh lazy shell has no operational
     /// projection to replace; cached services rebuild theirs in the wrapper.
     pub(crate) fn rebind_completed_local_metadata_shard_instance_if_frozen(
