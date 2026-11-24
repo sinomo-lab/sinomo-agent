@@ -430,6 +430,80 @@ impl DfsPeerVerdicts {
     }
 }
 
+/// Watches this node's verdict for one peer for a requester whose held write
+/// waits on that peer, and calls back each time the verdict changes back to a
+/// path after the peer could not be reached. The watch reads the same
+/// verdicts the write-set roles read. It ends when dropped, or once nothing
+/// holds the callback.
+pub(crate) struct DfsPeerPathBackWatch {
+    stop: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for DfsPeerPathBackWatch {
+    fn drop(&mut self) {
+        // A stored permit ends the watch whether or not it is waiting now.
+        self.stop.notify_one();
+    }
+}
+
+/// Start a [`DfsPeerPathBackWatch`] of `peer` for `data_dir`'s node.
+pub(crate) fn watch_peer_path_back(
+    data_dir: &SinomoDataDir,
+    peer: NodeId,
+    on_path_back: Weak<dyn Fn() + Send + Sync>,
+) -> Option<DfsPeerPathBackWatch> {
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let state =
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths).ok()?;
+    let data_dir = data_dir.clone();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stopped = Arc::clone(&stop);
+    // A verdict that is unknown, or a path still being verified, says
+    // neither: the watch waits for a settled one.
+    let reach = |entry: (PeerPathVerdict, bool)| match entry {
+        (PeerPathVerdict::Path, false) => Some(true),
+        (PeerPathVerdict::NoPath, _) => Some(false),
+        _ => None,
+    };
+    std::thread::Builder::new()
+        .name("sinomo-dfs-path-back".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let mut verdicts = DfsPeerVerdicts::new(&data_dir, &cluster_paths, &state);
+                verdicts.retain(true);
+                let mut unreachable = false;
+                loop {
+                    match reach(verdicts.current().entry(&peer)) {
+                        Some(true) if unreachable => {
+                            unreachable = false;
+                            let Some(on_path_back) = on_path_back.upgrade() else {
+                                return;
+                            };
+                            on_path_back();
+                        }
+                        Some(reachable) => unreachable = !reachable,
+                        None => {}
+                    }
+                    if on_path_back.strong_count() == 0 {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = verdicts.changed() => {}
+                        _ = stopped.notified() => return,
+                    }
+                }
+            });
+        })
+        .ok()?;
+    Some(DfsPeerPathBackWatch { stop })
+}
+
 /// Test support: the write-set roles' gate on a standing no-path verdict over
 /// this process's real network verdicts. The owning test settles real
 /// verification episodes and asks what the gate then says; the gate's own

@@ -444,6 +444,7 @@ fn component_factory_with_selected_layout(
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
             .publish_event(crate::runtime_host::dfs_placement_event_publication())
             .publish_event(crate::runtime_host::dfs_configuration_event_publication())
+            .publish_event(crate::runtime_host::dfs_write_answer_event_publication())
             .publish_event(crate::runtime_host::dfs_write_set_event_publication(
                 crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[0],
             ))
@@ -1838,12 +1839,12 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        // Three DFS events, the write-set keeper's typed events, the
+        // Four DFS events, the write-set keeper's typed events, the
         // takeover events and the two namespace job events.
         let publications = &factory.descriptor().event_publications;
         assert_eq!(
             publications.len(),
-            3 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
+            4 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
                 + crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS.len()
                 + 2
         );
@@ -1853,6 +1854,7 @@ mod tests {
             .chain([
                 crate::DFS_NAMESPACE_JOB_PARKED_EVENT_KIND,
                 crate::DFS_NAMESPACE_JOB_COMPLETED_EVENT_KIND,
+                crate::DFS_WRITE_ANSWER_UNCLAIMED_EVENT_KIND,
             ])
         {
             assert!(

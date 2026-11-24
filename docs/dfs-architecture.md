@@ -116,7 +116,10 @@ same publication: the local DFS component announces each change as a typed
 `dfs.configuration.published` event and serves its current floor-checked
 snapshot on request. A long-lived client such as mounted SIFS holds the snapshot
 it fetched after the newest announcement and none while its subscription is
-down; a one-shot command reads it once per operation. Neither keeps its own
+down; a one-shot command reads it once per operation. On the same stream the
+component announces `dfs.write.answer_unclaimed` for a routed-write answer that
+reached Main and no attached owner took, so a client that holds that write
+takes the answer Main kept for it or sends the write again under its id. Neither keeps its own
 configuration cache or refresh loop, and keys outside the published scopes are
 read through ReadIndex. Peer routing and connection health remain owned by the
 network layer.

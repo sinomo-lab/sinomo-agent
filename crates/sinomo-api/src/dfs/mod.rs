@@ -37,6 +37,8 @@ pub mod placement_environment;
 pub use placement_environment::*;
 pub mod routes;
 pub use routes::*;
+pub mod write_answer;
+pub use write_answer::*;
 pub mod browser_api;
 pub use browser_api::*;
 pub mod read_retry;

@@ -1412,6 +1412,19 @@ impl DfsPreparedMetadataJournalBatchRpc {
     }
 }
 
+#[cfg(test)]
+impl DfsNodeTransport {
+    /// Let go of this transport's response inbox, as an owner that is no
+    /// longer attached: its registrations stay, and Main keeps the answers
+    /// for them until this transport registers them again on its new inbox.
+    pub(crate) fn detach_response_owner_for_test(&mut self) {
+        if self.response_inbox.is_some() {
+            self.response_inbox =
+                Some(crate::response_delivery::DfsRoutedResponseInboxOwner::new());
+        }
+    }
+}
+
 pub struct DfsNodeTransport {
     #[cfg(test)]
     test_metadata_direct_probe: Option<DfsTestMetadataDirectRpcProbe>,

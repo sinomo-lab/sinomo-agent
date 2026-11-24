@@ -50,9 +50,13 @@ mod crossing_native_tests;
 #[cfg(test)]
 mod follow_native_tests;
 #[cfg(test)]
+mod held_answer_native_tests;
+#[cfg(test)]
 mod keeping_native_tests;
 #[cfg(test)]
 mod native_tests;
+#[cfg(test)]
+mod participant_takeover_native_tests;
 #[cfg(test)]
 mod takeover_driver_native_tests;
 #[cfg(test)]

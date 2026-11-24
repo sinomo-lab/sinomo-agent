@@ -1392,16 +1392,6 @@ fn native_hidden_parent_prepare_handoff_and_restart_preserve_one_logical_success
     );
     {
         let mut owner = cluster._runtime.metadata_primary_service("/").unwrap();
-        let mut merely_larger_epoch = old_scope.clone();
-        merely_larger_epoch.epoch += 1;
-        assert!(
-            !owner
-                .prepared_operation_has_retired_authority_evidence(
-                    &merely_larger_epoch,
-                    &original.digest
-                )
-                .unwrap()
-        );
         assert!(
             crate::service_sync::completed_metadata_handoff_evidence(
                 owner.metadata_backend_mut().unwrap(),

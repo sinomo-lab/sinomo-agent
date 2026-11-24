@@ -2925,7 +2925,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         watch,
                         until,
                     }) => {
-                        self.compact_pending_routed_write(request_id);
+                        self.compact_pending_routed_write_for_mounted_call(request_id);
                         return Err(self.hand_back_mounted_write_wait(*resend, watch, until));
                     }
                     Ok(crate::service_record_follow::DfsRecordChangeNow::Due(
@@ -2973,6 +2973,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     crate::service_record_follow::DfsRecordWaitWake {
                         on_arrival: true,
                         at: None,
+                        held_write: false,
                     },
                 );
                 match followed {

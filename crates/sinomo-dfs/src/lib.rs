@@ -43,6 +43,7 @@ mod distributed;
 mod error;
 mod file_history;
 mod file_history_query;
+mod held_write_watch;
 mod host_filesystem_provider;
 mod host_filesystem_provider_client;
 mod identity;
@@ -292,6 +293,10 @@ pub use sinomo_api::dfs::configuration::{
     DFS_CONFIGURATION_SNAPSHOT_ROUTE, DfsConfigurationPublication,
     DfsConfigurationSnapshotRequest, DfsConfigurationSnapshotResponse,
     DfsConfigurationSnapshotWire, DfsWriteConfigurationWire,
+};
+pub use sinomo_api::dfs::write_answer::{
+    DFS_WRITE_ANSWER_EVENT_SCHEMA_ID, DFS_WRITE_ANSWER_EVENT_SCHEMA_VERSION,
+    DFS_WRITE_ANSWER_UNCLAIMED_EVENT_KIND, DfsWriteAnswerUnclaimed,
 };
 pub use performance_metrics::dfs_status_observe_metrics;
 pub(crate) use runtime_admission::{

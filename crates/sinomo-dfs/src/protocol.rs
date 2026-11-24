@@ -1248,7 +1248,9 @@ pub enum DfsPosixCoordinationResult {
     /// No effect has started. The caller must resolve a cross-authority path
     /// or prepare a missing parent using the ordinary namespace protocol.
     FileWriteNeedsPathResolution,
-    /// The exact Main-produced durable aborted intent, not a success-derived claim.
+    /// The exact durable terminal intent an abort found or wrote, not a
+    /// success-derived claim: aborted, or committed when the write committed
+    /// before its abort reached it.
     AbortedWriteIntent(Box<crate::DistributedWriteIntent>),
     MetadataQuery(DfsMetadataShardResponse),
     NamespaceChanges(DfsNamespaceChangePollResponse),

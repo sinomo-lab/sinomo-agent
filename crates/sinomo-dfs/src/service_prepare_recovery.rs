@@ -243,16 +243,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if record.metadata_effects.iter().any(|effect| matches!(effect,
             DfsPreparedMetadataEffect::PutNamespaceJob { job }
                 if job.kind == DfsNamespaceJobKind::ParentCountParticipant)) {
-            // The original coordinator owns issuance/abort and the exact
-            // parent ancestry. Generic recovery cannot mint a recover: ID or
-            // commit this participant independently of that durable decision.
+            // A participant recovers under its own id, never a recover: id:
+            // its coordinator sends each phase under that id.
             record.validate()?;
             let (participant, _) = record.metadata_effects.iter().find_map(|effect| match effect {
                 DfsPreparedMetadataEffect::PutNamespaceJob { job } => job.parent_count_participant(),
                 _ => None,
             }).ok_or_else(|| DfsError::Metadata { message: "parent prepare omitted its declared participant".into() })?;
             participant.validate_phase_payload(&record.payload)?;
-            return Ok(false);
+            let participant = participant.clone();
+            return self.recover_parent_count_participant_prepare(&record, &participant);
         }
         if self.control_plane.is_none() {
             if record.digest.owner_epoch == 0 {
@@ -327,7 +327,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(true)
     }
 
-    fn finish_recovered_prepared_publication(
+    pub(crate) fn finish_recovered_prepared_publication(
         &mut self,
         payload: &DfsPreparedOperationPayload,
         published: bool,
