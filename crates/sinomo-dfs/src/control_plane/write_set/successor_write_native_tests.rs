@@ -783,3 +783,139 @@ fn native_abort_of_an_open_write_its_requester_took_over_aborts_it_once() {
     assert_eq!(bytes, b"before");
     runtime.close().unwrap();
 }
+
+/// An opening only the members hold, its primary lost before it committed
+/// it: the member that took over re-issues the opening at its epoch, and the
+/// re-issue's commit is held until the caller's same-id retry arrives. The
+/// retry meets the opening and its re-issue both prepared, recovers the
+/// opening through its re-issue, and the write commits once.
+#[test]
+fn native_retry_meeting_its_openings_recovery_commits_once() {
+    use crate::DfsMetadataBackend as _;
+    let (runtime, config) = owned_shard("native-successor-opening-reissue");
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let path = "/services/owned/reissued.txt";
+    let operation = "successor-opening-reissue";
+    let before = committed_before(&runtime, &config, path);
+    keep_with_paths(&runtime, &config, &[&b]);
+    let intent_id = crate::intent::stable_write_intent_id(&c, &before.object_id, operation);
+    // Neither member's answer reaches the primary: it never commits the
+    // opening it prepared.
+    let gates =
+        [&b, &c].map(|member| super::commit_native_tests::hold_replies(&runtime, &config, member));
+    let data_dir = runtime.data_dir(&c).clone();
+    let call_options = options(&config);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut client =
+            crate::runtime_host::open_dfs_runtime_service(&data_dir, Some(executor().handle()))
+                .expect("the requester opens its client");
+        let _ = sender.send(client.posix_write_file_with_operation_id(
+            path,
+            operation.as_bytes(),
+            call_options,
+            operation,
+        ));
+    });
+    let opening_at = |member: &NodeId| {
+        crate::LocalSobjMetadataBackend::open_for_inspection(
+            crate::DfsMetadataShardId::new(config.shard_id.clone()),
+            shard_root(&runtime, member, &config),
+        )
+        .ok()?
+        .list_prepared_operations()
+        .ok()?
+        .into_iter()
+        .find(|prepared| {
+            prepared.payload.prepared_intent.is_none()
+                && crate::service_routed_write::prepared_intent_for_write(
+                    prepared,
+                    &before.object_id,
+                    &intent_id,
+                )
+                .is_some()
+        })
+        .map(|prepared| prepared.digest.operation_id)
+    };
+    wait_until("both members hold the opening", &runtime, &[&b], || {
+        opening_at(&b).is_some() && opening_at(&c).is_some()
+    });
+    let opening = opening_at(&b).unwrap();
+    let reissue = crate::metadata_records::recovery_operation_id(&opening, config.epoch + 1);
+    let hold = std::sync::Mutex::new(Some(
+        crate::metadata_backend::prepared_operation::hold_prepared_commit(
+            &[shard_root(&runtime, &b, &config)],
+            &reissue,
+        ),
+    ));
+    // The hold ends when the caller's retry starts at B.
+    let _release = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&b),
+        std::sync::Arc::new(move |point, command, _| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+            ) && command.is_some_and(|command| {
+                matches!(&command.routed_message.message,
+                    crate::DfsNetworkMessage::DistributedWriteRequest(write)
+                        if write.request_id == operation)
+            }) {
+                hold.lock().unwrap().take();
+            }
+            Ok(())
+        }),
+    );
+    // Nothing the caller sends reaches B until B has re-issued the opening.
+    let resend = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(FaultRule {
+        source: Some(c.clone()),
+        target: Some(b.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: FaultAction::PauseBeforeDispatch(std::sync::Arc::clone(&resend)),
+    });
+    takes_over(&runtime, &config, &b);
+    for gate in &gates {
+        super::commit_native_tests::release(gate);
+    }
+    wait_until("B re-issues the opening", &runtime, &[&b], || {
+        prepared_at(&runtime, &b, &config, &reissue)
+            == Some(crate::DfsPreparedOperationStatus::Prepared)
+    });
+    assert_eq!(
+        prepared_at(&runtime, &b, &config, &opening),
+        Some(crate::DfsPreparedOperationStatus::Prepared),
+        "the opening stays prepared until its re-issue commits"
+    );
+    super::commit_native_tests::release(&resend);
+    let outcome = receiver.recv_timeout(EVENT_BOUND * 2).unwrap_or_else(|_| {
+        panic!(
+            "{operation} is answered once B has taken over; C's calls {:?}\n{}",
+            write_calls_from(&runtime, &c, operation),
+            event_log(&runtime, &[&b, &c])
+        )
+    });
+    runtime.clear_faults();
+    let target = crate::intent::stable_write_target_version(&c, &before.object_id, operation);
+    if let Some(stat) = committed(outcome, "the retry recovers its opening and commits") {
+        assert_eq!(stat.version, target);
+    }
+    assert_eq!(
+        prepared_at(&runtime, &b, &config, &reissue),
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+    assert_eq!(
+        prepared_at(&runtime, &b, &config, &opening),
+        Some(crate::DfsPreparedOperationStatus::Superseded)
+    );
+    let _ = p;
+    heal(&runtime, &config);
+    let (stat, bytes) = read(&runtime, &c, path);
+    assert_eq!(stat.version, target, "the write committed once");
+    assert_eq!(bytes, operation.as_bytes());
+    runtime.close().unwrap();
+}

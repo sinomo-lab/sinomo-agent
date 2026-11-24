@@ -110,6 +110,18 @@ pub(crate) fn validate_retained_write_opening(
             DfsPreparedMetadataEffect::PutFileSystem { file_system } => {
                 file_system.file_system_id == intent.file_system_id
             }
+            // A recovery re-issue of the opening supersedes the opening it
+            // was made from, and only that one.
+            DfsPreparedMetadataEffect::ResolvePreparedOperation {
+                digest,
+                status: DfsPreparedOperationStatus::Superseded,
+            } => {
+                record.digest.operation_id
+                    == crate::metadata_records::recovery_operation_id(
+                        &digest.operation_id,
+                        record.digest.owner_epoch,
+                    )
+            }
             _ => false,
         });
     if !allowed || intents != 1 {
@@ -1328,8 +1340,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if observed.intent.is_some() {
             return Ok(observed.intent);
         }
+        // Recovery re-issues a prepare at a later epoch under a recover: id,
+        // and both stay prepared until the re-issue commits. Recovering the
+        // opening commits its re-issue, so a re-issue whose opening is still
+        // prepared here is that opening, not a second one.
+        let reissues = observed
+            .prepared
+            .iter()
+            .flat_map(|original| {
+                observed.prepared.iter().filter(|reissue| {
+                    reissue.digest.operation_id
+                        == crate::metadata_records::recovery_operation_id(
+                            &original.digest.operation_id,
+                            reissue.digest.owner_epoch,
+                        )
+                })
+            })
+            .map(|reissue| reissue.digest.operation_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut opening = None;
         for prepared in observed.prepared {
+            if reissues.contains(&prepared.digest.operation_id) {
+                continue;
+            }
             let Some(original) = prepared_intent_for_write(&prepared, &object.object_id, intent_id)
             else {
                 continue;
