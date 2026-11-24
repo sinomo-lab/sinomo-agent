@@ -3291,6 +3291,124 @@ fn native_takeover_resends_a_failed_confirm_read_in_a_quiet_cluster() {
     runtime.close().unwrap();
 }
 
+/// With the primary, which led cluster KV, cut off, only the member whose Raft
+/// log is the more current can win the KV election, and it campaigns only on
+/// a request of its own: the other member's elections lose, and its requests
+/// forwarded there start none. That member ranks first and is handed the
+/// attempt while its own confirm read fails. It keeps re-sending that read in
+/// the same attempt, which elects it once it reaches the other voter again,
+/// and it takes over; no other change is needed to prompt it.
+#[test]
+fn native_takeover_is_confirmed_by_the_one_member_that_can_lead_kv() {
+    let (runtime, config) = switched_with_kv_voters("native-loss-kv-leader-only", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/kv-leader-only");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // The member ranked first by journal head, then node id, is handed the
+    // attempt.
+    let mut ranking = [&b, &c].map(|node| (journal_head(&runtime, node, &config), node.clone()));
+    ranking.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let (first, asker) = (ranking[0].1.clone(), ranking[1].1.clone());
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+
+    // The asker misses one KV entry, so its Raft log is behind the first's.
+    runtime.partition_node(
+        &asker,
+        Partition {
+            kv: true,
+            dfs: false,
+        },
+    );
+    reelect(&runtime, &p);
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: true,
+            dfs: true,
+        },
+    );
+    runtime.partition_node(&asker, Partition::default());
+    // The first-ranked member cannot reach KV while the attempt starts.
+    runtime.partition_node(
+        &first,
+        Partition {
+            kv: true,
+            dfs: false,
+        },
+    );
+    lose(&runtime, &[&b, &c], &p);
+    let trace_has = |node: &NodeId, text: &str| {
+        runtime
+            .write_set_takeover_trace(node)
+            .iter()
+            .any(|line| line.contains(text))
+    };
+    wait_until(
+        "the handed-off read fails and the asker's own read does too",
+        &runtime,
+        &[&b, &c],
+        || trace_has(&first, "unconfirmed") && trace_has(&asker, "recheck"),
+    );
+    for node in [&b, &c] {
+        assert!(
+            shard_events(&runtime, node, &config, DfsMetadataTakeoverEvent::PROMISED).is_empty(),
+            "nothing is promised while the member that can lead KV is cut off:\n{}",
+            event_log(&runtime, &[&b, &c])
+        );
+    }
+
+    runtime.partition_node(&first, Partition::default());
+    wait_until(
+        "the first-ranked member takes over",
+        &runtime,
+        &[&b, &c],
+        || {
+            try_record_from(&runtime, &config, &asker)
+                .is_some_and(|record| record.shard.primary_node_id == first)
+        },
+    );
+    assert_eq!(
+        record_from(&runtime, &config, &asker).shard.epoch,
+        config.epoch + 1
+    );
+    assert!(shard_events(&runtime, &asker, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    // The swap came from the attempt whose read failed, re-sent, not from an
+    // attempt some later change started.
+    let taken = |outcome: &str| {
+        runtime
+            .write_set_takeover_trace(&first)
+            .iter()
+            .filter(|line| line.starts_with("taken ") && line.contains(outcome))
+            .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let (failed, applied) = (taken("unconfirmed"), taken("settled Applied"));
+    assert!(
+        !failed.is_empty() && applied.len() == 1 && failed.contains(&applied[0]),
+        "the failed attempt itself takes over: failed {failed:?}, applied {applied:?}\n{}",
+        event_log(&runtime, &[&b, &c])
+    );
+    assert_eq!(
+        attempts_started_at(&runtime, &first, &config, config.epoch).len(),
+        1,
+        "the first-ranked member started one attempt:\n{}",
+        event_log(&runtime, &[&b, &c])
+    );
+
+    runtime.partition_node(&p, Partition::default());
+    for node in [&p, &b, &c] {
+        reelect(&runtime, node);
+    }
+    runtime.close().unwrap();
+}
+
 /// The old primary returns while one of its own maintenance passes holds its
 /// global admission and waits on the new primary, as its reconciliation does
 /// when it routes a namespace request there. The new primary's join holds the

@@ -482,7 +482,10 @@ them.
   `prefer` when it does not rank first, and a member already promising answers
   `followed`. A member that cannot run the
   attempt declines with `no-quorum` when its confirm read fails, or with
-  `unavailable` when its keeper cannot evaluate the shard. On such a decline
+  `unavailable` when its keeper cannot evaluate the shard. A member that
+  declines with `no-quorum` goes on re-sending its read like a failed confirm
+  read (below): cluster KV elects a leader only through a voter's own request,
+  and that member may be the only voter that can win. On such a decline
   the candidate reads the record itself: if that read fails too it re-sends
   its read as a failed confirm read is re-sent (below), and once a read
   succeeds a quorum is serving, so it asks the same member once more.

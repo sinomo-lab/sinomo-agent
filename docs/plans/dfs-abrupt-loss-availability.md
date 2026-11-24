@@ -223,11 +223,13 @@ shard record wins.
    non-mobile before mobile, then node id. A candidate that does not rank first
    hands the attempt to the member that does; that member runs it only if it
    still ranks itself first with its own journal, and otherwise hands it back
-   once. A member that cannot confirm the record declines; the candidate then
-   confirms it itself and, if it can, asks that member once more, so a
-   momentary loss of cluster KV at the first-ranked member does not pass the
-   attempt down the ranking. Unreachable members are left out, so a two-member
-   write set needs no corroboration.
+   once. A member that cannot confirm the record declines and goes on re-sending
+   its own read as step 2 describes, because cluster KV elects a leader only
+   through a voter's own request and that member may be the only voter that can
+   win. The candidate then confirms the record itself and, if it can, asks that
+   member once more, so a momentary loss of cluster KV at the first-ranked
+   member does not pass the attempt down the ranking. Unreachable members are
+   left out, so a two-member write set needs no corroboration.
 2. **Confirm quorum.** The candidate reads the shard record linearizably. If it
    cannot, it promises nothing. A failed read can be momentary while the KV
    voters elect, so it is re-sent on the same timer as an unknown swap for as

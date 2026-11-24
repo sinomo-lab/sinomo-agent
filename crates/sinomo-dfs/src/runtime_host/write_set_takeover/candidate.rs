@@ -1217,7 +1217,6 @@ impl TakeoverRole {
             .attempts
             .get_mut(&key)
             .and_then(|current| current.reply.take());
-        let served = reply.is_some();
         if let Some(reply) = reply {
             let _ = reply.send(match &outcome {
                 TakeOutcome::Settled { settlement, .. } => match settlement {
@@ -1249,17 +1248,14 @@ impl TakeoverRole {
             });
         }
         let (promise, settlement) = match outcome {
-            // This node's own attempt re-runs a failed confirm read. A
-            // hand-off it ran for an asker ends: the asker rechecks.
-            TakeOutcome::Unconfirmed { reason } if !served => {
+            // A failed confirm read is re-sent, also when this node runs the
+            // attempt for an asker, which was told it declined and rechecks.
+            // Cluster KV elects a leader only through a voter's own request,
+            // and this node, ranked first, may be the one voter that can win:
+            // ending here would leave nothing to elect it.
+            TakeOutcome::Unconfirmed { reason } => {
                 tracing::debug!(target: "sinomo.dfs.write_set", %reason, shard = %key.1.0, "takeover confirm read failed; re-sending");
                 self.wait_to_reconfirm(&key, None);
-                return;
-            }
-            TakeOutcome::Unconfirmed { reason } => {
-                tracing::debug!(target: "sinomo.dfs.write_set", %reason, shard = %key.1.0, "takeover not confirmed");
-                self.end_standing(&key);
-                self.attempts.remove(&key);
                 return;
             }
             TakeOutcome::NotTaken { follow, reason } => {
