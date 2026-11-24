@@ -110,6 +110,9 @@ pub(crate) struct DfsRecordWaitWake {
     pub(crate) on_arrival: bool,
     /// The owner has work of its own due then.
     pub(crate) at: Option<Instant>,
+    /// The routed write the service holds is asked to be sent again (see
+    /// [`crate::held_write_watch`]).
+    pub(crate) held_write: bool,
 }
 
 /// How a followed namespace request ended.
@@ -263,7 +266,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// The current projection of the dispatch shard, including same-epoch
     /// membership updates that change the exact stamp required for a re-send.
-    fn current_dispatch_record(
+    pub(crate) fn current_dispatch_record(
         &mut self,
         evidence: &DfsRecordChangeEvidence,
     ) -> Option<DfsMetadataShardConfig> {
@@ -345,8 +348,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.transport
                 .set_incoming_arrival_waker(Some(Arc::clone(&waker)));
         }
+        let held = wake
+            .held_write
+            .then(|| {
+                self.held_write
+                    .as_ref()
+                    .map(|(_, held)| Arc::clone(&held.wake))
+            })
+            .flatten();
+        if let Some(held) = &held {
+            held.set_waker(Some(Arc::clone(&waker)));
+        }
         let followed =
             self.await_shard_record_change_on(watch.as_mut(), evidence, resend, wake, deadline);
+        if let Some(held) = &held {
+            held.set_waker(None);
+        }
         if wake.on_arrival {
             self.transport.set_incoming_arrival_waker(None);
         }
@@ -396,6 +413,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.check_cancelled("shard record wait")?;
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return Ok(Some(DfsRecordFollowed::Ended));
+        }
+        // The held write is asked to be sent again.
+        if wake.held_write
+            && self
+                .held_write
+                .as_ref()
+                .is_some_and(|(_, held)| held.wake.is_due())
+        {
+            return Ok(Some(DfsRecordFollowed::Woken));
         }
         // An answer that already arrived is read before the record: it may
         // settle the request that would otherwise be sent again.
@@ -499,6 +525,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsRecordWaitWake {
                         on_arrival: true,
                         at: Some(wake_at),
+                        held_write: false,
                     },
                 )
                 .map(DfsHeldWriteWaitNow::Due);
@@ -510,6 +537,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsRecordWaitWake {
                     on_arrival: true,
                     at: None,
+                    held_write: false,
                 },
                 deadline,
             )? {
@@ -1366,6 +1394,7 @@ mod tests {
                 DfsRecordWaitWake {
                     on_arrival: true,
                     at: None,
+                    held_write: false,
                 },
             )
             .unwrap();
@@ -1398,6 +1427,7 @@ mod tests {
                 DfsRecordWaitWake {
                     on_arrival: true,
                     at: Some(Instant::now() + Duration::from_millis(40)),
+                    held_write: false,
                 },
             )
             .unwrap();

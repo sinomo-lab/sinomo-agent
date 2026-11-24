@@ -2197,6 +2197,65 @@ pub(crate) fn dfs_placement_event_publication() -> sinomo_module::ComponentEvent
     )
 }
 
+pub(crate) fn dfs_write_answer_event_publication() -> sinomo_module::ComponentEventPublication {
+    sinomo_module::ComponentEventPublication::new(
+        crate::DFS_WRITE_ANSWER_UNCLAIMED_EVENT_KIND,
+        crate::DFS_WRITE_ANSWER_EVENT_SCHEMA_ID,
+        crate::DFS_WRITE_ANSWER_EVENT_SCHEMA_VERSION,
+    )
+}
+
+/// Announce that an answer to a routed write sent from this node arrived
+/// with no registered response owner. A requester outside Main, which
+/// registers none, holds that request and sends it again under its id; Main
+/// keeps nothing for it. Provenance: the primary that answered, and the
+/// route the answer arrived on.
+pub(crate) async fn publish_dfs_write_answer_unclaimed(
+    client: &ComponentEventClient,
+    origin_node_id: &sinomo_core::Id,
+    answering_node_id: &sinomo_core::Id,
+    request_id: &str,
+    object_id: &crate::DfsObjectId,
+) {
+    let publication = dfs_write_answer_event_publication();
+    let payload = match serde_json::to_value(crate::DfsWriteAnswerUnclaimed {
+        request_id: request_id.to_owned(),
+        object_id: object_id.clone(),
+    }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, "DFS unclaimed write answer payload could not be encoded");
+            return;
+        }
+    };
+    let mut envelope = sinomo_core::EventEnvelope::new(
+        sinomo_core::Id::generate(),
+        time::OffsetDateTime::now_utc(),
+        origin_node_id.clone(),
+        sinomo_core::Source::new("component/sinomo-dfs").expect("static DFS event source"),
+        sinomo_core::EventKind::new(publication.kind.clone()).expect("static DFS event kind"),
+        sinomo_core::Salience::new(0.2).expect("static DFS event salience"),
+        sinomo_core::Confidence::new(1.0).expect("static DFS event confidence"),
+        sinomo_core::RoutingMetadata::new(
+            sinomo_core::RoutingScope::Local,
+            sinomo_core::LatencyClass::Reactive,
+            sinomo_core::PrivacyClass::Derived,
+        ),
+    )
+    .with_payload(payload);
+    envelope.evidence.refs.push(sinomo_core::EvidenceRef::new(
+        format!("sinomo-node:{answering_node_id}"),
+        sinomo_core::EvidenceKind::Other,
+    ));
+    envelope
+        .links
+        .related_to
+        .push(crate::DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE.to_string());
+    if let Err(error) = client.publish(&publication, envelope).await {
+        tracing::warn!(%error, "DFS unclaimed write answer event publication failed");
+    }
+}
+
 pub(crate) fn dfs_configuration_event_publication() -> sinomo_module::ComponentEventPublication {
     sinomo_module::ComponentEventPublication::new(
         crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND,
@@ -2827,6 +2886,7 @@ fn open_dfs_runtime_service_for_use(
     // exclusively with the native provider/intent/receipt/kernel guards.
     let service = NetworkedDfsService::new(transport, content)
         .with_cancellation(cancellation)
+        .with_node_data_dir(data_dir.clone())
         .with_placement_snapshot_cache(cached_daemon_dfs_placement_snapshot_cache(
             data_dir,
             &state.local_node_id,
@@ -3899,6 +3959,7 @@ pub(crate) use maintenance_runtime::{
 mod peer_verdicts;
 #[cfg(any(test, feature = "test-support"))]
 pub use peer_verdicts::DfsStandingVerdictGate;
+pub(crate) use peer_verdicts::{DfsPeerPathBackWatch, watch_peer_path_back};
 mod write_set_keeping;
 mod write_set_takeover;
 pub(crate) use write_set_takeover::{

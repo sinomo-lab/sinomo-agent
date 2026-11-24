@@ -2734,7 +2734,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn canonical_pending_routed_write_request_id(&self, request_id: &str) -> Option<String> {
+    pub(crate) fn canonical_pending_routed_write_request_id(
+        &self,
+        request_id: &str,
+    ) -> Option<String> {
         self.writes
             .pending_routed_writes
             .get(request_id)
@@ -3059,7 +3062,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             match self.record_change_or_watch(&evidence, resend)? {
                 crate::service_record_follow::DfsRecordChangeNow::Due(followed) => followed,
                 crate::service_record_follow::DfsRecordChangeNow::NotYet { watch, until } => {
-                    self.compact_pending_routed_write(&canonical);
+                    self.compact_pending_routed_write_for_mounted_call(&canonical);
                     return Err(self.hand_back_mounted_write_wait(*resend, watch, until));
                 }
             }
@@ -3070,6 +3073,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 crate::service_record_follow::DfsRecordWaitWake {
                     on_arrival: true,
                     at: None,
+                    held_write: false,
                 },
             )?
         };
@@ -3109,6 +3113,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(RoutedWriteRecordFollow::NotFollowed);
         };
         let followed = if self.mounted_call_hands_back_waits() {
+            // An event asked for the write to be sent again (see
+            // `crate::held_write_watch`): it goes under its id, and the
+            // primary answers from its row.
+            if self.take_mounted_held_write_due(&canonical) {
+                let record = self
+                    .current_dispatch_record(&evidence)
+                    .unwrap_or_else(|| evidence.dispatched.clone());
+                self.dispatch_held_routed_write(&canonical, &record, true)?;
+                return Ok(RoutedWriteRecordFollow::Resent);
+            }
             // The mount waits for the primary's answer with its lock
             // released, and on no timer: the primary answers when the write
             // commits. The call's next run does not send the write again: it
@@ -3116,18 +3130,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             match self.held_write_answer_or_watch(&evidence, wake_at)? {
                 crate::service_record_follow::DfsHeldWriteWaitNow::Due(followed) => followed,
                 crate::service_record_follow::DfsHeldWriteWaitNow::Waiting(watch) => {
-                    return Err(self.hand_back_mounted_held_write_wait(&canonical, watch));
+                    return Err(self.hand_back_mounted_held_write_wait(
+                        &canonical,
+                        evidence.clone(),
+                        watch,
+                    ));
                 }
             }
         } else {
-            self.await_shard_record_change(
+            // This settle holds the write: it watches the events that ask
+            // for it to be sent again while it waits for the answer.
+            if self
+                .held_write
+                .as_ref()
+                .is_none_or(|(held, _)| held != &canonical)
+            {
+                self.held_write = self
+                    .watch_held_routed_write(&canonical)
+                    .map(|watch| (canonical.clone(), watch));
+            }
+            let followed = self.await_shard_record_change(
                 &evidence,
                 None,
                 crate::service_record_follow::DfsRecordWaitWake {
                     on_arrival: true,
                     at: Some(wake_at),
+                    held_write: true,
                 },
-            )?
+            )?;
+            if self
+                .held_write
+                .as_ref()
+                .is_some_and(|(_, held)| held.wake.take_due())
+            {
+                let record = self
+                    .current_dispatch_record(&evidence)
+                    .unwrap_or_else(|| evidence.dispatched.clone());
+                self.dispatch_held_routed_write(&canonical, &record, true)?;
+                return Ok(RoutedWriteRecordFollow::Resent);
+            }
+            followed
         };
         match followed {
             crate::service_record_follow::DfsRecordFollowed::Newer(record) => {

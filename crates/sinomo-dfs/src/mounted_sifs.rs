@@ -449,16 +449,20 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane_
 ) -> Result<OpenedMountedSifsService, DfsError> {
     let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
         mounted_sifs_cluster_context(&data_dir)?;
-    let control_plane = if cluster_state.is_some() {
-        Some(Box::new(MountedSifsControlPlaneKvClient::new_authoritative(
+    let client = cluster_state.is_some().then(|| {
+        MountedSifsControlPlaneKvClient::new_authoritative(
             &data_dir,
             Arc::clone(&sync_peer_transport),
             Arc::clone(&async_peer_transport),
-        )) as Box<dyn DfsControlPlaneKvClient>)
-    } else {
-        None
-    };
-    open_mounted_sifs_service_from_context(
+        )
+    });
+    // The feed that announces configuration also announces answers no owner
+    // claimed; this client's held writes hear them there.
+    let unclaimed_answers = client
+        .as_ref()
+        .map(MountedSifsControlPlaneKvClient::unclaimed_answers);
+    let control_plane = client.map(|client| Box::new(client) as Box<dyn DfsControlPlaneKvClient>);
+    let mut opened = open_mounted_sifs_service_from_context(
         &data_dir,
         &cluster_paths,
         cluster_state.as_ref(),
@@ -469,7 +473,9 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane_
         control_plane,
         cancellation,
         None,
-    )
+    )?;
+    opened.service.unclaimed_answers = unclaimed_answers;
+    Ok(opened)
 }
 
 /// Opens mounted SIFS with caller-owned DFS peer transports.
@@ -644,6 +650,9 @@ fn open_mounted_sifs_service_from_context(
         cluster_state.is_some(),
     )?;
     service.set_cancellation(cancellation);
+    if cluster_state.is_some() {
+        service.node_data_dir = Some(data_dir.clone());
+    }
     if cluster_state.is_none() {
         service
             .bootstrap_distributed_sifs()
@@ -2981,10 +2990,26 @@ enum MountedSifsConfiguration {
     Unsupported,
 }
 
-#[derive(Debug)]
+/// The held routed writes of a client's calls that hear Main's
+/// announcements of unclaimed answers, by request id.
+type MountedSifsAnswerListeners = std::collections::BTreeMap<
+    String,
+    Vec<(crate::DfsObjectId, std::sync::Weak<dyn Fn() + Send + Sync>)>,
+>;
+
 struct MountedSifsConfigurationShared {
     state: Mutex<(MountedSifsConfiguration, u64)>,
     settled: Condvar,
+    answer_listeners: Mutex<MountedSifsAnswerListeners>,
+}
+
+impl std::fmt::Debug for MountedSifsConfigurationShared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountedSifsConfigurationShared")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MountedSifsConfigurationShared {
@@ -2992,6 +3017,47 @@ impl MountedSifsConfigurationShared {
         Self {
             state: Mutex::new((MountedSifsConfiguration::Connecting, 0)),
             settled: Condvar::new(),
+            answer_listeners: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Send the held write `answer` names again, if a call of this client
+    /// holds it; an announcement for any other request is ignored.
+    fn answer_unclaimed(&self, answer: &crate::DfsWriteAnswerUnclaimed) {
+        let wakes = self
+            .answer_listeners
+            .lock()
+            .ok()
+            .and_then(|listeners| {
+                listeners.get(&answer.request_id).map(|held| {
+                    held.iter()
+                        .filter(|(object_id, _)| *object_id == answer.object_id)
+                        .filter_map(|(_, wake)| wake.upgrade())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        for wake in wakes {
+            wake();
+        }
+    }
+
+    /// Send every held write of this client's calls again: the stream that
+    /// announces unclaimed answers missed some, or its daemon restarted.
+    fn every_answer_unclaimed(&self) {
+        let wakes = self
+            .answer_listeners
+            .lock()
+            .map(|listeners| {
+                listeners
+                    .values()
+                    .flatten()
+                    .filter_map(|(_, wake)| wake.upgrade())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for wake in wakes {
+            wake();
         }
     }
 
@@ -3085,6 +3151,8 @@ impl MountedSifsConfigurationShared {
 enum MountedSifsConfigurationItem {
     Ready,
     Published(DfsConfigurationPublication),
+    /// Main announced an answer to a routed write that no owner claimed.
+    AnswerUnclaimed(crate::DfsWriteAnswerUnclaimed),
     Lagged,
 }
 
@@ -3146,6 +3214,15 @@ impl MountedSifsConfigurationEvents {
                         {
                             mounted_sifs_configuration_item(event.envelope.payload.clone())
                         }
+                        Ok(event)
+                            if event.envelope.kind.as_str()
+                                == crate::DFS_WRITE_ANSWER_UNCLAIMED_EVENT_KIND =>
+                        {
+                            match mounted_sifs_answer_item(event.envelope.payload.clone()) {
+                                Some(item) => item,
+                                None => continue,
+                            }
+                        }
                         Ok(_) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             MountedSifsConfigurationItem::Lagged
@@ -3176,6 +3253,14 @@ impl MountedSifsConfigurationEvents {
     }
 }
 
+/// An undecodable unclaimed-answer announcement names no request this client
+/// could hold.
+fn mounted_sifs_answer_item(payload: serde_json::Value) -> Option<MountedSifsConfigurationItem> {
+    serde_json::from_value(payload)
+        .ok()
+        .map(MountedSifsConfigurationItem::AnswerUnclaimed)
+}
+
 /// An undecodable announcement still means "changed".
 fn mounted_sifs_configuration_item(payload: serde_json::Value) -> MountedSifsConfigurationItem {
     match serde_json::from_value(payload) {
@@ -3184,8 +3269,9 @@ fn mounted_sifs_configuration_item(payload: serde_json::Value) -> MountedSifsCon
     }
 }
 
-/// Subscribe to `dfs.configuration.published` on the local daemon's existing
-/// event stream. The authenticated local Main is resolved for each session.
+/// Subscribe to `dfs.configuration.published` and `dfs.write.answer_unclaimed`
+/// on the local daemon's existing event stream. The authenticated local Main
+/// is resolved for each session.
 async fn mounted_sifs_daemon_configuration_events(
     data_dir: &SinomoDataDir,
     items: tokio::sync::mpsc::UnboundedSender<MountedSifsConfigurationItem>,
@@ -3214,7 +3300,7 @@ async fn mounted_sifs_daemon_configuration_events(
     let request = sinomo_core::network::ObjectRpcRequest::encode_body(
         sinomo_api::DAEMON_EVENT_SUBSCRIBE_ROUTE,
         sinomo_api::DAEMON_RPC_CATEGORY,
-        &sinomo_api::DaemonEventSubscribeRequest::for_dfs_configuration(),
+        &sinomo_api::DaemonEventSubscribeRequest::for_dfs_mounted_client(),
     )
     .map_err(|error| error.to_string())?;
     sinomo_api::send_daemon_rpc_stream_from_data_dir_async(
@@ -3236,6 +3322,14 @@ async fn mounted_sifs_daemon_configuration_events(
                     if event.kind.as_str() == crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND =>
                 {
                     mounted_sifs_configuration_item(event.payload)
+                }
+                sinomo_api::DaemonEventStreamItem::Event { event }
+                    if event.kind.as_str() == crate::DFS_WRITE_ANSWER_UNCLAIMED_EVENT_KIND =>
+                {
+                    match mounted_sifs_answer_item(event.payload) {
+                        Some(item) => item,
+                        None => return Ok(true),
+                    }
                 }
                 sinomo_api::DaemonEventStreamItem::Event { .. } => return Ok(true),
                 sinomo_api::DaemonEventStreamItem::Lagged { .. } => {
@@ -3352,12 +3446,21 @@ async fn run_mounted_sifs_configuration_session(
         for item in std::iter::once(first).chain(std::iter::from_fn(|| items.try_recv().ok())) {
             match item {
                 MountedSifsConfigurationItem::Ready => {
+                    // A new session: announcements made while the last one
+                    // was down, or before its daemon restarted, were missed.
+                    shared.every_answer_unclaimed();
                     ready = true;
                     refetch = true;
                 }
-                MountedSifsConfigurationItem::Lagged => refetch = true,
+                MountedSifsConfigurationItem::Lagged => {
+                    shared.every_answer_unclaimed();
+                    refetch = true;
+                }
                 MountedSifsConfigurationItem::Published(publication) => {
                     newest = Some(publication);
+                }
+                MountedSifsConfigurationItem::AnswerUnclaimed(answer) => {
+                    shared.answer_unclaimed(&answer);
                 }
             }
         }
@@ -3490,7 +3593,7 @@ pub(crate) fn register_mounted_sifs_test_event_bus(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn mounted_sifs_test_event_bus(
+pub(crate) fn mounted_sifs_test_event_bus(
     data_dir: &SinomoDataDir,
 ) -> Option<(
     sinomo_module::ComponentEventBus,
@@ -3798,6 +3901,66 @@ impl MountedSifsControlPlaneKvClient {
     }
 }
 
+/// The announcements of unclaimed answers this client's configuration feed
+/// hears from the local daemon, for the held writes of its calls.
+#[derive(Debug)]
+struct MountedSifsUnclaimedAnswers {
+    configuration: Arc<MountedSifsConfigurationFeed>,
+}
+
+impl crate::held_write_watch::DfsUnclaimedAnswerSource for MountedSifsUnclaimedAnswers {
+    fn watch(
+        &self,
+        request_id: &str,
+        object_id: &crate::DfsObjectId,
+        wake: std::sync::Weak<dyn Fn() + Send + Sync>,
+    ) -> Box<dyn std::any::Any + Send> {
+        if let Ok(mut listeners) = self.configuration.shared.answer_listeners.lock() {
+            listeners
+                .entry(request_id.to_owned())
+                .or_default()
+                .push((object_id.clone(), wake.clone()));
+        }
+        Box::new(MountedSifsAnswerListener {
+            configuration: Arc::clone(&self.configuration),
+            request_id: request_id.to_owned(),
+            wake,
+        })
+    }
+}
+
+impl MountedSifsControlPlaneKvClient {
+    /// What this client's held writes hear of Main's announcements of
+    /// answers no owner claimed.
+    fn unclaimed_answers(&self) -> Arc<dyn crate::held_write_watch::DfsUnclaimedAnswerSource> {
+        Arc::new(MountedSifsUnclaimedAnswers {
+            configuration: Arc::clone(&self.configuration),
+        })
+    }
+}
+
+/// A held write's place among the listeners for unclaimed answers; dropped
+/// when the call no longer holds the write, so a later announcement for it
+/// is ignored.
+struct MountedSifsAnswerListener {
+    configuration: Arc<MountedSifsConfigurationFeed>,
+    request_id: String,
+    wake: std::sync::Weak<dyn Fn() + Send + Sync>,
+}
+
+impl Drop for MountedSifsAnswerListener {
+    fn drop(&mut self) {
+        if let Ok(mut listeners) = self.configuration.shared.answer_listeners.lock()
+            && let Some(held) = listeners.get_mut(&self.request_id)
+        {
+            held.retain(|(_, wake)| !std::sync::Weak::ptr_eq(wake, &self.wake));
+            if held.is_empty() {
+                listeners.remove(&self.request_id);
+            }
+        }
+    }
+}
+
 /// A mounted requester's wait on its configuration feed. It holds the feed,
 /// so the subscription outlives the client's other clones for the wait.
 struct MountedSifsConfigurationChangeWatch {
@@ -3850,6 +4013,23 @@ impl crate::DfsConfigurationChangeWatch for MountedSifsConfigurationChangeWatch 
             drop(configuration.shared.state.lock());
             configuration.shared.settled.notify_all();
         })
+    }
+
+    fn held_shard_record(
+        &self,
+        file_system_id: &crate::DfsFileSystemId,
+        shard_id: &str,
+    ) -> Option<crate::DfsMetadataShardConfig> {
+        let state = self.configuration.shared.state.lock().ok()?;
+        let MountedSifsConfiguration::Published(snapshot) = &state.0 else {
+            return None;
+        };
+        snapshot
+            .metadata_shards(file_system_id)
+            .ok()
+            .flatten()?
+            .into_iter()
+            .find(|shard| shard.shard_id == shard_id)
     }
 }
 

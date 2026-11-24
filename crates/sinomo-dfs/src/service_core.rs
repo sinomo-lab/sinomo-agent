@@ -97,6 +97,9 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             record_waits_parked: false,
             attribute_read_replans: false,
             attribute_read_resend: None,
+            node_data_dir: None,
+            held_write: None,
+            unclaimed_answers: None,
         }
     }
 }
@@ -263,6 +266,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if outer || should_clear {
             self.clear_metadata_lookup_cache();
         }
+    }
+
+    /// Name the node this requester runs on, whose network verdicts its held
+    /// writes watch.
+    pub(crate) fn with_node_data_dir(
+        mut self,
+        data_dir: sinomo_core::local::SinomoDataDir,
+    ) -> Self {
+        self.node_data_dir = Some(data_dir);
+        self
     }
 
     /// Install a cooperative cancellation flag. Distributed wait/retry loops

@@ -387,3 +387,67 @@ fn response_delivery_shutdown_revokes_custody_and_wakes_registered_waiter() {
     ));
     assert_eq!(inbox.len().unwrap(), 0);
 }
+
+/// An answer for a live call whose owner is not attached is kept with the
+/// call's registration, and goes to the owner that registers the same
+/// request again; another request's owner gets nothing of it.
+#[test]
+fn response_delivery_keeps_an_answer_for_an_unattached_owner_until_it_registers_again() {
+    let router = Arc::new(DfsRoutedResponseDelivery::new());
+    let first = DfsRoutedResponseInboxOwner::new();
+    let _call = router
+        .register(
+            &first,
+            "request",
+            &object_id(),
+            &["request".into(), "alias".into()],
+        )
+        .unwrap()
+        .unwrap();
+    drop(first);
+    assert!(router.try_deliver(&message("alias", true)).unwrap());
+    assert_eq!(router.kept_answer_count(), 1);
+    let other = DfsRoutedResponseInboxOwner::new();
+    let _other = router
+        .register(&other, "other", &object_id(), &["other".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.len().unwrap(), 0);
+    let attached = DfsRoutedResponseInboxOwner::new();
+    let _attached = router
+        .register(
+            &attached,
+            "request",
+            &object_id(),
+            &["request".into(), "alias".into()],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.drain().unwrap(), vec![message("alias", true)]);
+    assert_eq!(router.kept_answer_count(), 0);
+}
+
+/// What was kept for a call goes when the call ends: a later answer to it is
+/// not taken into custody, and an owner registering the request afterwards
+/// receives nothing.
+#[test]
+fn response_delivery_keeps_nothing_after_the_call_ends() {
+    let router = Arc::new(DfsRoutedResponseDelivery::new());
+    let first = DfsRoutedResponseInboxOwner::new();
+    let call = router
+        .register(&first, "request", &object_id(), &["request".into()])
+        .unwrap()
+        .unwrap();
+    drop(first);
+    assert!(router.try_deliver(&message("request", false)).unwrap());
+    assert_eq!(router.kept_answer_count(), 1);
+    drop(call);
+    assert_eq!(router.kept_answer_count(), 0);
+    assert!(!router.try_deliver(&message("request", true)).unwrap());
+    let later = DfsRoutedResponseInboxOwner::new();
+    let _later = router
+        .register(&later, "request", &object_id(), &["request".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.len().unwrap(), 0);
+}

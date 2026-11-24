@@ -5303,10 +5303,10 @@ async fn handle_served_daemon_dfs_message(
         let encoded_bytes = encoded_value_bytes
             .and_then(|bytes| usize::try_from(bytes).ok())
             .unwrap_or(usize::MAX);
-        if registered
+        let custody = registered
             .response_delivery
-            .try_deliver_with_size(&command.routed_message, encoded_bytes)?
-        {
+            .deliver_with_size(&command.routed_message, encoded_bytes)?;
+        if custody != crate::response_delivery::DfsResponseCustody::Unowned {
             tracing::trace!(
                 target: "sinomo.perf",
                 stage = "dfs.response.delivery",
@@ -5315,8 +5315,30 @@ async fn handle_served_daemon_dfs_message(
                 rpc_request_id = %command.request_id,
                 source_node_id = %command.routed_message.source_node_id,
                 encoded_bytes,
+                ?custody,
                 "DFS response custody transferred to registered requester"
             );
+        }
+        // No attached owner takes it: its registered owner is not attached,
+        // and Main keeps it for the owner that registers the request again,
+        // or no owner registered it, as for a requester outside Main. The
+        // announcement names the request, and a requester that holds it runs
+        // the call again: it takes a kept answer when it registers, and
+        // otherwise sends the write again under its id. An answer no owner
+        // registered goes on to Main's own service as before.
+        if custody != crate::response_delivery::DfsResponseCustody::Delivered
+            && let Some(events) = registered.event_client.as_ref()
+        {
+            crate::runtime_host::publish_dfs_write_answer_unclaimed(
+                events,
+                &local.local_node_id,
+                &command.routed_message.source_node_id,
+                &response.request_id,
+                &response.object_id,
+            )
+            .await;
+        }
+        if custody != crate::response_delivery::DfsResponseCustody::Unowned {
             return Ok(DfsDataPlaneResponse::value(crate::DfsMessageResponse {
                 request_id: command.request_id,
                 outbound_messages: Vec::new(),

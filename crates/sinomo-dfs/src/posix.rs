@@ -428,6 +428,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         outcome: NetworkedDfsWriteOutcome,
         foreground_replica_repair: bool,
     ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
+        let settled = self.settle_write_outcome_until_ready(outcome, foreground_replica_repair);
+        // The settle is over: what watched the write it held ends with it.
+        self.held_write = None;
+        settled
+    }
+
+    fn settle_write_outcome_until_ready(
+        &mut self,
+        outcome: NetworkedDfsWriteOutcome,
+        foreground_replica_repair: bool,
+    ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
         // Its dispatch is done: a later dispatch belongs to another caller.
         self.writes.followed_write = None;
         let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {

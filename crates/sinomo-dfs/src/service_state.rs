@@ -860,6 +860,16 @@ pub struct NetworkedDfsService<T> {
     /// The re-send timer of that attribute read, carried across its runs
     /// while it waits for a shard whose answer it needs.
     pub(crate) attribute_read_resend: Option<crate::service_record_follow::DfsRecordFollowResend>,
+    /// The node this requester runs on, for the network verdicts its held
+    /// writes watch. `None` for a service that is not a node's requester.
+    pub(crate) node_data_dir: Option<sinomo_core::local::SinomoDataDir>,
+    /// The routed write a settle that is not a mounted call holds, and what
+    /// watches it (see [`crate::held_write_watch`]).
+    pub(crate) held_write: Option<(String, crate::held_write_watch::DfsHeldWriteWatch)>,
+    /// For a client outside Main: Main's announcements of answers no owner
+    /// claimed (see [`crate::held_write_watch`]).
+    pub(crate) unclaimed_answers:
+        Option<std::sync::Arc<dyn crate::held_write_watch::DfsUnclaimedAnswerSource>>,
     pub(crate) writes: DfsWriteState,
     pub(crate) reads: DfsReadState,
     pub(crate) replication: DfsReplicationState,

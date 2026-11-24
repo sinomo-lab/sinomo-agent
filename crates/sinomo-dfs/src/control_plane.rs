@@ -1251,6 +1251,17 @@ pub trait DfsConfigurationChangeWatch: Send {
 
     /// A handle that ends a wait in progress, or the next one, at once.
     fn waker(&self) -> Arc<dyn Fn() + Send + Sync>;
+
+    /// The record of `shard_id` in `file_system_id` that the publication
+    /// this watch observes holds now. `None` when the watch cannot tell, for
+    /// example while it holds no publication.
+    fn held_shard_record(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _shard_id: &str,
+    ) -> Option<DfsMetadataShardConfig> {
+        None
+    }
 }
 
 pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
