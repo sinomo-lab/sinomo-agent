@@ -1196,10 +1196,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Keep the content a same-id retry of an open write carries when this
-    /// node now owns the write and holds none of its content: the primary
-    /// the write opened at may have been the only node holding it. The
-    /// content is the write's own, verified against the hash its row or its
-    /// prepared opening recorded, so the write resumes from it here.
+    /// node owns the write and holds none of its content: the primary the
+    /// write opened at may have been the only node holding it. This node may
+    /// already have adopted the write at its own epoch when the retry
+    /// arrives. The content is the write's own, verified against the hash
+    /// its row or its prepared opening recorded, so the write resumes from
+    /// it here.
     fn bind_retry_content_to_open_write(
         &mut self,
         requester_node_id: &NodeId,
@@ -1258,9 +1260,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
             });
         let Some(open) = open.filter(|open| {
-            open.content_hash.as_deref() == Some(content_hash.as_str())
-                && open.target_version == command.request.target_version
-                && open.owner_epoch < scope.owner_epoch
+            crate::intent::stable_write_intent_record_matches_routed_write_command(
+                open,
+                requester_node_id,
+                command,
+                &content_hash,
+            ) && open.owner_epoch <= scope.owner_epoch
         }) else {
             return Ok(());
         };
@@ -1933,7 +1938,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
         } else if let Some(replayed_result) =
             match self.replayed_routed_write_outcome_if_known(&requester_node_id, &command) {
-                Ok(Some(outcome)) => Some(DfsDistributedWriteResult::Outcome { outcome }),
+                Ok(Some(outcome)) => {
+                    // The requester holds a write answered Pending until its
+                    // commit answers it. A member that took the write over
+                    // first serves it here, from its row, and holds that
+                    // answer as the write's first dispatch does.
+                    if let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome {
+                        self.track_pending_remote_write_response(
+                            intent_id,
+                            &requester_node_id,
+                            &request_id,
+                            &object_id,
+                            metadata_journal_after_sequence,
+                            None,
+                            foreground_replica_repair,
+                        );
+                    }
+                    Some(DfsDistributedWriteResult::Outcome { outcome })
+                }
                 Ok(None) => None,
                 Err(
                     error @ (DfsError::WriteOperationIdConflict { .. }

@@ -919,3 +919,150 @@ fn native_retry_meeting_its_openings_recovery_commits_once() {
     assert_eq!(bytes, operation.as_bytes());
     runtime.close().unwrap();
 }
+
+/// C's call writes over a file while the primary cannot stage to either
+/// member, and the primary answers it `Pending`. The primary is lost and B
+/// takes over, and B adopts the open write at its own epoch before the
+/// call's same-id retry reaches it. Without `held`, the primary holds the
+/// write's one copy, and B's copy from the retry completes W. With `held`,
+/// the write's copies belong to B and C only, so B's copy from the retry is
+/// one of two: B answers the retry `Pending` while it cannot stage to C,
+/// and commits once its copy to C lands. Ends with the call answered and the
+/// write committed once.
+fn retry_after_its_successor_adopted_the_write(name: &str, held: bool) {
+    let (runtime, config) = owned_shard(name);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let path = "/services/owned/adopted.txt";
+    let operation = "successor-adopted-retry";
+    let before = committed_before(&runtime, &config, path);
+    keep_with_paths(&runtime, &config, &[&b]);
+    cannot_stage(&runtime, &config);
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let data_dir = runtime.data_dir(&c).clone();
+    let mut call_options = options(&config);
+    if held {
+        call_options.policy = crate::DfsReplicationPolicy::new(2, 2).unwrap();
+        call_options.policy.forbidden_node_ids = vec![p.clone()];
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut client =
+            crate::runtime_host::open_dfs_runtime_service(&data_dir, Some(executor().handle()))
+                .expect("the requester opens its client");
+        let _ = sender.send(client.posix_write_file_with_operation_id(
+            path,
+            operation.as_bytes(),
+            call_options,
+            operation,
+        ));
+    });
+    let intent_id = crate::intent::stable_write_intent_id(&c, &before.object_id, operation);
+    let answered_by = |target: &NodeId| {
+        let calls = runtime.rpc_observations();
+        calls.iter().any(|call| {
+            call.source == c
+                && &call.target == target
+                && call.dfs_request_id.as_deref() == Some(operation)
+                && calls.iter().any(|answer| {
+                    answer.call_id == call.call_id
+                        && answer.phase == crate::test_runtime::RpcPhase::Completed
+                })
+        })
+    };
+    wait_until("the primary answers the write", &runtime, &[&b], || {
+        answered_by(&p)
+    });
+    // Nothing the caller sends reaches B until B has adopted the write.
+    let resend = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(FaultRule {
+        source: Some(c.clone()),
+        target: Some(b.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: FaultAction::PauseBeforeDispatch(std::sync::Arc::clone(&resend)),
+    });
+    if held {
+        for route in [
+            crate::DFS_DATA_STAGE_BLOB_ROUTE,
+            crate::DFS_DATA_STAGE_PATCH_ROUTE,
+            crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(FaultRule {
+                source: Some(b.clone()),
+                target: Some(c.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: FaultAction::BudgetExhausted,
+            });
+        }
+    }
+    takes_over(&runtime, &config, &b);
+    let epoch = record_from(&runtime, &config, &b).shard.epoch;
+    wait_until("B adopts the write at its epoch", &runtime, &[&b], || {
+        intent_at(&runtime, &b, &config, &before.object_id, &intent_id)
+            .is_some_and(|row| row.owner_epoch == epoch)
+    });
+    super::commit_native_tests::release(&resend);
+    if held {
+        wait_until("B answers the retry", &runtime, &[&b], || answered_by(&b));
+        let early = receiver.recv_timeout(Duration::from_secs(1));
+        assert!(
+            early.is_err(),
+            "B holds the write below W: {early:?}; C's calls {:?}",
+            write_calls_from(&runtime, &c, operation)
+        );
+        // B's copy to C lands: the write commits, and its commit answers
+        // the call.
+        runtime.clear_faults();
+    }
+    let outcome = receiver.recv_timeout(EVENT_BOUND * 2).unwrap_or_else(|_| {
+        panic!(
+            "{operation} is answered once B has adopted it; C's calls {:?}\n{}",
+            write_calls_from(&runtime, &c, operation),
+            event_log(&runtime, &[&b, &c])
+        )
+    });
+    runtime.clear_faults();
+    let target = crate::intent::stable_write_target_version(&c, &before.object_id, operation);
+    if let Some(stat) = committed(outcome, "the member that took over commits the write") {
+        assert_eq!(stat.version, target);
+    }
+    let to_b = write_calls_from(&runtime, &c, operation)
+        .into_iter()
+        .filter(|(target, route, _, _)| {
+            target == &b && route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+        })
+        .count();
+    assert_eq!(
+        to_b, 1,
+        "the call sent the write to B once, and B answered it"
+    );
+    heal(&runtime, &config);
+    let (stat, bytes) = read(&runtime, &c, path);
+    assert_eq!(stat.version, target, "the write committed once");
+    assert_eq!(bytes, operation.as_bytes());
+    runtime.close().unwrap();
+}
+
+/// The member that took over adopted the open write at its own epoch
+/// before the caller's same-id retry reached it: the retry's content still
+/// binds to the write there, and the write commits once.
+#[test]
+fn native_retry_after_its_successor_adopted_the_write_commits_once() {
+    retry_after_its_successor_adopted_the_write("native-successor-adopted-retry", false);
+}
+
+/// As [`native_retry_after_its_successor_adopted_the_write_commits_once`],
+/// with the write's copies on B and C only: the member that took over holds
+/// one of two while it serves the retry, answers it `Pending` and holds that
+/// answer, and the write's commit answers the caller's one call.
+#[test]
+fn native_retry_held_at_its_successor_is_answered_by_its_commit() {
+    retry_after_its_successor_adopted_the_write("native-successor-held-retry", true);
+}
