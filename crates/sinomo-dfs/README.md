@@ -529,7 +529,10 @@ them.
   from the row, whose content size the write recorded when it opened. The
   write's bytes come from a receipt holder or from the caller's same-id retry,
   whose content is checked against the row's hash, never from the lost
-  primary; the retry then finishes the write once.
+  primary; the retry then finishes the write once. The caller's abort is
+  answered from the row too: it aborts an open write once, a repeat is
+  answered as that abort, and a write that committed first is answered with
+  its commit.
 
 Alignment uses a prefix probe that names the epoch start and
 `epoch_start_alignment = <epoch>`, answered on the direct journal-batch route

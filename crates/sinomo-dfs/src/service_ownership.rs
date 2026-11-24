@@ -28,7 +28,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             },
             DfsConfirmedTimeoutAction::Abort => {
-                self.abort_pending_write(intent_id)?;
+                let content_hash = self
+                    .retained_routed_write(intent_id)
+                    .and_then(|pending| pending.command)
+                    .map(|command| crate::intent::routed_write_command_content_hash(&command));
+                let terminal = self.abort_pending_write(intent_id)?;
+                if terminal.state == DfsWriteIntentState::Committed {
+                    // The write committed before its abort reached it.
+                    return Ok(DfsConfirmedTimeoutOutcome::Committed(
+                        NetworkedDfsWriteOutcome::Committed {
+                            intent_id: terminal.intent_id,
+                            version: terminal.target_version,
+                            content_hash: content_hash.unwrap_or_default(),
+                            repair_jobs: Vec::new(),
+                        },
+                    ));
+                }
                 Ok(DfsConfirmedTimeoutOutcome::Aborted {
                     intent_id: intent_id.to_string(),
                 })
@@ -136,6 +151,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
     }
 
+    /// Abort this requester's pending write `intent_id`. Returns the write's
+    /// terminal intent: aborted, or committed when the write committed
+    /// before its abort reached it.
     pub fn abort_pending_write(
         &mut self,
         intent_id: &str,
@@ -218,14 +236,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn route_pending_write_abort(
-        &mut self,
-        intent_id: &str,
-    ) -> Result<DistributedWriteIntent, DfsError> {
-        // Only the original retained request supplies this locator. An absent or
-        // expired request is uncertainty, never permission to guess a write owner.
-        let pending = self
-            .writes
+    /// The original request this requester retains for its write `intent_id`.
+    fn retained_routed_write(&self, intent_id: &str) -> Option<crate::PendingRoutedWrite> {
+        self.writes
             .pending_routed_writes
             .get(intent_id)
             .and_then(|tracked| {
@@ -251,9 +264,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                     .cloned()
             })
-            .ok_or_else(|| DfsError::Distributed {
-                message: format!("pending write {intent_id} has no retained original request"),
-            })?;
+    }
+
+    fn route_pending_write_abort(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<DistributedWriteIntent, DfsError> {
+        // Only the original retained request supplies this locator. An absent or
+        // expired request is uncertainty, never permission to guess a write owner.
+        let pending =
+            self.retained_routed_write(intent_id)
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!("pending write {intent_id} has no retained original request"),
+                })?;
         let command = pending
             .command
             .as_ref()
@@ -294,13 +317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "pending write abort changed its original stable intent binding".into(),
             });
         }
-        // The abort's id derives from the intent it closes, so every attempt
-        // of every call is the same request. The primary answers a repeat
-        // with the aborted intent it recorded.
-        let abort_id = format!(
-            "abort:{}",
-            blake3::hash(actual_intent_id.as_bytes()).to_hex()
-        );
+        let abort_id = pending_write_abort_request_id(&actual_intent_id);
         let operation = DfsNamespaceOperation::AbortPendingWrite {
             path: object.path,
             object_id: command.request.object_id.clone(),
@@ -366,8 +383,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?
             }
         };
-        if intent.state != DfsWriteIntentState::Aborted
-            || intent.intent_id != actual_intent_id
+        if !matches!(
+            intent.state,
+            DfsWriteIntentState::Aborted | DfsWriteIntentState::Committed
+        ) || intent.intent_id != actual_intent_id
             || intent.file_system_id != command.request.file_system_id
             || intent.object_id != command.request.object_id
             || intent.target_version != command.request.target_version
@@ -380,6 +399,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.abandon_pending_routed_write(&pending.canonical_request_id);
         Ok(intent)
+    }
+
+    /// The answer to an abort of a write whose row is already closed: an
+    /// aborted row answers the abort that closed it, and a committed one
+    /// answers with the commit, which the abort leaves in place. An open row
+    /// has no such answer.
+    fn closed_write_abort_answer(
+        record: &DfsWriteIntentRecord,
+    ) -> Result<Option<DistributedWriteIntent>, DfsError> {
+        match &record.status {
+            DfsWriteIntentStatus::Aborted | DfsWriteIntentStatus::Committed => {
+                Ok(Some(crate::intent::distributed_intent_from_record(record)))
+            }
+            status if crate::intent::write_intent_status_is_active(status) => Ok(None),
+            _ => Err(DfsError::Distributed {
+                message: "closed write intent cannot be aborted".into(),
+            }),
+        }
     }
 
     pub(crate) fn abort_routed_pending_write(
@@ -461,16 +498,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         self.ensure_object_not_in_cross_shard_flight(&actual)?;
-        let intent = crate::intent::distributed_intent_from_record(&record);
-        if record.status == DfsWriteIntentStatus::Aborted {
-            // Replay the same actual durable outcome; never author another body.
-            self.retire_aborted_write_execution(&intent)?;
-            return Ok(intent);
-        }
-        if !crate::intent::write_intent_status_is_active(&record.status) {
-            return Err(DfsError::Distributed {
-                message: "closed write intent cannot be aborted".into(),
-            });
+        if let Some(answer) = Self::closed_write_abort_answer(&record)? {
+            if answer.state == DfsWriteIntentState::Aborted {
+                // Replay the same actual durable outcome; never author another body.
+                self.retire_aborted_write_execution(&answer)?;
+            }
+            return Ok(answer);
         }
         if record.publication.is_current()
             && record
@@ -483,8 +516,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         // Reuse normal per-intent hydration on the actual admitted owner.
-        // It restores only real durable bodies, receipts and content sources.
+        // It restores only real durable bodies, receipts and content sources,
+        // adopts the write at this node's epoch, and can recover its final
+        // prepare: the row as it then stands decides the abort.
         self.restore_pending_write_for_intent_if_missing(intent_id, object_id)?;
+        let record = self
+            .metadata_backend
+            .as_ref()
+            .expect("checked actual backend")
+            .get_intent(object_id, intent_id)?
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write abort lost its exact durable intent".into(),
+            })?;
+        if let Some(answer) = Self::closed_write_abort_answer(&record)? {
+            return Ok(answer);
+        }
+        let intent = crate::intent::distributed_intent_from_record(&record);
         if self.coordinator.intent(intent_id) != Some(&intent) {
             return Err(DfsError::Distributed {
                 message: "live write intent differs from its actual durable body".into(),
@@ -499,7 +546,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsError::Metadata {
                 message: "write abort lost its actual durable terminal intent".into(),
             })?;
-        let expected = crate::intent::distributed_intent_from_record(&record);
+        let expected = intent;
         let terminal = crate::intent::distributed_intent_from_record(&aborted);
         let mut unchanged = terminal.clone();
         unchanged.state = expected.state.clone();
@@ -510,4 +557,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         Ok(terminal)
     }
+}
+
+/// The request id of every abort of the write `intent_id`: it derives from
+/// the intent the abort closes, so every attempt of every call is the same
+/// request, and the primary answers a repeat from the intent's row.
+pub(crate) fn pending_write_abort_request_id(intent_id: &str) -> String {
+    format!("abort:{}", blake3::hash(intent_id.as_bytes()).to_hex())
 }
