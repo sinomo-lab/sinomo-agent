@@ -232,6 +232,12 @@ impl DfsMutationScheduler {
         self.foreground_notify.notify_waiters();
     }
 
+    /// How many times foreground work has asked maintenance to give way.
+    #[cfg(test)]
+    pub fn foreground_requests(&self) -> u64 {
+        self.foreground_generation.current()
+    }
+
     #[cfg(test)]
     pub fn maintenance_interest_count(&self) -> usize {
         self.maintenance_interest_count.load(Ordering::Acquire)

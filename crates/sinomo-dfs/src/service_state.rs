@@ -757,6 +757,28 @@ impl DfsMetadataBackendOwner {
     }
 }
 
+/// Who runs a holder of admission's work again once a read it hands to the
+/// host comes back. Without one, the read is sent and waited for in place.
+#[derive(Debug, Default)]
+pub(crate) struct DfsReadHandoff {
+    /// The host runs this work again with the read's answer: a served
+    /// namespace request, or a pending request maintenance recovers.
+    pub(crate) host_reruns: bool,
+    /// Maintenance sends the reads its work hands off, each as its owner's
+    /// pending item: a job step's keyed by its job, a recovered pending
+    /// request's by that request.
+    pub(crate) maintenance_sends: bool,
+    /// The job whose step maintenance runs now: a read the step hands off is
+    /// that job's own, and the job runs again with its answer.
+    pub(crate) job: Option<String>,
+    /// The reads this pass's work handed off, by owner, for the host to send
+    /// once the pass has released admission.
+    pub(crate) reads: Vec<(
+        crate::read_handoff::DfsReadOwner,
+        Box<crate::source_adoption::RemoteNamespacePhase>,
+    )>,
+}
+
 /// Stateful networked DFS data-plane and metadata coordinator.
 #[derive(Debug)]
 pub struct NetworkedDfsService<T> {
@@ -802,13 +824,17 @@ pub struct NetworkedDfsService<T> {
     /// SAME durable request retained across the existing host's remote-phase yield.
     pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
     pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
-    /// Answers to the reads a request on several shard lanes sent to other
-    /// nodes' primaries with its lanes released, keyed by the request and
-    /// the read; its re-run takes each in place of sending that read.
+    /// Answers to the reads a holder of admission sent to other nodes'
+    /// primaries with its lanes and admission released, keyed by the request
+    /// or job and the read; its re-run takes each in place of sending that
+    /// read.
     pub(crate) answered_remote_reads: BTreeMap<
         String,
         std::result::Result<crate::source_adoption::CompletedRemoteTargetNamespacePhase, DfsError>,
     >,
+    /// Who runs this service's work again when a read it makes on another
+    /// node's primary is handed to the host instead of waited for.
+    pub(crate) read_handoff: DfsReadHandoff,
     /// Requests whose runs so far only yielded reads: their re-run is still
     /// the request's first execution.
     pub(crate) read_yield_fresh_requests: BTreeSet<(NodeId, String)>,

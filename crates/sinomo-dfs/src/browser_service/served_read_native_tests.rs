@@ -7,8 +7,8 @@ use sinomo_core::network::ObjectRpcCall;
 use sinomo_core::node::NodeId;
 
 const PATH: &str = "/documents/served-read.txt";
-/// Well inside the 30 s bound a metadata query keeps while its service holds
-/// admission, so the departure, not that bound, is what ends the read.
+/// How promptly the read's work ends once its client's budget passes or its
+/// client leaves. The read keeps no bound of its own.
 const PROMPT: Duration = Duration::from_secs(10);
 
 fn stat_request() -> ObjectRpcRequest {

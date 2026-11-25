@@ -1656,8 +1656,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 metadata_journal_has_more: false,
             });
         }
-        // A request on several shard lanes reads another node's shard with
-        // its lanes released; the re-run takes the answer the yield brought.
+        // Work that holds admission reads another node's shard with its
+        // lanes and admission released; the re-run takes the answer the
+        // yield brought.
         let lanes_released_read = (expected.primary_node_id != self.node_id
             && self.routed_read_waits_with_lanes_released(&expected.primary_node_id))
         .then(|| {
@@ -1669,25 +1670,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
         .transpose()?;
         let lanes_released = lanes_released_read.is_some();
-        // A query adds no deadline of its own when nothing is held across
-        // its wait: a requester that delegates to its node's Main (a mount,
-        // the CLI, a hosted client), or a read made with the request's lanes
-        // released. Its caller's budget or departure ends it. A query this
-        // service waits for while it serves a request or holds a shard's
-        // admission keeps a bound, so that admission is never held without
-        // end.
-        let holds_nothing = self.transport.delegates_local_namespace_authority()
-            && !self.transport.serves_routed_request()
-            && self.publication_execution.current().is_none();
-        let requested = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A query adds no deadline of its own: its caller's budget, its
+        // requester's departure, or the network's verdict on its primary
+        // ends it.
         let previous_deadline = self.transport.operation_deadline();
-        let own_deadline = previous_deadline.map_or(requested, |old| old.min(requested));
-        self.transport
-            .set_operation_deadline(if lanes_released_read.is_some() || holds_nothing {
-                previous_deadline
-            } else {
-                Some(own_deadline)
-            });
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         self.pending_routed_namespace_ops.insert(
             request_id.clone(),
@@ -1778,7 +1764,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })();
         self.pending_routed_namespace_ops.remove(&request_id);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
-        self.transport.set_operation_deadline(previous_deadline);
         // A query handed to a lanes-released read is answered by that read;
         // only one this attempt sent itself can have gone undelivered.
         *undelivered = !lanes_released

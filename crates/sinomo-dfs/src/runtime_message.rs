@@ -1392,6 +1392,13 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     // The lane is cached across requests: this request's budget and its
     // requester's departure bound only this execution.
     let served_request = served.map(|served| service_lane.service.enter_served_request(served));
+    // The host runs a namespace request again with the answer of a read it
+    // hands off; that request's reads on other nodes' primaries do not wait
+    // here.
+    let host_reruns = std::mem::replace(
+        &mut service_lane.service.read_handoff.host_reruns,
+        resume_command.is_some(),
+    );
     let mut process_report = match verified_fetch {
         Some(verified) => service_lane
             .service
@@ -1404,6 +1411,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 prepared.as_ref(),
             ),
     };
+    service_lane.service.read_handoff.host_reruns = host_reruns;
     if let Some(served_request) = served_request {
         service_lane.service.leave_served_request(served_request);
     }

@@ -72,6 +72,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             pending_namespace_request_recovery: None,
             completed_remote_namespace_phases: BTreeMap::new(),
             answered_remote_reads: BTreeMap::new(),
+            read_handoff: Default::default(),
             read_yield_fresh_requests: Default::default(),
             file_sync_wait_deadline: None,
             prepared_remote_sources: BTreeMap::new(),

@@ -32,14 +32,6 @@ use crate::{
 };
 use sinomo_core::node::NodeId;
 
-/// Bound on a read this node sends to another shard's primary and waits for
-/// while it still holds admission: a namespace job that maintenance resumes,
-/// or a request that cannot hand the read to its host. A read made with the
-/// request's lanes released has no such bound; its request's budget, or its
-/// requester's departure, ends it.
-const POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
-
 mod closed_storage_parks;
 mod destination_reservation;
 #[cfg(any(test, feature = "test-support"))]
@@ -925,13 +917,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && let Some(shard) = self.routed_namespace_shard_for_path(path)?
             && self.metadata_lease_omits_shard(&shard.shard_id)
         {
-            let timeout = (!self.routed_read_waits_with_lanes_released(&shard.primary_node_id))
-                .then_some(POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT);
             return Ok(self.route_namespace_lookup_path_to_metadata_primary(
                 file_system_id.clone(),
                 shard.primary_node_id.clone(),
                 path.to_owned(),
-                timeout,
+                None,
             )?);
         }
         self.lookup_metadata_path(file_system_id, path)
@@ -1087,16 +1077,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
-        // A rejected source read never becomes a replica fallback. Made with
-        // the request's lanes released, the read adds no deadline to the
-        // enclosing operation's; sent while this service holds admission, it
-        // keeps its bound.
-        let previous = self.transport.operation_deadline();
-        if !self.routed_read_waits_with_lanes_released(&source.primary_node_id) {
-            let requested = std::time::Instant::now() + POSIX_SERVED_CROSS_SHARD_READ_TIMEOUT;
-            self.transport
-                .set_operation_deadline(Some(previous.map_or(requested, |old| old.min(requested))));
-        }
+        // A rejected source read never becomes a replica fallback. The read
+        // adds no deadline to the enclosing operation's; work holding
+        // admission hands it to its host.
         let response = self.query_metadata_authority_impl(
             source,
             crate::DfsMetadataSelection::CurrentObjectForNamespaceJob {
@@ -1105,7 +1088,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object_id: object_id.clone(),
             },
         );
-        self.transport.set_operation_deadline(previous);
         let crate::DfsMetadataQueryResult::CurrentObject { object } = response? else {
             return Err(DfsPosixError::Dfs(DfsError::Metadata {
                 message: "namespace source authority returned another query kind".into(),

@@ -58,6 +58,8 @@ mod native_tests;
 #[cfg(test)]
 mod participant_takeover_native_tests;
 #[cfg(test)]
+mod read_handoff_native_tests;
+#[cfg(test)]
 mod takeover_driver_native_tests;
 #[cfg(test)]
 mod takeover_loss_native_tests;

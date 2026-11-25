@@ -180,7 +180,8 @@ pub(crate) enum DfsRecordChangeNow {
     },
 }
 
-fn post_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
+/// Leave this node's keeper the hint that `shard`'s primary was not reached.
+pub(crate) fn post_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
     crate::write_set_keeping_signals::post_commit_demand(
         local,
         &shard.file_system_id,

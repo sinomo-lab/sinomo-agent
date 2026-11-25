@@ -172,6 +172,7 @@ mod posix_model;
 mod posix_object;
 mod posix_path;
 mod protocol;
+mod read_handoff;
 mod renewable_lease;
 mod repair;
 mod repair_executor;
