@@ -6588,6 +6588,16 @@ impl DfsTestRuntime {
         crate::runtime_host::hold_takeover_activation_for_test(self.data_dir(node).root(), hold);
     }
 
+    /// Keep `node`'s activation as a new primary from requesting the
+    /// reconciliation that resumes the shard's work, so a test sees what
+    /// else resumes it.
+    pub fn skip_takeover_activation_reconciliation(&self, node: &NodeId, skip: bool) {
+        crate::runtime_host::skip_takeover_activation_reconciliation_for_test(
+            self.data_dir(node).root(),
+            skip,
+        );
+    }
+
     /// Whether `node`'s keeper held a network reachability subscription at
     /// its last evaluation; `None` before it first evaluated.
     pub fn write_set_keeping_holds_reachability(&self, node: &NodeId) -> Option<bool> {

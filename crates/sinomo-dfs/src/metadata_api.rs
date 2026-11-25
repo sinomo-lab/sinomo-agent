@@ -2629,6 +2629,44 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         })
     }
 
+    /// Return one cursor-bounded page of the Running namespace jobs of one
+    /// exact local shard, in job id order. `None` when this backend does not
+    /// hold `shard_id`.
+    fn running_namespace_jobs_on_shard_page(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<Option<DfsNamespaceJobPage>> {
+        Ok(None)
+    }
+
+    /// Return one cursor-bounded page of the Running namespace jobs of every
+    /// local copy, in job id order.
+    fn running_namespace_jobs_page(
+        &self,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        Ok(DfsNamespaceJobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        })
+    }
+
+    /// The live prepares of one exact local shard; empty when this backend
+    /// does not hold `shard_id`.
+    fn prepared_operations_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<crate::DfsPreparedOperationRecord>> {
+        Ok(self
+            .list_prepared_operations()?
+            .into_iter()
+            .filter(|record| &record.shard_id == shard_id)
+            .collect())
+    }
+
     /// Read all journal entries after `after_sequence`.
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
 

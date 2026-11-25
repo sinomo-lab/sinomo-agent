@@ -321,6 +321,7 @@ mod stable_operation_tests {
     ) -> DfsDistributedWriteCommand {
         let target_version = stable_write_target_version(requester, object_id, operation_id);
         DfsDistributedWriteCommand {
+            storage_revision: None,
             publication: Default::default(),
             patch: None,
             request_id: operation_id.to_string(),

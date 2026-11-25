@@ -113,6 +113,9 @@ struct FencedSourceRows {
     object_id: Option<crate::DfsObjectId>,
     path: Option<String>,
     job_id: Option<String>,
+    /// Whether the fence refused a publication: its drop then wakes the job
+    /// steps refused as busy.
+    refused: bool,
 }
 static FAMILY_FENCES: OnceLock<Mutex<std::collections::BTreeMap<u64, FencedSourceRows>>> =
     OnceLock::new();
@@ -148,6 +151,7 @@ impl DfsSourceFamilyFence {
             object_id: Some(object_id.clone()),
             path: Some(crate::namespace::metadata_path(path)),
             job_id: None,
+            refused: false,
         })
     }
     /// Fence the job row `job_id`.
@@ -157,16 +161,21 @@ impl DfsSourceFamilyFence {
             object_id: None,
             path: None,
             job_id: Some(job_id.to_string()),
+            refused: false,
         })
     }
 }
 impl Drop for DfsSourceFamilyFence {
     fn drop(&mut self) {
-        if let Some(fences) = FAMILY_FENCES.get() {
+        let refused = FAMILY_FENCES.get().and_then(|fences| {
             fences
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(&self.id);
+                .remove(&self.id)
+                .map(|rows| rows.refused)
+        });
+        if refused == Some(true) {
+            crate::maintenance::job_claims::note_refusing_fence_dropped();
         }
     }
 }
@@ -195,9 +204,9 @@ pub(crate) fn fenced_source_rows_refusal(
     payload: &crate::DfsPreparedOperationPayload,
 ) -> Option<MetadataBackendError> {
     let fences = FAMILY_FENCES.get()?;
-    let fences = fences.lock().unwrap_or_else(|error| error.into_inner());
+    let mut fences = fences.lock().unwrap_or_else(|error| error.into_inner());
     let fenced = fences
-        .values()
+        .values_mut()
         .filter(|rows| &rows.scope == scope)
         .collect::<Vec<_>>();
     if fenced.is_empty() {
@@ -257,7 +266,11 @@ pub(crate) fn fenced_source_rows_refusal(
             .job_id
             .as_deref()
             .is_some_and(|job_id| job_ids.contains(job_id));
-        (object || path.is_some() || job).then(|| MetadataBackendError::SourceFamilyFenced {
+        if !(object || path.is_some() || job) {
+            return None;
+        }
+        rows.refused = true;
+        Some(MetadataBackendError::SourceFamilyFenced {
             path: rows
                 .path
                 .clone()

@@ -275,10 +275,10 @@ fn a_held_job_read_leaves_its_nodes_other_maintenance_running() {
 /// shard. On the users record's activation, both moves resume in maintenance
 /// and each asks the other's primary for its second alias's target, or adopts
 /// a moved record there; namespace calls between R and S are held until a
-/// call each way and a move's handed-off read are out. Neither node holds its
-/// admission across its wait, so each answers the other, and both moves
-/// complete well within the bound a read held under admission used to wait
-/// for.
+/// call each way is out, each a move's handed-off read or a phase its job
+/// handed to the host. Neither node holds its admission across its wait, so
+/// each answers the other, and both moves complete well within the bound a
+/// read held under admission used to wait for.
 #[test]
 fn crossing_jobs_each_read_the_others_primary_and_both_complete() {
     let (mut cluster, nodes) = disjoint_shard_cluster("native-handoff-crossing-jobs");
@@ -352,8 +352,8 @@ fn crossing_jobs_each_read_the_others_primary_and_both_complete() {
     );
     let root_r = cluster._runtime.data_dir(&root_node).root();
     let root_s = cluster._runtime.data_dir(&services_node).root();
-    // Each node's work waits on the other: a call each way is held, and the
-    // handed-off read of a move (its job's or its request's) is out.
+    // Each node's work waits on the other: a call each way is held, made by
+    // a move's handed-off read or by a phase its job handed to the host.
     let read_out = |root: &std::path::Path, job: &DfsNamespaceJobRecord| {
         crate::read_handoff::waiting(root, &job_owner(job))
             || job.origin.as_ref().is_some_and(|origin| {
@@ -374,12 +374,12 @@ fn crossing_jobs_each_read_the_others_primary_and_both_complete() {
     let deadline = Instant::now() + EVENT_BOUND;
     loop {
         let (r_read, s_read, r_to_s, s_to_r) = crossing();
-        if (r_read || s_read) && r_to_s > 0 && s_to_r > 0 {
+        if r_to_s > 0 && s_to_r > 0 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "each node waits on the other with a read out: R's read out {r_read}, S's \
+            "each node waits on the other: R's read out {r_read}, S's \
              {s_read}; R sent S {r_to_s} calls and S sent R {s_to_r}; R's job {:?}, S's job \
              {:?}; due on R {:?}, on S {:?}; turns on R {:?}, on S {:?}; R sent U {}, S sent U {}",
             frames(&directory_move_job(&cluster._runtime, &root_node, from_r)),
@@ -594,6 +594,98 @@ fn a_job_whose_read_found_no_path_stays_quiet_until_the_path_comes_back() {
             .posix_namespace_lstat_distributed(&format!("{to}/alias"))
             .is_ok()
     );
+    drop(kv);
+    cluster.close();
+}
+
+/// A move waits while users converts; on the activation its job resumes in
+/// maintenance and hands the adoption of its carried alias to the host, and
+/// the destination primary's answer fails as a broken call would. The
+/// failure ends that continuation, not the maintenance turn: the job stays
+/// Running, and the coordinator's next publication, an admission released
+/// after the failure, runs it again; no timer does. The job then completes
+/// the move.
+#[test]
+fn a_continuation_that_fails_in_passing_resumes_on_the_next_publication() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-handoff-failed-continuation");
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let writer = cluster.replica_node.clone();
+    let (from, to) = (
+        "/failed-continuation-tree",
+        "/services/failed-continuation-tree",
+    );
+    tree_with_alias(
+        &mut cluster.replica,
+        &writer,
+        from,
+        "/users/failed-continuation-target",
+    );
+    let publication = "/failed-continuation-publications";
+    cluster.replica.posix_mkdir_all(publication).unwrap();
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    parked_move(&mut cluster.replica, from, to);
+    // The destination refuses the first adoption it is asked for from here.
+    let refused = Arc::new(AtomicBool::new(false));
+    let refusal = Arc::clone(&refused);
+    let _hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        cluster._runtime.data_dir(&services_node),
+        Arc::new(move |point, command, _| {
+            if !matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+            ) {
+                return Ok(());
+            }
+            let Some(DfsNetworkMessage::NamespaceRequest(request)) =
+                command.map(|command| &command.routed_message.message)
+            else {
+                return Ok(());
+            };
+            if matches!(
+                request.operation,
+                DfsNamespaceOperation::AdoptObjectAtPath { .. }
+                    | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
+            ) && !refusal.swap(true, Ordering::SeqCst)
+            {
+                return Err(DfsError::Network {
+                    message: "the adoption call broke".into(),
+                });
+            }
+            Ok(())
+        }),
+    );
+    replace_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        &converting,
+        active.value.clone(),
+    );
+    wait_until(
+        "the job hands its adoption to the host",
+        EVENT_BOUND,
+        || refused.load(Ordering::SeqCst),
+    );
+    // The failure did not fail the job; it runs again on the coordinator's
+    // next publication, such as this one on its root shard.
+    assert_ne!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Failed
+    );
+    cluster
+        .replica
+        .posix_write_file(
+            &format!("{publication}/next"),
+            b"next",
+            DfsWriteOptions::replicated_eventual(vec![writer.clone()]),
+        )
+        .unwrap();
+    wait_until("the publication resumes the job", EVENT_BOUND, || {
+        moved(&cluster._runtime, &root_node, from)
+    });
     drop(kv);
     cluster.close();
 }

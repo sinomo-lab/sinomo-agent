@@ -258,6 +258,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
     );
     assert_native_bytes_field(
         &DfsDistributedWriteCommand {
+            storage_revision: None,
             publication: Default::default(),
             patch: None,
             request_id: "distributed-write".to_string(),
@@ -457,6 +458,7 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
                 2,
                 2,
                 DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    storage_revision: None,
                     request_id: "dfs_net_req_nested_return_node".to_string(),
                     file_system_id: sifs_file_system_id(),
                     requesting_node_id: primary.clone(),
@@ -1012,6 +1014,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
     let observed_before = runtime.rpc_observations().len();
     let request_id = "dfs_net_req_served_frame".to_string();
     let command = DfsDistributedWriteCommand {
+        storage_revision: None,
         publication: Default::default(),
         patch: None,
         request_id: request_id.clone(),
@@ -2872,6 +2875,7 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         .handle_namespace_request(
             owner.clone(),
             DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "native-cross-scope-negative-request".into(),
                 file_system_id: a.file_system_id.clone(),
                 requesting_node_id: owner,

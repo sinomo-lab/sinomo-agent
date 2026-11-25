@@ -5115,6 +5115,15 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     // its departure. Both reach the blocking mutation through `served`.
     let (served, _departure) = sinomo_dfs::DfsServedRequestScope::at_arrival(budget);
     let refusal = ClosedShardStorageRefusal::for_command(&command);
+    if let Some((revision, shards)) = requester_storage_revision(&command) {
+        // A budget that ends first leaves the request to run as it would
+        // have: what it finds is its answer.
+        let _ = served
+            .until_budget(await_daemon_dfs_projection_revision(
+                paths, revision, &shards, runtime,
+            ))
+            .await;
+    }
     let result = served
         .until_budget(handle_served_daemon_dfs_message(
             paths,
@@ -5141,8 +5150,86 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     }
 }
 
+/// The storage-record revision a request's sender saw for the shards it
+/// depends on, with those shards: carried by the namespace requests and the
+/// content writes a closed shard refuses.
+fn requester_storage_revision(
+    command: &DfsMessageCommand,
+) -> Option<(
+    sinomo_core::kv::KvRevision,
+    Vec<crate::DfsMetadataShardConfig>,
+)> {
+    match &command.routed_message.message {
+        crate::DfsNetworkMessage::NamespaceRequest(request) => request
+            .storage_revision
+            .map(|revision| (revision, request.authority_shards.clone())),
+        crate::DfsNetworkMessage::DistributedWriteRequest(write)
+        | crate::DfsNetworkMessage::ExclusiveCreateRequest(write)
+        | crate::DfsNetworkMessage::RetainedWriteRequest(write) => write
+            .storage_revision
+            .map(|revision| (revision, write.authority_shard.iter().cloned().collect())),
+        _ => None,
+    }
+}
+
+/// Wait while this node's configuration projection holds, for one of
+/// `shards`, a closed storage record older than `revision`, the
+/// storage-record revision the request's sender saw. The sender's view is a
+/// lower bound on this node's, as for a requester that follows its shard's
+/// record: this node waits on its own projection, whose publication is a
+/// local event, and never on the sender. A node whose projection holds those
+/// records Active, or closed at or after that revision, answers as it is, as
+/// does a node with no projection to wait on. The caller bounds the wait by
+/// the request's budget and runs it before the request takes admission.
+async fn await_daemon_dfs_projection_revision(
+    paths: &DaemonPaths,
+    revision: sinomo_core::kv::KvRevision,
+    shards: &[crate::DfsMetadataShardConfig],
+    runtime: &tokio::runtime::Handle,
+) {
+    let Ok(data_dir) = daemon_data_dir(paths) else {
+        return;
+    };
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let Ok(state) =
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
+    else {
+        return;
+    };
+    let Ok(authority) = daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(runtime),
+    ) else {
+        return;
+    };
+    // Behind for a shard whose record here is closed and older than the
+    // revision the sender saw: the sender has seen a later record.
+    let behind = |snapshot: &sinomo_dfs::DfsConfigurationSnapshot| {
+        shards.iter().any(|shard| {
+            let key = crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id);
+            let entry = snapshot.entry(&key).flatten();
+            let active = entry.is_some_and(|entry| {
+                entry
+                    .decode::<crate::DfsMetadataShardStorage>()
+                    .is_ok_and(|record| record.is_active())
+            });
+            !active && entry.is_none_or(|entry| entry.modify_revision < revision)
+        })
+    };
+    let mut published = authority.subscribe_configuration_snapshot();
+    while behind(&published.borrow_and_update()) {
+        if published.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Why `error` is a closed shard's refusal to serve, if it is one.
-fn closed_shard_storage_cause_of(error: &DaemonError) -> Option<crate::DfsShardStorageClosedCause> {
+pub(super) fn closed_shard_storage_cause_of(
+    error: &DaemonError,
+) -> Option<crate::DfsShardStorageClosedCause> {
     match error {
         DaemonError::StoragePreparationPending { .. } => {
             Some(crate::DfsShardStorageClosedCause::Preparation)

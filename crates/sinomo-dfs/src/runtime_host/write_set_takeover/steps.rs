@@ -301,6 +301,10 @@ pub(in crate::runtime_host) fn activate_metadata_takeover(
         })
         .unwrap_or_default();
     let aligned = align_members(data_dir, runtime, key, &cut, &write_set_members)?;
+    #[cfg(any(test, feature = "test-support"))]
+    if test_hooks::skips_activation_reconciliation(data_dir) {
+        return Ok(aligned);
+    }
     if let Err(error) =
         request_daemon_dfs_maintenance_reconciliation(&DfsRuntimePaths::new(data_dir))
     {
@@ -419,7 +423,9 @@ pub(in crate::runtime_host) fn read_takeover_promise(
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::runtime_host) mod test_hooks {
     //! Test support: stop a candidate between its promise and its swap, as a
-    //! crash there would, or hold a new primary's activation.
+    //! crash there would, hold a new primary's activation, or keep its
+    //! activation from requesting the reconciliation that resumes the
+    //! shard's work.
 
     use super::*;
     use std::path::PathBuf;
@@ -427,6 +433,8 @@ pub(in crate::runtime_host) mod test_hooks {
 
     static STOP_AFTER_PROMISE: LazyLock<Mutex<BTreeSet<PathBuf>>> = LazyLock::new(Default::default);
     static HOLD_ACTIVATION: LazyLock<Mutex<BTreeSet<PathBuf>>> = LazyLock::new(Default::default);
+    static SKIP_ACTIVATION_RECONCILIATION: LazyLock<Mutex<BTreeSet<PathBuf>>> =
+        LazyLock::new(Default::default);
 
     fn set(set: &Mutex<BTreeSet<PathBuf>>, root: PathBuf, on: bool) {
         let mut set = set.lock().unwrap_or_else(|error| error.into_inner());
@@ -445,6 +453,10 @@ pub(in crate::runtime_host) mod test_hooks {
         set(&HOLD_ACTIVATION, root, hold);
     }
 
+    pub(crate) fn skip_takeover_activation_reconciliation_for_test(root: PathBuf, skip: bool) {
+        set(&SKIP_ACTIVATION_RECONCILIATION, root, skip);
+    }
+
     pub(super) fn stops_after_promise(data_dir: &SinomoDataDir) -> bool {
         STOP_AFTER_PROMISE
             .lock()
@@ -454,6 +466,13 @@ pub(in crate::runtime_host) mod test_hooks {
 
     pub(super) fn holds_activation(data_dir: &SinomoDataDir) -> bool {
         HOLD_ACTIVATION
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&data_dir.root())
+    }
+
+    pub(super) fn skips_activation_reconciliation(data_dir: &SinomoDataDir) -> bool {
+        SKIP_ACTIVATION_RECONCILIATION
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .contains(&data_dir.root())

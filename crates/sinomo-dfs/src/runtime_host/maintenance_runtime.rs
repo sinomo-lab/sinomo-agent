@@ -11,6 +11,9 @@ pub(super) enum DaemonDfsMaintenanceKind {
     Routine,
     /// Only the repair executor's pass, for a wake that concerns only it.
     RepairExecutor,
+    /// Only the namespace jobs pass, over the shards a jobs turn's request
+    /// names (see `maintenance/job_triggers.rs`).
+    NamespaceJobs,
     MountedMutationRecovery,
     AuthoritativeReconciliation {
         content_gc_requested: bool,
@@ -24,7 +27,16 @@ impl DaemonDfsMaintenanceKind {
         // These callers already own an unfinished reconciliation/recovery
         // request. Foreground preemption cannot convert it into idle routine
         // work merely because its first phase has not reached a checkpoint.
-        !matches!(self, Self::Routine | Self::RepairExecutor)
+        !matches!(
+            self,
+            Self::Routine | Self::RepairExecutor | Self::NamespaceJobs
+        )
+    }
+
+    /// A turn that runs one pass for a wake that concerns only it, and none
+    /// of the node's other maintenance.
+    fn runs_one_pass(self) -> bool {
+        matches!(self, Self::RepairExecutor | Self::NamespaceJobs)
     }
 
     pub(super) fn replica_dispatch_is_deferred(self) -> bool {
@@ -32,6 +44,7 @@ impl DaemonDfsMaintenanceKind {
             self,
             Self::Routine
                 | Self::RepairExecutor
+                | Self::NamespaceJobs
                 | Self::MountedMutationRecovery
                 | Self::AuthoritativeReconciliation {
                     content_gc_requested: false,
@@ -228,6 +241,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     let kind = match maintenance_kind {
         DaemonDfsMaintenanceKind::Routine => "routine",
         DaemonDfsMaintenanceKind::RepairExecutor => "repair-executor",
+        DaemonDfsMaintenanceKind::NamespaceJobs => "namespace-jobs",
         DaemonDfsMaintenanceKind::MountedMutationRecovery => "mounted-mutation-recovery",
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
     };
@@ -569,9 +583,9 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     );
     let mut advertisement_control_plane =
         DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, runtime);
-    // An executor-only turn publishes nothing; the advertisement keeps the
-    // triggers of the ordinary turns.
-    match if executor_only {
+    // A turn that runs one pass publishes nothing; the advertisement keeps
+    // the triggers of the ordinary turns.
+    match if maintenance_kind.runs_one_pass() {
         Ok(false)
     } else {
         sinomo_dfs::publish_dfs_content_advertisement_if_needed_async(
@@ -598,7 +612,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     // Archived goal dispatch consumes the ordinary current advertisement cut.
     // Publish it before running callbacks that need real current candidates;
     // callbacks remain outside service ownership and mutation admission.
-    let namespace_work = if executor_only {
+    let namespace_work = if maintenance_kind.runs_one_pass() {
         super::maintenance_host::NamespaceReconciliationRun {
             complete: true,
             blocks_ordinary_maintenance: false,
@@ -870,15 +884,48 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                         .await?;
                     continue;
                 }
-                DaemonDfsMaintenancePreExecution::RemoteNamespacePhase(request, phase) => {
+                DaemonDfsMaintenancePreExecution::RemoteNamespacePhase(continuation, phase) => {
                     // This is the SAME normal owned phase dispatcher. The broad
                     // service, backend checkout and all admission guards ended above.
                     let completed =
                         super::message_host::dispatch_daemon_dfs_remote_namespace_phase(
                             &data_dir, phase, None, runtime,
                         )
-                        .await?;
-                    completed_remote_phase = Some((request, completed));
+                        .await;
+                    let completed = match completed {
+                        Ok(completed) => Ok(completed),
+                        Err(error) => {
+                            // A failed phase ends its owner's continuation, not
+                            // the turn. A job, and a request whose failure
+                            // passes, stays and runs again first once a later
+                            // publication's admission is released; a request
+                            // that failed definitely is answered with the
+                            // failure.
+                            if maintenance_kind == DaemonDfsMaintenanceKind::NamespaceJobs {
+                                crate::maintenance::job_triggers::remote_phase_ended(
+                                    &data_dir.root(),
+                                    false,
+                                );
+                            }
+                            if continuation.awaits_another_publication(&error) {
+                                // This turn holds no admission until the owner
+                                // runs again: the next release is another
+                                // publication's.
+                                let releases = scheduler.subscribe_admission_releases();
+                                let released_at_failure = *releases.borrow();
+                                rerun_daemon_dfs_owner_after_admission_release(
+                                    &data_dir,
+                                    continuation.owner(),
+                                    releases,
+                                    released_at_failure,
+                                    runtime,
+                                );
+                                return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+                            }
+                            Err(error)
+                        }
+                    };
+                    completed_remote_phase = Some((continuation, completed));
                     metadata_authority_preflight =
                         warm_daemon_dfs_metadata_authority_for_identity_async(
                             &cluster_paths,
@@ -936,7 +983,9 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         } else {
             outcome
         };
-        if !executor_only && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
+        if !maintenance_kind.runs_one_pass()
+            && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. })
+        {
             // Lifecycle work can delete or compact content without producing a
             // served-message event. One coalesced dirty edge after a completed pass
             // keeps capacity evidence current without a periodic filesystem scan.
@@ -956,10 +1005,53 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
 pub(super) enum DaemonDfsMaintenancePreExecution {
     Finished(Option<bool>),
     RemoteNamespacePhase(
-        Box<crate::DfsNamespaceRequestRecord>,
+        DaemonDfsNamespaceContinuation,
         Box<crate::source_adoption::RemoteNamespacePhase>,
     ),
     AuthorityPreflightStale(DaemonDfsAuthorityPreflightStale),
+}
+
+/// The owner a remote phase that maintenance handed to its host runs for: a
+/// job whose step yielded the phase, carried by the job's origin request, or
+/// a pending request maintenance recovers.
+#[derive(Debug)]
+pub(super) struct DaemonDfsNamespaceContinuation {
+    request: Box<crate::DfsNamespaceRequestRecord>,
+    job: Option<String>,
+}
+
+impl DaemonDfsNamespaceContinuation {
+    fn owner(&self) -> crate::read_handoff::DfsReadOwner {
+        match &self.job {
+            Some(job) => crate::read_handoff::DfsReadOwner::Job(job.clone()),
+            None => crate::read_handoff::DfsReadOwner::request(
+                &self.request.requester_node_id,
+                &self.request.request_id,
+            ),
+        }
+    }
+
+    /// Whether the owner whose phase failed with `error` runs again rather
+    /// than being answered with the failure. A job always runs again: its own
+    /// step decides what the failure means. A request runs again when the
+    /// failure passes: its phase may have reached the other node, the shard
+    /// it addressed is closed or moved, or foreground work cancelled it.
+    fn awaits_another_publication(&self, error: &DaemonError) -> bool {
+        if self.job.is_some() {
+            return true;
+        }
+        let text = error.to_string();
+        matches!(error, DaemonError::Network { .. })
+            || super::message_host::closed_shard_storage_cause_of(error).is_some()
+            || [
+                "network delivery",
+                "network error",
+                "cancelled",
+                "stale owner epoch",
+            ]
+            .iter()
+            .any(|passing| text.contains(passing))
+    }
 }
 
 /// Work that foreground work cut short, or that is due for another reason, runs
@@ -973,7 +1065,8 @@ fn wake_daemon_dfs_maintenance_after_admission_release(
     after: u64,
     runtime: &tokio::runtime::Handle,
 ) {
-    if crate::read_handoff::due_count(&data_dir.root()) == 0 {
+    let due = crate::read_handoff::due_count(&data_dir.root()) > 0;
+    if !due && !crate::maintenance::job_triggers::jobs_turn_requested(&data_dir.root()) {
         return;
     }
     let Ok(Some(task_owner)) = registered_dfs_runtime_host(data_dir) else {
@@ -986,6 +1079,34 @@ fn wake_daemon_dfs_maintenance_after_admission_release(
                 return;
             }
         }
+        if due {
+            notify_daemon_dfs_maintenance_work(&data_dir);
+        }
+        crate::maintenance::job_triggers::wake_requested_jobs_turn(&data_dir.root());
+    }));
+}
+
+/// Run `owner` again once an admission is released after `after`: the first
+/// publication after its remote phase failed. Until then the owner is not due,
+/// so nothing runs it on this failure's account.
+fn rerun_daemon_dfs_owner_after_admission_release(
+    data_dir: &SinomoDataDir,
+    owner: crate::read_handoff::DfsReadOwner,
+    mut releases: tokio::sync::watch::Receiver<u64>,
+    after: u64,
+    runtime: &tokio::runtime::Handle,
+) {
+    let Ok(Some(task_owner)) = registered_dfs_runtime_host(data_dir) else {
+        return;
+    };
+    let data_dir = data_dir.clone();
+    task_owner.own_task(runtime.spawn(async move {
+        while *releases.borrow_and_update() <= after {
+            if releases.changed().await.is_err() {
+                return;
+            }
+        }
+        crate::read_handoff::resume(&data_dir.root(), &owner);
         notify_daemon_dfs_maintenance_work(&data_dir);
     }));
 }
@@ -1296,8 +1417,8 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     turn_progress: &mut Option<(Arc<crate::maintenance::DfsMaintenanceProgressState>, u64)>,
     placement_budget: &mut usize,
     completed_remote_phase: &mut Option<(
-        Box<crate::DfsNamespaceRequestRecord>,
-        Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
+        DaemonDfsNamespaceContinuation,
+        Result<Box<crate::source_adoption::CompletedRemoteNamespacePhase>, DaemonError>,
     )>,
     handed_off_reads: &mut Vec<(
         crate::read_handoff::DfsReadOwner,
@@ -1401,7 +1522,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // Release this strong owner before returning the reusable lane to cache.
     let publication_provider_scope = publication_provider
         .map(|provider| maintenance_service.publication_provider.install(provider));
-    if maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor {
+    if !maintenance_kind.runs_one_pass() {
         let placement_advertisements = maintenance_service
             .placement_content_candidates()
             .unwrap_or_default();
@@ -1453,7 +1574,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     let mut recovery_handed_off = false;
     let maintenance_result = async {
         let options = match maintenance_kind {
-            DaemonDfsMaintenanceKind::Routine => {
+            DaemonDfsMaintenanceKind::Routine | DaemonDfsMaintenanceKind::NamespaceJobs => {
                 daemon_dfs_routine_maintenance_tick_options(node_resources)
             }
             DaemonDfsMaintenanceKind::RepairExecutor => {
@@ -1480,8 +1601,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                         content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested,
                     } => (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested),
                     DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
-                    DaemonDfsMaintenanceKind::Routine | DaemonDfsMaintenanceKind::RepairExecutor => {
-                        unreachable!("routine and executor-only turns handled above")
+                    DaemonDfsMaintenanceKind::Routine
+                    | DaemonDfsMaintenanceKind::RepairExecutor
+                    | DaemonDfsMaintenanceKind::NamespaceJobs => {
+                        unreachable!("routine and one-pass turns handled above")
                     }
                 };
                 let recovery_options = if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
@@ -1593,7 +1716,22 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 recovery_options
             }
         };
-        if let Some((request, completed)) = completed_remote_phase.take() {
+        if let Some((continuation, completed)) = completed_remote_phase.take() {
+            let DaemonDfsNamespaceContinuation { request, .. } = continuation;
+            let completed = match completed {
+                Ok(completed) => completed,
+                Err(error) => {
+                    // A request answers its definite failure as its own run
+                    // would have, had it sent the phase in place.
+                    maintenance_service.answer_failed_namespace_request_continuation(
+                        &request,
+                        &crate::DfsError::Metadata {
+                            message: error.to_string(),
+                        },
+                    )?;
+                    return Ok(None);
+                }
+            };
             maintenance_service.complete_remote_namespace_phase(*completed)?;
             maintenance_service.pending_namespace_request_recovery = Some(request);
             // Resume only the original durable request. Ending this continuation
@@ -1603,7 +1741,57 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             // A completed repair wait's deadline belongs to that re-run only.
             maintenance_service.file_sync_wait_deadline = None;
             resumed?;
+            // A jobs turn's pass that stopped at this phase runs again over
+            // its shards once the job's continuation hands off no further
+            // phase.
+            if maintenance_kind == DaemonDfsMaintenanceKind::NamespaceJobs
+                && maintenance_service.remote_namespace_phase.is_none()
+            {
+                crate::maintenance::job_triggers::remote_phase_ended(&data_dir.root(), true);
+            }
             return Ok(None);
+        }
+        if maintenance_kind == DaemonDfsMaintenanceKind::NamespaceJobs {
+            // A jobs turn runs only the jobs pass, over the shards its
+            // request names; the request stays until a pass settles it.
+            let claim =
+                crate::maintenance::job_triggers::take_requested_jobs_turn(&data_dir.root());
+            if claim.shards().is_empty() {
+                claim.complete();
+                return Ok(Some(crate::maintenance::dfs_namespace_jobs_turn_report(
+                    Default::default(),
+                )));
+            }
+            let pass = maintenance_service.posix_resume_namespace_jobs_on_shards_bounded(
+                Some(claim.shards()),
+                options.namespace_job_max_jobs,
+                options.namespace_job_max_steps_per_job,
+            );
+            return match pass {
+                Ok(jobs) => {
+                    let report = crate::maintenance::dfs_namespace_jobs_turn_report(jobs);
+                    if _foreground_preemption.is_requested() {
+                        // Cut short: the request stays, and the admission
+                        // release that ends the foreground work wakes it.
+                        drop(claim);
+                    } else if crate::dfs_maintenance_report_reached_limit(&report) {
+                        claim.continue_now();
+                    } else {
+                        claim.complete();
+                    }
+                    Ok(Some(report))
+                }
+                Err(error) => {
+                    if maintenance_service.remote_namespace_phase.is_some() {
+                        claim.continue_after_remote_phase();
+                    } else if !_foreground_preemption.is_requested() {
+                        claim.complete();
+                    }
+                    Err(DaemonError::from(crate::DfsError::Metadata {
+                        message: error.to_string(),
+                    }))
+                }
+            };
         }
         // Both kinds now execute the same bounded phases. Recovery has already
         // durably transferred discovered work before this future can yield to
@@ -1654,12 +1842,15 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                             .into(),
                     })
                 })?;
-            Some((request, phase))
+            let job = maintenance_service
+                .pending_namespace_job_continuation
+                .take();
+            Some((DaemonDfsNamespaceContinuation { request, job }, phase))
         } else {
             None
         };
     if matches!(&maintenance_result, Ok(Some(_)))
-        && maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor
+        && !maintenance_kind.runs_one_pass()
         && let Some((generation, jobs)) =
             super::maintenance_host::daemon_dfs_requested_namespace_job_compaction(
                 &DaemonPaths::new(&data_dir),
@@ -1801,9 +1992,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             ),
         }
     }
-    if let Some((request, phase)) = remote_namespace_phase {
+    if let Some((continuation, phase)) = remote_namespace_phase {
         return Ok(DaemonDfsMaintenancePreExecution::RemoteNamespacePhase(
-            request, phase,
+            continuation,
+            phase,
         ));
     }
     // A routed write stays on the shard lane that served it until it finishes.
@@ -1814,7 +2006,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // durably still owes that write's reply. The global service's backend
     // lease has been returned above, so each lane checks out its own shard
     // while this turn still holds the global admission.
-    if maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor
+    if !maintenance_kind.runs_one_pass()
         && let Some(owners) = write_phase_owners.as_ref()
     {
         run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
@@ -2054,7 +2246,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     node_resources: sinomo_device::NodeResourceSnapshot,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
-    run_daemon_dfs_maintenance_in_blocking_task(paths, runtime, node_resources, shutdown, false)
+    run_daemon_dfs_maintenance_in_blocking_task(paths, runtime, node_resources, shutdown, None)
         .await
 }
 
@@ -2066,8 +2258,32 @@ pub(crate) async fn run_daemon_dfs_repair_executor_turn_in_blocking_task(
     node_resources: sinomo_device::NodeResourceSnapshot,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
-    run_daemon_dfs_maintenance_in_blocking_task(paths, runtime, node_resources, shutdown, true)
-        .await
+    run_daemon_dfs_maintenance_in_blocking_task(
+        paths,
+        runtime,
+        node_resources,
+        shutdown,
+        Some(DaemonDfsMaintenanceKind::RepairExecutor),
+    )
+    .await
+}
+
+/// Run one jobs turn from Tokio's blocking pool, owned and cancelled exactly
+/// like a maintenance tick.
+pub(crate) async fn run_daemon_dfs_namespace_jobs_turn_in_blocking_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    run_daemon_dfs_maintenance_in_blocking_task(
+        paths,
+        runtime,
+        node_resources,
+        shutdown,
+        Some(DaemonDfsMaintenanceKind::NamespaceJobs),
+    )
+    .await
 }
 
 async fn run_daemon_dfs_maintenance_in_blocking_task(
@@ -2075,7 +2291,7 @@ async fn run_daemon_dfs_maintenance_in_blocking_task(
     runtime: tokio::runtime::Handle,
     node_resources: sinomo_device::NodeResourceSnapshot,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    executor_only: bool,
+    one_pass: Option<DaemonDfsMaintenanceKind>,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
@@ -2096,11 +2312,11 @@ async fn run_daemon_dfs_maintenance_in_blocking_task(
                 _ = cancellation_owner.wait_for_shutdown() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
                 _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
                 result = until_shutdown_observed(async {
-                    if executor_only {
+                    if let Some(kind) = one_pass {
                         run_daemon_dfs_maintenance_tick_kind_on_runtime(
                             &paths,
                             &tick_runtime,
-                            DaemonDfsMaintenanceKind::RepairExecutor,
+                            kind,
                             node_resources,
                         )
                         .await

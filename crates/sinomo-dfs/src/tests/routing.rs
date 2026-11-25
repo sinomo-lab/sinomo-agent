@@ -1889,6 +1889,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             frame_id: 6,
             message_id: 7,
             message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "namespace-mkdir".to_string(),
                 file_system_id: sifs_file_system_id(),
                 requesting_node_id: local.clone(),

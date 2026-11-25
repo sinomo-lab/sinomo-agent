@@ -148,6 +148,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// closed: record the shards for this node, so their activation wakes
     /// its maintenance, record and announce the park, and refuse with `Busy`
     /// naming `path`.
+    ///
+    /// The records are read again after the park is recorded, in that order
+    /// against an activation, whose host publishes the record before it takes
+    /// the parks. An activation that took the parks before this one was
+    /// recorded published first, so this read finds the shard Active: the
+    /// park is taken back and the job runs again first. Otherwise the
+    /// activation, still to come, takes this park.
     pub(super) fn park_namespace_step_on_shard_storage(
         &mut self,
         job: &DfsNamespaceJobRecord,
@@ -155,16 +162,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: Vec<crate::DfsMetadataShardConfig>,
         path: String,
     ) -> DfsPosixError {
+        let key = |shard: &crate::DfsMetadataShardConfig| {
+            (
+                shard.file_system_id.clone(),
+                crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+            )
+        };
         self.note_namespace_job_parked(job, frame, &shards);
         crate::maintenance::storage_waits::record_parked_on_shard_storage(
             &self.node_id,
-            shards.into_iter().map(|shard| {
-                (
-                    shard.file_system_id,
-                    crate::DfsMetadataShardId::new(shard.shard_id),
-                )
-            }),
+            shards.iter().map(key),
         );
+        let activated = shards
+            .iter()
+            .filter(|shard| !self.shard_storage_record_is_closed(shard).unwrap_or(true))
+            .map(key)
+            .collect::<std::collections::BTreeSet<_>>();
+        if !activated.is_empty() {
+            crate::maintenance::storage_waits::take_parked_on_activated_shard_storage(
+                &self.node_id,
+                &activated,
+            );
+            self.read_handoff.rerun = true;
+        }
         DfsPosixError::Dfs(DfsError::Busy { path })
     }
 

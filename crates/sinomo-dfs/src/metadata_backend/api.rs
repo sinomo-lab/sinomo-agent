@@ -156,6 +156,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .cloned()
             .collect())
     }
+    fn prepared_operations_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        if shard_id != &self.shard_id {
+            return Ok(Vec::new());
+        }
+        self.list_prepared_operations()
+    }
     fn prepared_operation_reservations(
         &self,
         payload: &crate::DfsPreparedOperationPayload,
@@ -1771,6 +1780,32 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<DfsNamespaceJobPage> {
         let tables = self.current_tables_snapshot()?;
         Ok(namespace_jobs_page_from_tables(&tables, after, max_entries))
+    }
+
+    fn running_namespace_jobs_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsNamespaceJobPage>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.running_namespace_jobs_page(after, max_entries)
+            .map(Some)
+    }
+
+    fn running_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(running_namespace_jobs_page_from_tables(
+            &tables,
+            after,
+            max_entries,
+        ))
     }
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {

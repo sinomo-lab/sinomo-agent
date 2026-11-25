@@ -1045,8 +1045,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &sifs_file_system_id(),
                     from,
                     Some(to),
-                    &[DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries],
+                    &[
+                        DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                        DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                    ],
                 )? =>
+            {
+                return Ok(());
+            }
+            // A request that waited for its job answers from that job.
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } if self.resume_or_replay_cross_shard_mutation_for_active_request(
+                &sifs_file_system_id(),
+                existing_path,
+                Some(link_path),
+                &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+            )? =>
             {
                 return Ok(());
             }

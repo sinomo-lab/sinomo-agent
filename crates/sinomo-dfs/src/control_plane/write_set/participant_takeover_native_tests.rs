@@ -19,7 +19,7 @@ use std::time::Duration;
 const EVENT_BOUND: Duration = Duration::from_secs(90);
 
 /// The table snapshot of `node`'s copy of `shard`.
-fn snapshot(
+pub(super) fn snapshot(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     shard: &str,
@@ -106,7 +106,7 @@ fn status_at(
 /// a move of `/users` into `/services` is coordinated on U and counts `/` on
 /// the root shard. Returns the runtime, the root shard, U and the third node
 /// B.
-fn parent_on_a_switched_root(
+pub(super) fn parent_on_a_switched_root(
     name: &str,
 ) -> (DfsTestRuntime, DfsMetadataShardConfig, NodeId, NodeId) {
     let (runtime, service, root) =
@@ -165,7 +165,11 @@ fn parent_on_a_switched_root(
 
 /// Replicate the root primary's whole journal to `member` through the
 /// ordinary durability barrier.
-fn catch_up_root(runtime: &DfsTestRuntime, root: &DfsMetadataShardConfig, member: &NodeId) {
+pub(super) fn catch_up_root(
+    runtime: &DfsTestRuntime,
+    root: &DfsMetadataShardConfig,
+    member: &NodeId,
+) {
     let mut service = runtime.metadata_primary_service("/").unwrap();
     let shard_id = crate::DfsMetadataShardId::new(root.shard_id.clone());
     let head = service
@@ -275,7 +279,7 @@ fn stop_phase_at(
 
 /// The root shard's primary R is cut off and lost, and B takes over, as only
 /// B's keeper runs, and activates.
-fn b_takes_over_root(
+pub(super) fn b_takes_over_root(
     runtime: &DfsTestRuntime,
     root: &DfsMetadataShardConfig,
     u: &NodeId,
@@ -352,7 +356,12 @@ fn moved_once(
 }
 
 /// Let the cut-off old primary back in and settle cluster KV.
-fn heal_root(runtime: &DfsTestRuntime, root: &DfsMetadataShardConfig, u: &NodeId, b: &NodeId) {
+pub(super) fn heal_root(
+    runtime: &DfsTestRuntime,
+    root: &DfsMetadataShardConfig,
+    u: &NodeId,
+    b: &NodeId,
+) {
     let r = &root.primary_node_id;
     runtime.partition_node(r, Partition::default());
     for observer in [u, b] {

@@ -445,6 +445,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             options: options.clone(),
         };
         let command = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: request_id.clone(),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: requester.clone(),

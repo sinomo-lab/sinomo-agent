@@ -4746,6 +4746,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         Ok(records)
     }
+    fn prepared_operations_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<DfsPreparedOperationRecord>> {
+        let Some(slot) = self.shards.get(shard_id) else {
+            return Ok(Vec::new());
+        };
+        slot.backend()?.prepared_operations_on_shard(shard_id)
+    }
     fn prepared_operations_for_request(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -6991,6 +7000,53 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         if jobs.len() > max_entries {
             jobs.truncate(max_entries);
         }
+        let next_cursor = if has_more {
+            jobs.last().map(|job| DfsNamespaceJobPageCursor {
+                job_id: job.job_id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(DfsNamespaceJobPage { jobs, next_cursor })
+    }
+
+    fn running_namespace_jobs_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsNamespaceJobPage>> {
+        let Some(slot) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        slot.backend()?
+            .running_namespace_jobs_on_shard_page(shard_id, after, max_entries)
+    }
+
+    fn running_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        if max_entries == 0 {
+            return Ok(DfsNamespaceJobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut merged = BTreeMap::<String, DfsNamespaceJobRecord>::new();
+        let mut shard_has_more = false;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
+            let page = backend.running_namespace_jobs_page(after, max_entries.saturating_add(1))?;
+            shard_has_more |= page.next_cursor.is_some();
+            for job in page.jobs {
+                merged.insert(job.job_id.clone(), job);
+            }
+        }
+        let mut jobs = merged.into_values().collect::<Vec<_>>();
+        let has_more = jobs.len() > max_entries || shard_has_more;
+        jobs.truncate(max_entries);
         let next_cursor = if has_more {
             jobs.last().map(|job| DfsNamespaceJobPageCursor {
                 job_id: job.job_id.clone(),

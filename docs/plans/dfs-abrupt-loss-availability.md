@@ -91,9 +91,7 @@ The implementation differs from these requirements:
   nothing cancels it.
 - On a shard that has not switched, an epoch change also advances the store
   generation, which makes the metadata service reopen.
-- Namespace-job resume selects jobs on every locally replicated shard rather than
-  only on shards this node is primary for. Cross-shard source-adoption sessions
-  exist only in memory.
+- Cross-shard source-adoption sessions exist only in memory.
 
 These existing properties support the design:
 

@@ -1629,6 +1629,7 @@ mod genuine_source_first_tests {
             let actor = actor_for_root(&native.data_dir(&coordinator).root()).unwrap();
             let origin = held.plan.job.origin.as_ref().expect("original request");
             let mut command = crate::DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: origin.request_id.clone(),
                 file_system_id: held.plan.job.file_system_id.clone(),
                 requesting_node_id: origin.requester_node_id.clone(),

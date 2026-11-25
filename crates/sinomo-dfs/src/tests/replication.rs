@@ -388,6 +388,7 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
             frame_id: 1,
             message_id: 1,
             message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "native-no-replay".into(),
                 file_system_id: sifs_file_system_id(),
                 requesting_node_id: cluster.replica_node.clone(),

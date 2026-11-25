@@ -47,7 +47,8 @@ pub(super) use candidate::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use steps::test_hooks::{
-    hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,
+    hold_takeover_activation_for_test, skip_takeover_activation_reconciliation_for_test,
+    stop_takeover_after_promise_for_test,
 };
 
 pub(super) type ShardKey = (crate::DfsFileSystemId, DfsMetadataShardId);

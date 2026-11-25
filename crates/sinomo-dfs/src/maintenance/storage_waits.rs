@@ -6,7 +6,11 @@
 //! shard here for the node that ran the step: the refusal is the event, and
 //! nothing scans jobs to rebuild the record. When shards' storage activates,
 //! the node's host takes the records naming them and wakes maintenance only
-//! if there was one, so a node with no parked work runs no pass.
+//! if there was one, so a node with no parked work runs no pass. The host
+//! publishes the activated record before it takes the records, and a step
+//! reads the shard's record again after it records its park: an activation
+//! that took the records before the park was recorded is seen by that read,
+//! and the step runs again at once.
 //!
 //! The refusal also records, per job, the step it refused and the shards it
 //! waits on. While the job's durable record still runs that step next, the
@@ -133,9 +137,10 @@ pub(crate) fn take_parked_on_activated_shard_storage(
     activated: &BTreeSet<DfsMetadataShardStorageKey>,
 ) -> bool {
     // A job waiting on an activated shard runs its step again in the
-    // maintenance pass this wakes, and records what it still waits on. A step
-    // refused because the shard's primary does not yet serve its activated
-    // copy resumes at the next maintenance pass.
+    // maintenance pass this wakes, and records what it still waits on. Its
+    // requests carry the storage revision this node saw, so a primary whose
+    // own projection has not yet reached the activation waits for it before
+    // it answers.
     let mut parks = JOB_PARKS.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(node_parks) = parks.get_mut(node) {
         node_parks.retain(|(file_system_id, _), park| {

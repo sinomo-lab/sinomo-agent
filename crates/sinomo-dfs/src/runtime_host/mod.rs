@@ -2312,11 +2312,17 @@ pub(crate) async fn publish_dfs_configuration_events(
     }
 }
 
-/// Wake the node's repair executor whenever the published configuration
-/// changes which shards this node is primary for. A successor serves its new
-/// shard from its own replicated index at once; the executor's pass drops the
-/// changed shards' timing when it observes the same assignment.
-pub(crate) async fn watch_dfs_repair_primary_assignments(
+/// Wake the node's repair executor, and request a namespace jobs turn for the
+/// shard, whenever the published configuration names this node primary of a
+/// shard at an epoch it did not hold before. A successor serves its new shard
+/// from its own replicated index at once: the executor's pass drops the
+/// changed shards' timing when it observes the same assignment, and the jobs
+/// turn resumes the Running jobs its copy of the shard holds. The first
+/// observation after the process starts requests no jobs turn: the startup
+/// maintenance pass resumes every Running job. The first publication after a
+/// jobs pass could not read the configuration requests a jobs turn for every
+/// shard it names this node primary of (see `maintenance/job_triggers.rs`).
+pub(crate) async fn watch_dfs_primary_assignments(
     data_dir: SinomoDataDir,
     authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
     local_node_id: sinomo_core::Id,
@@ -2324,15 +2330,31 @@ pub(crate) async fn watch_dfs_repair_primary_assignments(
 ) {
     let data_root = data_dir.root();
     let mut published = authority.subscribe_configuration_snapshot();
-    let mut observed = None;
+    let mut observed: Option<BTreeMap<String, u64>> = None;
     loop {
         let current = Arc::clone(&published.borrow_and_update());
+        let unreadable =
+            crate::maintenance::job_triggers::take_configuration_unreadable(&local_node_id);
         if let Ok(Some(shards)) = current.metadata_shards(&crate::sifs_file_system_id()) {
             let primaries = crate::repair_executor::local_primary_shards(&shards, &local_node_id);
+            let jobs_shards = primaries
+                .iter()
+                .filter(|(shard, epoch)| {
+                    unreadable
+                        || observed
+                            .as_ref()
+                            .is_some_and(|previous| previous.get(*shard) != Some(*epoch))
+                })
+                .map(|(shard, _)| crate::DfsMetadataShardId::new(shard.clone()))
+                .collect::<Vec<_>>();
             if crate::repair_executor::repair_primary_assignments_changed(&mut observed, primaries)
             {
                 crate::repair_executor::wake_repair_executor(&data_root, "primary_assignment");
             }
+            crate::maintenance::job_triggers::request_jobs_turn(&data_root, jobs_shards);
+        } else if unreadable {
+            // Still unreadable: the next publication takes the record.
+            crate::maintenance::job_triggers::note_configuration_unreadable(&local_node_id);
         }
         // Any published configuration can bring a lane's authority view up to
         // an assignment a refused dispatch was waiting for.
@@ -3954,6 +3976,7 @@ pub(crate) use maintenance_runtime::{
     DaemonDfsMaintenanceTickOutcome, daemon_dfs_background_network_work_deferred,
     replay_daemon_dfs_mounted_mutation_committed_work_on_runtime,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
+    run_daemon_dfs_namespace_jobs_turn_in_blocking_task,
     run_daemon_dfs_repair_executor_turn_in_blocking_task,
 };
 mod peer_verdicts;
@@ -3967,8 +3990,8 @@ pub(crate) use write_set_takeover::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use write_set_takeover::{
-    hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,
-    takeover_events_for_test, takeover_trace_for_test,
+    hold_takeover_activation_for_test, skip_takeover_activation_reconciliation_for_test,
+    stop_takeover_after_promise_for_test, takeover_events_for_test, takeover_trace_for_test,
 };
 #[cfg(test)]
 pub(crate) use write_set_takeover::ask_dfs_takeover_corroboration_for_test;

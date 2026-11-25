@@ -898,6 +898,7 @@ mod tests {
     fn namespace_requests_expose_every_involved_path() {
         let file_system_id = fs_id("scope-namespace-fs");
         let command = message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "scope-rename".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: node_id("scope-source"),
@@ -925,6 +926,7 @@ mod tests {
 
         let mkdir_all = |authority_shards| {
             message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "scope-mkdir-all".into(),
                 file_system_id: file_system_id.clone(),
                 requesting_node_id: node_id("scope-source"),
@@ -956,6 +958,7 @@ mod tests {
 
         let empty_lookup =
             message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "scope-empty-lookup".to_string(),
                 file_system_id: fs_id("scope-empty-fs"),
                 requesting_node_id: node_id("scope-source"),
@@ -976,6 +979,7 @@ mod tests {
         let shard = authority_shard(&file_system_id, "services");
         let namespace_command = |authority_shards| {
             message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "scope-stamped-mkdir".to_string(),
                 file_system_id: file_system_id.clone(),
                 requesting_node_id: node_id("scope-source"),
@@ -997,6 +1001,7 @@ mod tests {
         );
         let lookup_command = |authority_shards| {
             message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "scope-stamped-lookup".to_string(),
                 file_system_id: file_system_id.clone(),
                 requesting_node_id: node_id("scope-source"),
@@ -1025,6 +1030,7 @@ mod tests {
         );
         let poll_command = |authority_shards| {
             message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "scope-stamped-namespace-poll".to_string(),
                 file_system_id: file_system_id.clone(),
                 requesting_node_id: node_id("scope-source"),
@@ -1101,6 +1107,7 @@ mod tests {
             ] {
                 let canonical_mutation =
                     message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                        storage_revision: None,
                         request_id: "scope-canonical-mutation".into(),
                         file_system_id: file_system_id.clone(),
                         requesting_node_id: node_id("scope-source"),
@@ -1235,6 +1242,7 @@ mod tests {
         let file_system_id = fs_id("scope-distributed-fs");
         let requester = node_id("scope-requester");
         let mut write = DfsDistributedWriteCommand {
+            storage_revision: None,
             publication: Default::default(),
             patch: None,
             request_id: "scope-distributed-write".to_string(),

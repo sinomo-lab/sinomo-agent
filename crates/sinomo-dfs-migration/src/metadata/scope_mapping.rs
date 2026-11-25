@@ -1078,6 +1078,7 @@ pub(super) fn map_scope(
                     continue;
                 }
                 let command = DfsNamespaceCommand {
+                    storage_revision: None,
                     request_id: request.request_id.clone(),
                     file_system_id: request.file_system_id.clone(),
                     requesting_node_id: request.requester_node_id.clone(),
@@ -1779,6 +1780,7 @@ mod tests {
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
         let expected = namespace_command_digest(&DfsNamespaceCommand {
+            storage_revision: None,
             request_id: request.request_id.clone(),
             file_system_id,
             requesting_node_id: request.requester_node_id.clone(),

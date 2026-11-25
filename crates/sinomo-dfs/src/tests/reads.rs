@@ -4265,6 +4265,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         &remote,
         3,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "lookup-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),
@@ -4296,6 +4297,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         &remote,
         4,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "lookup-paths-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),
@@ -4317,6 +4319,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         &remote,
         5,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "apply-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),

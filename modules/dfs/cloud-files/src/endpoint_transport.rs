@@ -534,6 +534,7 @@ mod tests {
             .expect("actual native ingress observer");
         let mut transport = service.into_transport();
         let command = dfs::DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "cloud-files-local-query-contract".into(),
             file_system_id: shard.file_system_id.clone(),
             requesting_node_id: local.clone(),

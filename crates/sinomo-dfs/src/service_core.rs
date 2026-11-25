@@ -70,6 +70,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             namespace_execution: Default::default(),
             remote_namespace_phase: None,
             pending_namespace_request_recovery: None,
+            pending_namespace_job_continuation: None,
             completed_remote_namespace_phases: BTreeMap::new(),
             answered_remote_reads: BTreeMap::new(),
             read_handoff: Default::default(),
@@ -732,6 +733,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && self.pending_routed_namespace_ops.is_empty()
             && self.namespace_execution.is_quiescent()
             && self.pending_namespace_request_recovery.is_none()
+            && self.pending_namespace_job_continuation.is_none()
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
     }
