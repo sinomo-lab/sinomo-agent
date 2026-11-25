@@ -9048,13 +9048,20 @@ fn daemon_dfs_stage_reply_on_its_own_reaches_the_lane_serving_its_write() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        native
-            .main_lane_held(&owner, &shard.file_system_id, &shard.shard_id)
-            .unwrap()
-            && !native.main_global_writer_holds(&owner).unwrap(),
-        "the reply's commit waits on the replica under its write's lane, not the global writer"
-    );
+    // An earlier journal batch to the replica can be the first one held at
+    // the gate. The reply's commit is held there too, so its lane stays taken
+    // for as long as the gate is closed.
+    while !(native
+        .main_lane_held(&owner, &shard.file_system_id, &shard.shard_id)
+        .unwrap()
+        && !native.main_global_writer_holds(&owner).unwrap())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the reply's commit waits on the replica under its write's lane, not the global writer"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     native.clear_faults();
     commit_gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
     crate::test_runtime::executor()
@@ -14434,6 +14441,74 @@ fn native_peer_projection_uses_owned_members_and_catalog_without_optional_checkp
     );
     assert!(current.contains(&nodes[0]) && current.contains(&nodes[1]));
     drop(host);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_peer_projection_follows_each_change_of_its_entries() {
+    let nodes =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-peer-projection-change", 3);
+    let mut runtime =
+        crate::test_runtime::DfsTestRuntime::new("native-peer-projection-change", nodes[0].clone())
+            .unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let paths = ClusterPaths::new(runtime.data_dir(&nodes[0]));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    let (members, services) = read_native_dfs_peer_configuration(
+        &paths,
+        &state,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    )
+    .unwrap();
+    let derive = |services: &[sinomo_core::kv::KvEntry]| {
+        peer_snapshot_from_configuration_entries(&state, members.clone(), services.to_vec())
+            .unwrap()
+            .peer_node_ids
+    };
+    assert_eq!(derive(&services), nodes);
+    assert_eq!(derive(&services), nodes, "unchanged entries name the same peers");
+
+    // Same key and revisions, different record: only the value tells them apart.
+    let mut incompatible = services.clone();
+    let mut changed = false;
+    for entry in &mut incompatible {
+        let mut instance = entry
+            .decode::<sinomo_core::service::ServiceInstanceRecord>()
+            .unwrap();
+        if instance.node_id == nodes[2]
+            && instance
+                .provider_capabilities
+                .iter()
+                .any(|capability| capability == "dfs.object.transfer")
+        {
+            instance.interface_version = "sinomo.dfs.v1".into();
+            entry.value = sinomo_core::kv::encode_kv_value(&instance).unwrap();
+            changed = true;
+        }
+    }
+    assert!(changed, "the changed input comes from a genuine provider advertisement");
+    assert_eq!(
+        derive(&incompatible),
+        nodes[..2],
+        "a changed record derives its own peers instead of reusing the earlier set"
+    );
+
+    let withdrawn = services
+        .iter()
+        .filter(|entry| {
+            entry
+                .decode::<sinomo_core::service::ServiceInstanceRecord>()
+                .unwrap()
+                .node_id
+                != nodes[1]
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(derive(&withdrawn), [nodes[0].clone(), nodes[2].clone()]);
+    assert_eq!(derive(&services), nodes, "the restored entries name every peer again");
     runtime.close().unwrap();
 }
 
