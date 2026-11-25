@@ -29541,6 +29541,7 @@ mod tests {
         };
         let mut preview = preview_placement(
             &config,
+            &[],
             "/folder",
             DfsObjectId::from_legacy_named("object-placement-editor").expect("object"),
             DfsVersion::from_legacy_named("version-placement-editor").expect("version"),
