@@ -10,6 +10,7 @@ mod job_events;
 mod namespace_counts;
 mod parent_counts;
 mod parent_supersession_negatives;
+mod read_handoff;
 
 /// The live object `node`'s durable metadata store holds at `path`.
 /// Callers delegating to their Main keep no store, so replica convergence is

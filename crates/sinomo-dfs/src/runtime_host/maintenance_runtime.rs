@@ -661,8 +661,13 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             &data_dir,
             metadata_authority_preflight.generation,
         )?;
-        let foreground_preemption =
-            daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
+        let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
+        let foreground_preemption = scheduler.begin_maintenance_interest();
+        // The first admission released after the one this turn yields to, or
+        // after this turn's own, is the earliest moment the foreground work it
+        // gave way to can have finished.
+        let admission_releases = scheduler.subscribe_admission_releases();
+        let released_before_admission = *admission_releases.borrow();
         let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
             &data_dir,
             &foreground_preemption,
@@ -672,6 +677,12 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         else {
             metrics::counter!("sinomo.dfs.background.deferred", "reason" => "admission")
                 .increment(1);
+            wake_daemon_dfs_maintenance_after_admission_release(
+                &data_dir,
+                admission_releases,
+                released_before_admission,
+                runtime,
+            );
             // Reads still preempt admission. Keep the caller's actual pending
             // recovery request, including before its first phase or after an
             // authority generation invalidated the old phase checkpoint.
@@ -689,6 +700,8 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 },
             );
         };
+        // Nothing else releases an admission while this turn holds the node.
+        let released_with_this_turn = *admission_releases.borrow() + 1;
         let DaemonDfsMaintenanceAdmission {
             _lifecycle_guard: lifecycle_guard,
             _mutation_admission: mutation_admission,
@@ -714,6 +727,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
             "dfs-maintenance-owner-state");
         }
         let mut deferred_work = None;
+        let mut handed_off_reads = Vec::new();
         let mut turn_progress = None;
         let mut placement_budget = 0;
         let committed_work_tracker = DfsCommittedWorkTracker::new();
@@ -734,6 +748,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                     &mut turn_progress,
                     &mut placement_budget,
                     &mut completed_remote_phase,
+                    &mut handed_off_reads,
                     publication_scope
                         .as_ref()
                         .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
@@ -780,7 +795,16 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         drop(publication_scope);
         drop(retained_admission);
         drop(lifecycle_guard);
+        let yielded_to_foreground = foreground_preemption.is_requested();
         drop(foreground_preemption);
+        if yielded_to_foreground {
+            wake_daemon_dfs_maintenance_after_admission_release(
+                &data_dir,
+                admission_releases,
+                released_with_this_turn,
+                runtime,
+            );
+        }
         if let Some(started) = trace_hold_started {
             tracing::trace!(target: "sinomo.dfs.perf", owner_id = trace_id.unwrap_or_default(),
             node = %preflight_cluster_state.local_node_id, kind = ?maintenance_kind,
@@ -795,6 +819,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 worker,
             );
         }
+        send_daemon_dfs_handed_off_reads(&data_dir, handed_off_reads, runtime);
         // The tracker is owned outside the cancellable maintenance future and is
         // updated at each durable mutation boundary. Transfer those exact bits
         // only after destroying the backend-bearing generation and dropping its
@@ -937,6 +962,258 @@ pub(super) enum DaemonDfsMaintenancePreExecution {
     AuthorityPreflightStale(DaemonDfsAuthorityPreflightStale),
 }
 
+/// Work that foreground work cut short, or that is due for another reason, runs
+/// again once an admission is released after `after`: on that release, not on
+/// a later unrelated wake. Work the next turn's foreground work cuts short
+/// again waits for the release after that one, so nothing runs while
+/// foreground work is still waiting.
+fn wake_daemon_dfs_maintenance_after_admission_release(
+    data_dir: &SinomoDataDir,
+    mut releases: tokio::sync::watch::Receiver<u64>,
+    after: u64,
+    runtime: &tokio::runtime::Handle,
+) {
+    if crate::read_handoff::due_count(&data_dir.root()) == 0 {
+        return;
+    }
+    let Ok(Some(task_owner)) = registered_dfs_runtime_host(data_dir) else {
+        return;
+    };
+    let data_dir = data_dir.clone();
+    task_owner.own_task(runtime.spawn(async move {
+        while *releases.borrow_and_update() <= after {
+            if releases.changed().await.is_err() {
+                return;
+            }
+        }
+        notify_daemon_dfs_maintenance_work(&data_dir);
+    }));
+}
+
+/// Send the reads this turn's work handed off, now that the turn holds no
+/// admission. Each read is its owner's pending item until it ends. An answer
+/// is kept for its owner and wakes a turn, which runs the owner with it. A
+/// read that ends without one parks its owner until
+/// [`daemon_dfs_parked_read_event`] comes, then wakes a turn that runs the
+/// owner, which sends the read again.
+fn send_daemon_dfs_handed_off_reads(
+    data_dir: &SinomoDataDir,
+    reads: Vec<(
+        crate::read_handoff::DfsReadOwner,
+        Box<crate::source_adoption::RemoteNamespacePhase>,
+    )>,
+    runtime: &tokio::runtime::Handle,
+) {
+    if reads.is_empty() {
+        return;
+    }
+    // A host with no task owner is stopping: each owner sends its read again
+    // when it next runs.
+    let Ok(Some(task_owner)) = registered_dfs_runtime_host(data_dir) else {
+        return;
+    };
+    for (owner, phase) in reads {
+        let crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(read) = phase.as_ref()
+        else {
+            continue;
+        };
+        let mut sending = DaemonDfsHandedOffReadSend {
+            root: data_dir.root(),
+            owner,
+            key: read.key.clone(),
+            ended: false,
+        };
+        let primary = read.read.pending.primary_node_id.clone();
+        let shard = read.read.pending.dispatch_authority_shard.clone();
+        if !crate::read_handoff::begin_send(&sending.root, &sending.owner, &sending.key) {
+            sending.ended = true;
+            continue;
+        }
+        let data_dir = data_dir.clone();
+        let handle = runtime.clone();
+        task_owner.own_task(runtime.spawn(async move {
+            let completed = super::message_host::dispatch_daemon_dfs_remote_namespace_phase(
+                &data_dir, phase, None, &handle,
+            )
+            .await;
+            if let Ok(crate::source_adoption::CompletedRemoteNamespacePhase::ReadAnswered {
+                key,
+                answer: Ok(answer),
+            }) = completed.map(|completed| *completed)
+                && key == sending.key
+            {
+                if sending.end(Some(Ok(answer))) {
+                    notify_daemon_dfs_maintenance_work(&data_dir);
+                }
+                return;
+            }
+            // Unanswered: the owner stays quiet until the read is worth
+            // sending again.
+            let Some(stop) = sending.park() else {
+                return;
+            };
+            let mut parked = DaemonDfsParkedRead {
+                root: sending.root.clone(),
+                owner: sending.owner.clone(),
+                stop,
+                ended: false,
+            };
+            if daemon_dfs_parked_read_event(
+                &data_dir,
+                &handle,
+                &primary,
+                shard.as_ref(),
+                &parked.stop,
+            )
+            .await
+                && parked.end(true)
+            {
+                notify_daemon_dfs_maintenance_work(&data_dir);
+            }
+        }));
+    }
+}
+
+/// Wait for an event after which a handed-off read that ended unanswered is
+/// worth sending again: this node's verdict for `primary` changes back to a
+/// path after it could not be reached; an examination of `primary` that
+/// concludes after the read ended finds a path; or the record of the read's
+/// shard moves off the epoch and primary it was sent under. The wait first
+/// leaves the keeper the hint that the primary was not reached, as an
+/// undelivered read does, so the network examines it. Nothing else ends the
+/// wait but `stop`, which returns false.
+async fn daemon_dfs_parked_read_event(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    primary: &NodeId,
+    shard: Option<&sinomo_dfs::DfsMetadataShardConfig>,
+    stop: &tokio::sync::Notify,
+) -> bool {
+    use sinomo_core::network::PeerPathVerdict;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let Ok(state) =
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
+    else {
+        stop.notified().await;
+        return false;
+    };
+    let mut verdicts = super::peer_verdicts::DfsPeerVerdicts::new(data_dir, &cluster_paths, &state);
+    verdicts.retain(true);
+    let mut published = daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(runtime),
+    )
+    .ok()
+    .map(|authority| authority.subscribe_configuration_snapshot());
+    let examined_before = verdicts.current().concluded_generation(primary);
+    if let Some(shard) = shard {
+        crate::service_record_follow::post_primary_unreachable(&state.local_node_id, shard);
+    }
+    let record_moved =
+        |published: &tokio::sync::watch::Receiver<Arc<sinomo_dfs::DfsConfigurationSnapshot>>| {
+            let Some(shard) = shard else {
+                return false;
+            };
+            let current = published.borrow();
+            let Ok(Some(shards)) = current.metadata_shards(&shard.file_system_id) else {
+                return false;
+            };
+            shards
+                .iter()
+                .find(|current| current.shard_id == shard.shard_id)
+                .is_none_or(|current| {
+                    current.epoch != shard.epoch || current.primary_node_id != shard.primary_node_id
+                })
+        };
+    let mut unreachable = false;
+    loop {
+        if published.as_ref().is_some_and(record_moved) {
+            return true;
+        }
+        let snapshot = verdicts.current();
+        match snapshot.entry(primary) {
+            (PeerPathVerdict::Path, false)
+                if unreachable || snapshot.concluded_generation(primary) != examined_before =>
+            {
+                return true;
+            }
+            (PeerPathVerdict::NoPath, _) => unreachable = true,
+            _ => {}
+        }
+        let configuration = async {
+            match published.as_mut() {
+                Some(published) => {
+                    if published.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = stop.notified() => return false,
+            () = verdicts.changed() => {}
+            () = configuration => {}
+        }
+    }
+}
+
+/// A handed-off read on its way to its primary. Ending without an answer and
+/// without being parked, its task's abort included, leaves its owner to send
+/// it again when it next runs.
+struct DaemonDfsHandedOffReadSend {
+    root: std::path::PathBuf,
+    owner: crate::read_handoff::DfsReadOwner,
+    key: String,
+    ended: bool,
+}
+
+impl DaemonDfsHandedOffReadSend {
+    fn end(&mut self, answer: Option<crate::read_handoff::DfsHandedOffReadAnswer>) -> bool {
+        self.ended = true;
+        crate::read_handoff::end_send(&self.root, &self.owner, &self.key, answer)
+    }
+
+    fn park(&mut self) -> Option<Arc<tokio::sync::Notify>> {
+        self.ended = true;
+        crate::read_handoff::park(&self.root, &self.owner, &self.key)
+    }
+}
+
+impl Drop for DaemonDfsHandedOffReadSend {
+    fn drop(&mut self) {
+        if !self.ended {
+            crate::read_handoff::end_send(&self.root, &self.owner, &self.key, None);
+        }
+    }
+}
+
+/// An owner parked on its unanswered read. A wait that its task's abort ends
+/// leaves the owner to send the read again when it next runs.
+struct DaemonDfsParkedRead {
+    root: std::path::PathBuf,
+    owner: crate::read_handoff::DfsReadOwner,
+    stop: Arc<tokio::sync::Notify>,
+    ended: bool,
+}
+
+impl DaemonDfsParkedRead {
+    fn end(&mut self, due: bool) -> bool {
+        self.ended = true;
+        crate::read_handoff::unpark(&self.root, &self.owner, &self.stop, due)
+    }
+}
+
+impl Drop for DaemonDfsParkedRead {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.end(false);
+        }
+    }
+}
+
 // The cancellable future borrows this actual lane. Dropping that future must
 // return live request custody before its outer global admission is released.
 struct DaemonDfsMaintenanceServiceReturn<'a> {
@@ -957,6 +1234,9 @@ impl DaemonDfsMaintenanceServiceReturn<'_> {
         // checkpointed calls and starts after admission release.
         retained.lane.service.set_background_replica_dispatch(false);
         retained.lane.service.foreign_live_write_intents.clear();
+        // This turn's read hand-off ends with it. A read handed off but never
+        // sent is sent again when its owner next runs.
+        retained.lane.service.read_handoff = Default::default();
         // A foreground generation belongs to this maintenance turn. Never
         // leave its already-triggered cancellation source on the reused lane.
         retained.lane.service.set_cancellation(self.previous_cancellation.take());
@@ -1018,6 +1298,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     completed_remote_phase: &mut Option<(
         Box<crate::DfsNamespaceRequestRecord>,
         Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    )>,
+    handed_off_reads: &mut Vec<(
+        crate::read_handoff::DfsReadOwner,
+        Box<crate::source_adoption::RemoteNamespacePhase>,
     )>,
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
@@ -1147,6 +1431,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         }
     };
     maintenance_service.set_committed_work_tracker(committed_work_tracker.clone());
+    // This host sends the reads the turn's work hands off once the turn has
+    // released admission.
+    maintenance_service.read_handoff.maintenance_sends =
+        maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor;
     let defer_replica_dispatch = maintenance_kind.replica_dispatch_is_deferred();
     maintenance_service.set_background_replica_dispatch(defer_replica_dispatch);
     if defer_replica_dispatch {
@@ -1352,6 +1640,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     {
         *_deferred_work = None;
     }
+    // The host sends the reads this turn's work handed off once the turn has
+    // released admission.
+    *handed_off_reads = std::mem::take(&mut maintenance_service.read_handoff.reads);
     let remote_namespace_phase =
         if let Some(phase) = maintenance_service.remote_namespace_phase.take() {
             let request = maintenance_service

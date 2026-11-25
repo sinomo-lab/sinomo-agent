@@ -109,10 +109,16 @@ pub fn dfs_maintenance_completion_decision(
     work: Option<DfsPendingMaintenanceWork>,
     committed_edge_latched: bool,
 ) -> DfsMaintenanceProbeDecision {
+    // A completed turn may have resumed past the phases that run work due
+    // after a handed-off read: the next turn runs it.
+    let handed_off_read_due = work
+        .as_ref()
+        .is_some_and(|work| work.due_handed_off_read_count > 0);
     let mut decision = dfs_maintenance_probe_decision(observed_at, observed_at_unix_nanos, work);
     match outcome {
         DfsMaintenanceTickOutcome::Completed { reached_limit } => {
-            decision.immediate_continuation = reached_limit && decision.trigger_maintenance;
+            decision.immediate_continuation =
+                (reached_limit || handed_off_read_due) && decision.trigger_maintenance;
         }
         DfsMaintenanceTickOutcome::Continued => {
             // A transient work probe can be empty while an owned placement
@@ -270,6 +276,38 @@ mod tests {
             dfs_maintenance_due_in(now, now, now, true, false),
             Some(DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
         );
+    }
+
+    #[test]
+    fn work_due_after_a_handed_off_read_continues_a_completed_turn_at_once() {
+        let now = Instant::now();
+        let work = || {
+            Some(DfsPendingMaintenanceWork {
+                due_handed_off_read_count: 1,
+                ..DfsPendingMaintenanceWork::default()
+            })
+        };
+        let completed = dfs_maintenance_completion_decision(
+            DfsMaintenanceTickOutcome::Completed {
+                reached_limit: false,
+            },
+            now,
+            1_000_000_000,
+            work(),
+            false,
+        );
+        assert!(completed.trigger_maintenance);
+        assert!(completed.immediate_continuation);
+        // A turn that could not run is not continued at once.
+        let deferred = dfs_maintenance_completion_decision(
+            DfsMaintenanceTickOutcome::Deferred,
+            now,
+            1_000_000_000,
+            work(),
+            false,
+        );
+        assert!(deferred.trigger_maintenance);
+        assert!(!deferred.immediate_continuation);
     }
 
     #[test]

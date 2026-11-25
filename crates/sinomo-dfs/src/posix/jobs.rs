@@ -212,11 +212,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.metadata_backend.is_none() {
             return Ok(DfsNamespaceJobMaintenanceReport::default());
         }
+        // Under a maintenance host that sends them, a job step's reads on
+        // other nodes' primaries are handed off rather than waited for.
+        let reads = self.handed_off_reads_root();
         // A shard's primary resumes its own jobs; a local copy of a shard this
         // node does not replicate is not kept current.
         let replicated = self.locally_replicated_sifs_metadata_shards();
-        let mut cursor = None;
         let mut report = DfsNamespaceJobMaintenanceReport::default();
+        // A job whose handed-off read came back runs first, with its answer.
+        let mut ran = std::collections::BTreeSet::new();
+        if let Some(root) = reads.as_deref() {
+            for owner in crate::read_handoff::due_owners(root) {
+                let crate::read_handoff::DfsReadOwner::Job(job_id) = &owner else {
+                    continue;
+                };
+                // A pass that runs no jobs leaves the job to send its read
+                // again when a pass runs it; one with no room left keeps it
+                // due for the next.
+                if max_jobs == 0 {
+                    crate::read_handoff::forget(root, &owner);
+                    continue;
+                }
+                if report.resumed_job_count >= max_jobs {
+                    break;
+                }
+                match self.namespace_job(job_id)? {
+                    Some(job)
+                        if job.status == DfsNamespaceJobStatus::Running
+                            && !self.path_in_unreplicated_sifs_shard(
+                                replicated.as_ref(),
+                                &job.file_system_id,
+                                &job.root_path,
+                            )? =>
+                    {
+                        ran.insert(job_id.clone());
+                        self.resume_namespace_job_in_pass(
+                            job,
+                            max_steps_per_job,
+                            Some(root),
+                            &mut report,
+                        )?;
+                    }
+                    // The job ended or no longer runs here.
+                    _ => crate::read_handoff::forget(root, &owner),
+                }
+            }
+        }
+        let mut cursor = None;
         loop {
             let page = self
                 .metadata_backend
@@ -229,6 +271,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             report.scanned_job_count = report.scanned_job_count.saturating_add(page.jobs.len());
             for job in page.jobs {
                 if job.status != DfsNamespaceJobStatus::Running
+                    || ran.contains(&job.job_id)
                     || self.path_in_unreplicated_sifs_shard(
                         replicated.as_ref(),
                         &job.file_system_id,
@@ -237,105 +280,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     continue;
                 }
-                if report.resumed_job_count >= max_jobs {
+                // A job that waits for its handed-off read runs again when
+                // the answer, or the event its parked read waits for, comes.
+                if report.resumed_job_count >= max_jobs
+                    || reads.as_deref().is_some_and(|root| {
+                        crate::read_handoff::waiting(
+                            root,
+                            &crate::read_handoff::DfsReadOwner::Job(job.job_id.clone()),
+                        )
+                    })
+                {
                     report.remaining_running_job_count =
                         report.remaining_running_job_count.saturating_add(1);
                     continue;
                 }
-                report.resumed_job_count = report.resumed_job_count.saturating_add(1);
-                match self.posix_resume_namespace_job_bounded(&job.job_id, max_steps_per_job) {
-                    Ok(updated) => match updated.status {
-                        DfsNamespaceJobStatus::Completed => {
-                            report.completed_job_count =
-                                report.completed_job_count.saturating_add(1);
-                        }
-                        DfsNamespaceJobStatus::Running => {
-                            report.remaining_running_job_count =
-                                report.remaining_running_job_count.saturating_add(1);
-                        }
-                        DfsNamespaceJobStatus::Failed => {
-                            report.failed_job_count = report.failed_job_count.saturating_add(1);
-                        }
-                    },
-                    Err(error) => {
-                        if self.remote_namespace_phase.is_some() {
-                            // Stop at this actual phase; a later job must not
-                            // replace its owned source custody. Join its durable
-                            // origin using the existing exact request predicate.
-                            let origin = job.origin.as_ref().ok_or_else(|| {
-                                DfsPosixError::Dfs(crate::DfsError::Metadata {
-                                    message: "remote job recovery has no durable request origin"
-                                        .into(),
-                                })
-                            })?;
-                            let request = self
-                                .metadata_backend
-                                .as_ref()
-                                .expect("metadata backend checked above")
-                                .get_namespace_request(
-                                    &origin.requester_node_id,
-                                    &origin.request_id,
-                                )?
-                                .ok_or_else(|| {
-                                    DfsPosixError::Dfs(crate::DfsError::Metadata {
-                                        message: "remote job recovery lost its durable request"
-                                            .into(),
-                                    })
-                                })?;
-                            if request.file_system_id != job.file_system_id
-                                || !origin.matches_request(&request)
-                                || request.status != crate::DfsNamespaceRequestStatus::Pending
-                            {
-                                return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
-                                    message: "remote job recovery differs from its durable request"
-                                        .into(),
-                                }));
-                            }
-                            self.pending_namespace_request_recovery = Some(Box::new(request));
-                            return Err(error);
-                        }
-                        let reason = error.to_string();
-                        let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
-                        match latest.status {
-                            DfsNamespaceJobStatus::Completed => {
-                                report.completed_job_count =
-                                    report.completed_job_count.saturating_add(1);
-                            }
-                            // A durably prepared step whose commit outcome is
-                            // unknown may still commit; the job keeps running.
-                            DfsNamespaceJobStatus::Running
-                                if namespace_job_kind_is_cross_shard(&latest.kind)
-                                    || matches!(
-                                        &error,
-                                        DfsPosixError::Dfs(
-                                            crate::DfsError::Cancelled { .. }
-                                                | crate::DfsError::MetadataCommitOutcomeUnknown { .. }
-                                        )
-                                    ) =>
-                            {
-                                report.remaining_running_job_count =
-                                    report.remaining_running_job_count.saturating_add(1);
-                            }
-                            DfsNamespaceJobStatus::Running => {
-                                let failed = self.fail_namespace_job(latest, reason.clone())?;
-                                report.failed_job_count = report.failed_job_count.saturating_add(1);
-                                report.failures.push(DfsNamespaceJobFailure {
-                                    job_id: failed.job_id,
-                                    kind: failed.kind,
-                                    reason,
-                                });
-                            }
-                            DfsNamespaceJobStatus::Failed => {
-                                report.failed_job_count = report.failed_job_count.saturating_add(1);
-                                report.failures.push(DfsNamespaceJobFailure {
-                                    job_id: latest.job_id,
-                                    kind: latest.kind,
-                                    reason: latest.failure_reason.unwrap_or(reason),
-                                });
-                            }
-                        }
-                    }
-                }
+                self.resume_namespace_job_in_pass(
+                    job,
+                    max_steps_per_job,
+                    reads.as_deref(),
+                    &mut report,
+                )?;
             }
             let Some(next_cursor) = page.next_cursor else {
                 break;
@@ -343,6 +307,148 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             cursor = Some(next_cursor);
         }
         Ok(report)
+    }
+
+    /// Run one job of a maintenance pass and record its outcome in `report`.
+    /// With `reads`, the job's step takes the answers its handed-off reads
+    /// brought back, and a read it hands off now becomes its pending item.
+    fn resume_namespace_job_in_pass(
+        &mut self,
+        job: DfsNamespaceJobRecord,
+        max_steps_per_job: usize,
+        reads: Option<&std::path::Path>,
+        report: &mut DfsNamespaceJobMaintenanceReport,
+    ) -> Result<()> {
+        report.resumed_job_count = report.resumed_job_count.saturating_add(1);
+        let outcome = match reads {
+            Some(root) => {
+                let owner = crate::read_handoff::DfsReadOwner::Job(job.job_id.clone());
+                let previous = self.read_handoff.job.replace(job.job_id.clone());
+                let (outcome, handed_off) =
+                    self.run_with_handed_off_reads(root, owner, |service| {
+                        service.posix_resume_namespace_job_bounded(&job.job_id, max_steps_per_job)
+                    });
+                self.read_handoff.job = previous;
+                if handed_off {
+                    // The step handed its read to the host and changed
+                    // nothing after it: the job stays Running and runs again
+                    // with the read's answer.
+                    report.remaining_running_job_count =
+                        report.remaining_running_job_count.saturating_add(1);
+                    return Ok(());
+                }
+                outcome
+            }
+            None => self.posix_resume_namespace_job_bounded(&job.job_id, max_steps_per_job),
+        };
+        // Foreground work that cancelled this run cut its step short: a job
+        // left Running runs again first, once the admission that work took
+        // is released.
+        let cut_short = self
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::DfsCancellationFlag::is_cancelled);
+        let resume = |job_id: &str| {
+            if cut_short && let Some(root) = reads {
+                crate::read_handoff::resume(
+                    root,
+                    &crate::read_handoff::DfsReadOwner::Job(job_id.to_owned()),
+                );
+            }
+        };
+        match outcome {
+            Ok(updated) => match updated.status {
+                DfsNamespaceJobStatus::Completed => {
+                    report.completed_job_count = report.completed_job_count.saturating_add(1);
+                }
+                DfsNamespaceJobStatus::Running => {
+                    resume(&updated.job_id);
+                    report.remaining_running_job_count =
+                        report.remaining_running_job_count.saturating_add(1);
+                }
+                DfsNamespaceJobStatus::Failed => {
+                    report.failed_job_count = report.failed_job_count.saturating_add(1);
+                }
+            },
+            Err(error) => {
+                if self.remote_namespace_phase.is_some() {
+                    // Stop at this actual phase; a later job must not
+                    // replace its owned source custody. Join its durable
+                    // origin using the existing exact request predicate.
+                    let origin = job.origin.as_ref().ok_or_else(|| {
+                        DfsPosixError::Dfs(crate::DfsError::Metadata {
+                            message: "remote job recovery has no durable request origin".into(),
+                        })
+                    })?;
+                    let request = self
+                        .metadata_backend
+                        .as_ref()
+                        .expect("metadata backend checked above")
+                        .get_namespace_request(&origin.requester_node_id, &origin.request_id)?
+                        .ok_or_else(|| {
+                            DfsPosixError::Dfs(crate::DfsError::Metadata {
+                                message: "remote job recovery lost its durable request".into(),
+                            })
+                        })?;
+                    if request.file_system_id != job.file_system_id
+                        || !origin.matches_request(&request)
+                        || request.status != crate::DfsNamespaceRequestStatus::Pending
+                    {
+                        return Err(DfsPosixError::Dfs(crate::DfsError::Metadata {
+                            message: "remote job recovery differs from its durable request".into(),
+                        }));
+                    }
+                    self.pending_namespace_request_recovery = Some(Box::new(request));
+                    return Err(error);
+                }
+                let reason = error.to_string();
+                let cancelled = cut_short
+                    || matches!(&error, DfsPosixError::Dfs(error) if error.is_cancellation());
+                let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
+                if latest.status == DfsNamespaceJobStatus::Running {
+                    resume(&latest.job_id);
+                }
+                match latest.status {
+                    DfsNamespaceJobStatus::Completed => {
+                        report.completed_job_count = report.completed_job_count.saturating_add(1);
+                    }
+                    // A durably prepared step whose commit outcome is
+                    // unknown may still commit; the job keeps running.
+                    DfsNamespaceJobStatus::Running
+                        if cancelled
+                            || namespace_job_kind_is_cross_shard(&latest.kind)
+                            || matches!(
+                                &error,
+                                DfsPosixError::Dfs(
+                                    crate::DfsError::Cancelled { .. }
+                                        | crate::DfsError::MetadataCommitOutcomeUnknown { .. }
+                                )
+                            ) =>
+                    {
+                        report.remaining_running_job_count =
+                            report.remaining_running_job_count.saturating_add(1);
+                    }
+                    DfsNamespaceJobStatus::Running => {
+                        let failed = self.fail_namespace_job(latest, reason.clone())?;
+                        report.failed_job_count = report.failed_job_count.saturating_add(1);
+                        report.failures.push(DfsNamespaceJobFailure {
+                            job_id: failed.job_id,
+                            kind: failed.kind,
+                            reason,
+                        });
+                    }
+                    DfsNamespaceJobStatus::Failed => {
+                        report.failed_job_count = report.failed_job_count.saturating_add(1);
+                        report.failures.push(DfsNamespaceJobFailure {
+                            job_id: latest.job_id,
+                            kind: latest.kind,
+                            reason: latest.failure_reason.unwrap_or(reason),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn posix_rename_directory_bounded(

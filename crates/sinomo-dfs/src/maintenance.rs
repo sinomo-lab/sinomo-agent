@@ -46,6 +46,10 @@ pub struct DfsPendingMaintenanceWork {
     pub mounted_mutation_recoverable_full_count: usize,
     pub mounted_mutation_overflow_count: usize,
     pub next_mounted_mutation_reprobe_unix_nanos: Option<u64>,
+    /// Work (a namespace job or a pending request) that is to run because the
+    /// read it handed off came back, or because the event its unanswered read
+    /// waited for came, and that has not run since.
+    pub due_handed_off_read_count: usize,
 }
 
 pub const DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
@@ -73,6 +77,7 @@ impl DfsPendingMaintenanceWork {
             || self.mounted_mutation_recoverable_exact_count > 0
             || self.mounted_mutation_recoverable_full_count > 0
             || self.due_time_based_maintenance_count > 0
+            || self.due_handed_off_read_count > 0
     }
 
     pub fn should_trigger_background_maintenance(&self) -> bool {
@@ -88,6 +93,7 @@ impl DfsPendingMaintenanceWork {
             || self.due_repair_attempt_count > 0
             || self.unattempted_repair_count > 0
             || self.due_time_based_maintenance_count > 0
+            || self.due_handed_off_read_count > 0
     }
 
     pub fn next_maintenance_deadline_unix_nanos(&self) -> Option<u64> {
@@ -610,6 +616,7 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
     Ok(DfsPendingMaintenanceWork {
         pending_repair_count: executor.need_count,
         repair_attempt_count: executor.tracked_need_count,
+        due_handed_off_read_count: crate::read_handoff::due_count(&data_dir.root()),
         due_repair_attempt_count,
         next_repair_retry_unix_nanos,
         actionable_placement_reconciliation_count,

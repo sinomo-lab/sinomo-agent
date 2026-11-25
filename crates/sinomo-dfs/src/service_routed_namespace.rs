@@ -1539,12 +1539,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             locally_authoritative_count = 1;
         }
         let mut shard_snapshots = BTreeMap::<DfsFileSystemId, Vec<DfsMetadataShardConfig>>::new();
+        // Under a maintenance host that sends them, a recovered request's
+        // reads on other nodes' primaries are handed off rather than waited
+        // for. A request whose handed-off read came back runs first, with its
+        // answer.
+        let reads = self.handed_off_reads_root();
+        let mut due = BTreeSet::new();
+        if let Some(root) = reads.as_deref()
+            && resumed_request.is_none()
+        {
+            for owner in crate::read_handoff::due_owners(root) {
+                let crate::read_handoff::DfsReadOwner::Request {
+                    requester_node_id,
+                    request_id,
+                } = &owner
+                else {
+                    continue;
+                };
+                // The rest wait for the next pass, which has room for them.
+                if locally_authoritative.len() >= max_requests {
+                    break;
+                }
+                let current = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above")
+                    .get_namespace_request(requester_node_id, request_id)?
+                    .filter(|request| request.status == DfsNamespaceRequestStatus::Pending);
+                match current {
+                    Some(request)
+                        if self.pending_namespace_request_authority_is_local(
+                            &request,
+                            &mut shard_snapshots,
+                        ) =>
+                    {
+                        due.insert((requester_node_id.clone(), request_id.clone()));
+                        locally_authoritative_count = locally_authoritative_count.saturating_add(1);
+                        locally_authoritative.push(request);
+                    }
+                    // The request ended or no longer runs here.
+                    _ => crate::read_handoff::forget(root, &owner),
+                }
+            }
+        }
         let mut cursor = self.pending_namespace_request_recovery_cursor.take();
         let scan_started_after_cursor = cursor.is_some();
         let scan_page_entry_limit =
             max_requests.clamp(1, DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT);
         let mut scanned_pages = 0usize;
         'scan: while resumed_request.is_none()
+            && locally_authoritative.len() < max_requests
             && scanned_pages < DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT
         {
             let page = self
@@ -1561,31 +1605,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     requester_node_id: request.requester_node_id.clone(),
                     request_id: request.request_id.clone(),
                 };
-                if !shard_snapshots.contains_key(&request.file_system_id) {
-                    let shards = self
-                        .metadata_shard_config_snapshot(&request.file_system_id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    shard_snapshots.insert(request.file_system_id.clone(), shards);
+                if due.contains(&(
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                )) {
+                    continue;
                 }
-                let authority_is_local =
-                    shard_snapshots
-                        .get(&request.file_system_id)
-                        .is_some_and(|snapshot| {
-                            Self::affected_namespace_shards_from_snapshot(
-                                &request.file_system_id,
-                                &request.operation,
-                                snapshot,
-                            )
-                            .is_ok_and(|shards| {
-                                shards.iter().any(|shard| {
-                                    shard.shard_id == request.authority_shard_id.0
-                                        && shard.primary_node_id == self.node_id
-                                })
-                            })
-                        });
-                if authority_is_local {
+                if self.pending_namespace_request_authority_is_local(&request, &mut shard_snapshots)
+                {
                     locally_authoritative_count = locally_authoritative_count.saturating_add(1);
                     locally_authoritative.push(request);
                     if locally_authoritative.len() >= max_requests {
@@ -1660,6 +1687,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .take(max_requests.saturating_sub(report.scanned))
         {
             report.scanned = report.scanned.saturating_add(1);
+            let owner = crate::read_handoff::DfsReadOwner::request(
+                &request.requester_node_id,
+                &request.request_id,
+            );
+            // A request that waits for its handed-off read runs again when
+            // the answer, or the event its parked read waits for, comes.
+            if reads
+                .as_deref()
+                .is_some_and(|root| crate::read_handoff::waiting(root, &owner))
+            {
+                continue;
+            }
 
             let command = DfsNamespaceCommand {
                 request_id: request.request_id.clone(),
@@ -1670,14 +1709,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authority_shards: Vec::new(),
                 operation: request.operation.clone(),
             };
-            let attempt = self.handle_namespace_request_internal(
-                request.requester_node_id.clone(),
-                command,
-                true,
-                false,
-                None,
-                None,
-            );
+            let requester_node_id = request.requester_node_id.clone();
+            let host_reruns = self.read_handoff.host_reruns;
+            self.read_handoff.host_reruns |= reads.is_some();
+            let (attempt, handed_off) = match reads.as_deref() {
+                Some(root) => self.run_with_handed_off_reads(root, owner, |service| {
+                    service.handle_namespace_request_internal(
+                        requester_node_id,
+                        command,
+                        true,
+                        false,
+                        None,
+                        None,
+                    )
+                }),
+                None => (
+                    self.handle_namespace_request_internal(
+                        requester_node_id,
+                        command,
+                        true,
+                        false,
+                        None,
+                        None,
+                    ),
+                    false,
+                ),
+            };
+            self.read_handoff.host_reruns = host_reruns;
+            if handed_off {
+                // The request handed its read to the host and recorded nothing
+                // after it: it stays pending and runs again with the answer.
+                continue;
+            }
+            let cut_short = self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::DfsCancellationFlag::is_cancelled);
             if self.remote_namespace_phase.is_some() {
                 // Actual owned work is a yield, never a rejection diagnostic.
                 // The host retains this SAME full durable request, releases its
@@ -1702,6 +1769,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 report.resolved = report.resolved.saturating_add(1);
                 report.remaining = report.remaining.saturating_sub(1);
+                continue;
+            }
+            // A run that foreground work cancelled before it finished is no
+            // failed attempt: the request stays pending and runs again first,
+            // once the admission the cancelling work took is released.
+            if cut_short && let Some(root) = reads.as_deref() {
+                crate::read_handoff::resume(
+                    root,
+                    &crate::read_handoff::DfsReadOwner::request(
+                        &request.requester_node_id,
+                        &request.request_id,
+                    ),
+                );
                 continue;
             }
 
@@ -1732,6 +1812,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         Ok(report)
+    }
+
+    /// Whether this node is primary of the shard that admitted `request`,
+    /// so its recovery runs here.
+    fn pending_namespace_request_authority_is_local(
+        &mut self,
+        request: &crate::DfsNamespaceRequestRecord,
+        shard_snapshots: &mut BTreeMap<DfsFileSystemId, Vec<DfsMetadataShardConfig>>,
+    ) -> bool {
+        if !shard_snapshots.contains_key(&request.file_system_id) {
+            let shards = self
+                .metadata_shard_config_snapshot(&request.file_system_id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            shard_snapshots.insert(request.file_system_id.clone(), shards);
+        }
+        shard_snapshots
+            .get(&request.file_system_id)
+            .is_some_and(|snapshot| {
+                Self::affected_namespace_shards_from_snapshot(
+                    &request.file_system_id,
+                    &request.operation,
+                    snapshot,
+                )
+                .is_ok_and(|shards| {
+                    shards.iter().any(|shard| {
+                        shard.shard_id == request.authority_shard_id.0
+                            && shard.primary_node_id == self.node_id
+                    })
+                })
+            })
     }
 
     fn admit_durable_namespace_request(
@@ -4412,20 +4524,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Whether a read this service routes to `primary` waits with its lanes
-    /// released. A served request on a several-shard lease holds the lanes of
-    /// every shard this node is primary of in its filesystem, and the shard
-    /// it reads may have a lane on its primary that a request there holds
-    /// while it waits on this node. The read therefore yields to the host,
-    /// which sends it once this request's lanes and admission have ended and
-    /// re-runs the request with the answer.
+    /// released. Work that holds admission, on one shard lane, on several or
+    /// on the global lane, holds what a request on `primary` may be waiting
+    /// for while that request waits on this node, and a slow primary would
+    /// hold it for as long as it takes to answer. The read therefore yields
+    /// to the host, which sends it once this work's lanes and admission have
+    /// ended and runs the work again with the answer: a served request under
+    /// its own request id, a job step by its job.
     pub(crate) fn routed_read_waits_with_lanes_released(&self, primary: &NodeId) -> bool {
         primary != &self.node_id
             && self.transport.serves_routed_request()
             && self.publication_execution.current().is_some()
-            && self
-                .metadata_backend
-                .as_ref()
-                .is_some_and(|backend| backend.resident_selected_shard_ids().is_some())
+            && (self.read_handoff.host_reruns || self.read_handoff.job.is_some())
     }
 
     /// Forget the answers a request's yielded reads brought back once a run
@@ -4436,19 +4546,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .retain(|key, _| !key.starts_with('|') && !key.contains(&marker));
     }
 
-    /// One routed read's identity within the request it serves: the same
-    /// read on the request's re-run has the same key.
+    /// One routed read's identity within the work it serves: the same read
+    /// on the work's re-run has the same key. A job step's read belongs to
+    /// its job; a request's to its durable request, or to the served command
+    /// its host runs again.
     pub(crate) fn routed_read_key(
         &self,
         primary: &NodeId,
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<String, DfsError> {
-        let request = self
-            .namespace_execution
-            .request()
-            .map(|request| format!("{}/{}", request.requester_node_id, request.request_id))
-            .unwrap_or_default();
+        let request = match (
+            self.read_handoff.job.as_deref(),
+            self.namespace_execution.request(),
+        ) {
+            (Some(job), _) => crate::read_handoff::DfsReadOwner::Job(job.to_owned()).key_owner(),
+            (None, Some(request)) => {
+                format!("{}/{}", request.requester_node_id, request.request_id)
+            }
+            (None, None) => String::new(),
+        };
         let operation = serde_json::to_string(operation).map_err(|error| DfsError::Metadata {
             message: format!("routed read has no stable identity: {error}"),
         })?;
@@ -4488,8 +4605,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Yield one routed read to the host: it is sent to its primary once this
-    /// request's lanes and admission have ended. The returned error ends this
-    /// run; the host discards its outcome and re-runs the request.
+    /// work's lanes and admission have ended. The returned error ends this
+    /// run; the host discards its outcome and runs the work again with the
+    /// answer.
     pub(crate) fn yield_routed_read(
         &mut self,
         key: String,

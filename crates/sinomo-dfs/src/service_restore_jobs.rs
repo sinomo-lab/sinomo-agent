@@ -527,8 +527,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job.pending_frames = vec![DfsNamespaceJobFrame::ContentCopy {
             state: Box::new(state),
         }];
+        // A cancelled checkpoint is the step's cancellation, not its failure.
         self.persist_namespace_job(job)
-            .map_err(|source| copy_error(source.to_string()))?;
+            .map_err(|source| match source {
+                crate::DfsPosixError::Dfs(error) if error.is_cancellation() => error,
+                other => copy_error(other.to_string()),
+            })?;
         if let Some(latest) = self
             .metadata_backend
             .as_ref()
@@ -639,6 +643,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         Ok::<_, DfsError>(())
                     })();
                     if let Err(source) = release {
+                        // A cancelled cleanup is the step's cancellation: the
+                        // job stays Running and its pass resumes it.
+                        if source.is_cancellation() {
+                            return Err(source);
+                        }
                         tracing::warn!(job_id = %job.job_id, error = %source, "content copy source pin cleanup remains pending");
                         break;
                     }
