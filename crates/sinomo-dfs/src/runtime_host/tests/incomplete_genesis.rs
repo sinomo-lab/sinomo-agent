@@ -443,6 +443,7 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
             DfsMessageExecutionScope::ExactShard { .. }
         ));
         let mut rename = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: format!("incomplete-rename-{}", sinomo_core::Id::generate()),
             file_system_id: shard.file_system_id.clone(),
             requesting_node_id: primary.clone(),
@@ -762,6 +763,7 @@ fn native_held_genesis_preserves_unrelated_ready_scope_mutation_and_owner_comple
         let ready_root = crate::local_dfs_metadata_shard_path(native.data_dir(&primary), &ready_id);
         let ready_before = actual_frames(&ready_root);
         let request = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: format!("unrelated-ready-{}", sinomo_core::Id::generate()),
             file_system_id: target.file_system_id.clone(),
             requesting_node_id: primary.clone(),
@@ -1216,6 +1218,7 @@ fn native_component_reopen_preserves_held_genesis_until_same_owner_completion() 
         ).map_err(|error|error.to_string())?;
             assert_eq!(stamps, vec![shard.clone()]);
             let body = DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: format!("held-reopen-mkdir-{}", sinomo_core::Id::generate()),
                 file_system_id: shard.file_system_id.clone(),
                 requesting_node_id: primary.clone(),

@@ -647,6 +647,7 @@ fn a_file_sync_rerun_keeps_its_wait_deadline_and_no_later_command_inherits_it() 
             frame_id: 1,
             message_id: 1,
             message: DfsNetworkMessage::NamespaceRequest(crate::DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "file-sync-carried-deadline-lookup".into(),
                 file_system_id: crate::sifs_file_system_id(),
                 requesting_node_id: replica.clone(),

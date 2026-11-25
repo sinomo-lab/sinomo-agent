@@ -2629,6 +2629,44 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         })
     }
 
+    /// Return one cursor-bounded page of the Running namespace jobs of one
+    /// exact local shard, in job id order. `None` when this backend does not
+    /// hold `shard_id`.
+    fn running_namespace_jobs_on_shard_page(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<Option<DfsNamespaceJobPage>> {
+        Ok(None)
+    }
+
+    /// Return one cursor-bounded page of the Running namespace jobs of every
+    /// local copy, in job id order.
+    fn running_namespace_jobs_page(
+        &self,
+        _after: Option<&DfsNamespaceJobPageCursor>,
+        _max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        Ok(DfsNamespaceJobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        })
+    }
+
+    /// The live prepares of one exact local shard; empty when this backend
+    /// does not hold `shard_id`.
+    fn prepared_operations_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<crate::DfsPreparedOperationRecord>> {
+        Ok(self
+            .list_prepared_operations()?
+            .into_iter()
+            .filter(|record| &record.shard_id == shard_id)
+            .collect())
+    }
+
     /// Read all journal entries after `after_sequence`.
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
 
@@ -2804,9 +2842,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// complete active shard configuration before clearing the pending freeze
     /// or running append-producing recovery. The calling backend instance is
     /// rebound to that exact generation; independently opened stale instances
-    /// stay fenced until they separately prove and observe it. The exact
-    /// prefix checked by the caller is revalidated under the refreshed writer
-    /// before epoch binding, marker changes, rebind checkpointing or explicit recovery.
+    /// stay fenced until they separately prove and observe it. Under the
+    /// refreshed writer, before epoch binding, marker changes, rebind
+    /// checkpointing or explicit recovery, the head must be the prefix the
+    /// caller checked or its exact journal extension, and the rebind ends in
+    /// that same writer hold.
     fn clear_metadata_shard_membership_handoff_freeze(
         &mut self,
         _shard_id: &DfsMetadataShardId,

@@ -121,6 +121,54 @@ pub(crate) fn metadata_prefix_proof_after_exact_frame(
     ))
 }
 
+/// Whether `head` is `ancestor` itself or `ancestor` extended by the shard's
+/// journal frames after it, each batch read through `read_batch` from the
+/// sequence it follows. A missing entry, a sequence gap or a divergent digest
+/// is no descent.
+pub(crate) fn metadata_prefix_descends<E: From<MetadataBackendError>>(
+    backend: &dyn crate::DfsMetadataBackend,
+    shard_id: &DfsMetadataShardId,
+    ancestor: &DfsMetadataPrefixProof,
+    head: &DfsMetadataPrefixProof,
+    mut read_batch: impl FnMut(u64) -> std::result::Result<Option<DfsMetadataJournalBatch>, E>,
+) -> std::result::Result<bool, E> {
+    if !ancestor.is_well_formed()
+        || !head.is_well_formed()
+        || head.journal_sequence < ancestor.journal_sequence
+    {
+        return Ok(false);
+    }
+    let mut reconstructed = ancestor.clone();
+    while reconstructed.journal_sequence < head.journal_sequence {
+        let Some(batch) = read_batch(reconstructed.journal_sequence)? else {
+            return Ok(false);
+        };
+        if batch.entries.is_empty() || batch.shard_id != *shard_id {
+            return Ok(false);
+        }
+        let frames = backend.journal_frames_for_batch(&batch)?;
+        if frames.len() != batch.entries.len() {
+            return Ok(false);
+        }
+        for (entry, frame) in batch.entries.iter().zip(frames) {
+            if entry.shard_id != *shard_id
+                || entry.sequence != reconstructed.journal_sequence.checked_add(1).unwrap_or(0)
+                || entry.sequence > head.journal_sequence
+                || frame.sequence != entry.sequence
+            {
+                return Ok(false);
+            }
+            reconstructed = metadata_prefix_proof_after_exact_frame(
+                &reconstructed,
+                entry,
+                shard_id,
+                &frame.exact_bytes,
+            )?;
+        }
+    }
+    Ok(reconstructed == *head)
+}
+
 impl DfsMetadataJournalFrame<'static> {
     pub(crate) fn local(
         shard_id: &DfsMetadataShardId,

@@ -1612,6 +1612,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 vec![current.clone()]
             };
         let request_id = self.next_request_id();
+        let storage_revision = self.storage_record_revision(&authority_shards);
         let command = DfsNamespaceCommand {
             request_id: request_id.clone(),
             file_system_id: query.file_system_id.clone(),
@@ -1619,6 +1620,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             include_metadata_journal_batches: false,
             metadata_journal_after_sequences: Vec::new(),
             authority_shards,
+            storage_revision,
             operation: DfsNamespaceOperation::MetadataQuery {
                 query: query.clone(),
             },

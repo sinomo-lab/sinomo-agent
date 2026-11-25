@@ -265,9 +265,34 @@ impl LocalSobjMetadataBackend {
                 self.journal_last_sequence()
             )));
         }
-        if !checked_prefix.is_well_formed() || rebound_prefix_proof != *checked_prefix {
+        // A writer already bound to the successor epoch may have appended
+        // since the caller's check. The head this hold found must be the
+        // checked prefix or its journal extension; nothing appends until the
+        // rebind below ends the hold.
+        if !crate::metadata_journal::metadata_prefix_descends(
+            self,
+            &self.shard_id,
+            checked_prefix,
+            &rebound_prefix_proof,
+            |after| {
+                // The durable journal, read under the writer this rebind
+                // already holds.
+                let entries = crate::metadata_journal::durable_journal_entries_since_limited(
+                    &self.root,
+                    after,
+                    crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                )?;
+                crate::metadata_journal::bounded_metadata_journal_batch(
+                    self.shard_id.clone(),
+                    after,
+                    entries,
+                    crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                    crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+                )
+            },
+        )? {
             return Err(MetadataBackendError::prefix_mismatch(format!(
-                "metadata shard {} membership handoff {} prefix changed before writer rebind: checked sequence {} current sequence {}",
+                "metadata shard {} membership handoff {} head does not descend from its checked prefix: checked sequence {} current sequence {}",
                 self.shard_id.0,
                 handoff_id,
                 checked_prefix.journal_sequence,

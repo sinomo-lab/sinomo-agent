@@ -2194,7 +2194,7 @@ fn an_uncontended_replica_answer_is_admitted_without_checking_its_view() {
 }
 
 #[test]
-fn completed_rebind_rejects_a_moved_prefix_before_binding_then_accepts_current_ancestry() {
+fn completed_rebind_refuses_a_foreign_prefix_and_binds_a_moved_one_in_one_hold() {
     let fixture = RetryFixture::new("completed-rebind-moved-prefix");
     let (data_dir, _paths, original_context) = current_direct_replica_context(&fixture);
     let shard_id = DfsMetadataShardId::new(&original_context.shard.shard_id);
@@ -2256,14 +2256,22 @@ fn completed_rebind_rejects_a_moved_prefix_before_binding_then_accepts_current_a
         .unwrap()
         .backend_instance_authority_epoch;
     let marker_before = prior.metadata_shard_write_freeze(&shard_id).unwrap();
+    // A checked prefix the head does not descend from is refused under the
+    // writer, before anything binds.
+    let forged = crate::DfsMetadataPrefixProof::from_digest(
+        checked_prefix.journal_sequence,
+        format!("dfs-metadata-prefix-v2:blake3:{:064x}", 0),
+    )
+    .expect("well-formed forged prefix");
+    assert_ne!(forged, checked_prefix);
     let error = prior
         .clear_metadata_shard_membership_handoff_freeze(
             &shard_id,
             &proof.handoff_id,
             &active,
-            &checked_prefix,
+            &forged,
         )
-        .expect_err("old checked prefix must reject under the refreshed actual writer");
+        .expect_err("a head that does not descend from the checked prefix is refused");
     assert!(matches!(
         error,
         crate::MetadataBackendError::Rejected {
@@ -2295,19 +2303,21 @@ fn completed_rebind_rejects_a_moved_prefix_before_binding_then_accepts_current_a
         .unwrap();
     assert!(
         current_prefix.journal_sequence > checked_prefix.journal_sequence,
-        "the real writer suffix caused the stale-cut rejection"
+        "the real writer suffix moved the head past the checked prefix"
     );
     let head_after_rejection = prior.journal_last_sequence();
+    // The genuine suffix extends the checked prefix: the rebind proves that
+    // under the writer and binds the current head in the same hold.
     assert!(
-        crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
-            &mut prior,
-            &fixture.remote,
-            &active,
-            None,
-            Some(&proof),
-        )
-        .unwrap(),
-        "the same actual completion proof validates the current retained ancestry"
+        prior
+            .clear_metadata_shard_membership_handoff_freeze(
+                &shard_id,
+                &proof.handoff_id,
+                &active,
+                &checked_prefix,
+            )
+            .unwrap(),
+        "the head extending the checked prefix binds in one writer hold"
     );
     assert_eq!(
         DfsMetadataBackend::metadata_prefix_proof(&prior, &shard_id).unwrap(),

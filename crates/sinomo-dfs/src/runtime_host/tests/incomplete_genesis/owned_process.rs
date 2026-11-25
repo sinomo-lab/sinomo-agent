@@ -982,6 +982,7 @@ fn retained_default_genesis_process_child() -> TestResult<()> {
     let request = command(
         &primary,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: format!("retained-genesis-mkdir-{}", sinomo_core::Id::generate()),
             file_system_id: shard.file_system_id.clone(),
             requesting_node_id: primary.clone(),

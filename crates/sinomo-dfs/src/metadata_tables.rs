@@ -6,6 +6,7 @@
 
 mod move_destination_reservations;
 mod parent_counts;
+mod running_jobs;
 
 use std::borrow::Cow;
 #[cfg(test)]
@@ -106,6 +107,9 @@ pub(crate) struct DfsMetadataTables {
     /// Nonserialized running directory-move destination reservations by
     /// reserved subtree root, derived only from durable jobs.
     move_destination_reservations: BTreeMap<(DfsFileSystemId, String), BTreeSet<String>>,
+    /// Nonserialized ids of the Running namespace jobs, derived only from
+    /// durable jobs.
+    running_namespace_jobs: BTreeSet<String>,
     pub(crate) namespace_job_receipts: BTreeMap<String, DfsNamespaceJobReceipt>,
     pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
     pub(crate) namespace_request_receipts: BTreeMap<(NodeId, String), DfsNamespaceRequestReceipt>,
@@ -2504,11 +2508,13 @@ impl DfsMetadataTables {
                 self.namespace_jobs.insert(job_id.clone(), job);
                 self.insert_parent_count_index(&job_id);
                 self.insert_move_destination_reservation_index(&job_id);
+                self.index_running_namespace_job(&job_id);
             }
             DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } => {
                 self.remove_parent_count_index(&receipt.job_id);
                 self.remove_move_destination_reservation_index(&receipt.job_id);
                 self.namespace_jobs.remove(&receipt.job_id);
+                self.index_running_namespace_job(&receipt.job_id);
                 self.namespace_job_receipts
                     .insert(receipt.job_id.clone(), receipt);
             }
@@ -3265,6 +3271,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
         tables.rebuild_parent_count_index();
         tables.rebuild_move_destination_reservation_index();
+        tables.rebuild_running_namespace_job_index();
         rollback_map(
             &mut tables.namespace_job_receipts,
             self.namespace_job_receipts,

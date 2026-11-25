@@ -1164,6 +1164,7 @@ fn routed_inline_blob_records_requester_receipt_without_restaging() {
             910,
             911,
             DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                storage_revision: None,
                 publication: Default::default(),
                 patch: None,
                 request_id,

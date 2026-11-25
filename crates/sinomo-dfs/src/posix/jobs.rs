@@ -37,6 +37,46 @@ pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> b
     )
 }
 
+/// The local copies whose Running jobs a maintenance pass resumes.
+enum DfsJobResumeScope {
+    /// Without cluster configuration this node is the only authority of
+    /// every copy it holds.
+    Local,
+    /// The SIFS shards the configuration names this node primary of, out of
+    /// that configuration's shards.
+    Primary {
+        shards: Vec<crate::DfsMetadataShardConfig>,
+        primaries: Vec<crate::DfsMetadataShardId>,
+    },
+}
+
+impl DfsJobResumeScope {
+    /// The shards to page, in order; `None` pages every local copy.
+    fn shards(&self) -> Vec<Option<crate::DfsMetadataShardId>> {
+        match self {
+            Self::Local => vec![None],
+            Self::Primary { primaries, .. } => primaries.iter().cloned().map(Some).collect(),
+        }
+    }
+
+    /// Whether `job`'s root lies in a shard of this scope.
+    fn resumes(&self, job: &DfsNamespaceJobRecord) -> bool {
+        let Self::Primary { shards, primaries } = self else {
+            return true;
+        };
+        crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &job.file_system_id,
+            shards,
+            &job.root_path,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|shard| {
+            primaries.contains(&crate::DfsMetadataShardId::new(shard.shard_id.clone()))
+        })
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_clear_dir_recursive(&mut self, path: &str) -> Result<()> {
         let _namespace_plan = self.namespace_execution.begin_planning();
@@ -149,15 +189,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         if matches!(&job.kind, DfsNamespaceJobKind::RenameDirectory) {
+            // Only the job's own shard's primary runs it, and recovers its
+            // prepares.
+            let shard = self.namespace_job_primary_shard(&job)?;
             // A preempted batch may have sealed moves without updating its job
-            // cursor. Recover those exact native bodies before observing the
-            // next children, then reload the job from the recovered generation.
+            // cursor. Recover those exact native bodies of the job's shard
+            // before observing the next children, then reload the job from the
+            // recovered generation.
             let cancellation = self.cancellation.clone();
-            let pass = self.recover_durable_namespace_prepares_pass(&|| {
+            let cancelled = || {
                 cancellation
                     .as_ref()
                     .is_some_and(crate::DfsCancellationFlag::is_cancelled)
-            })?;
+            };
+            let pass = match shard {
+                Some(shard) => self.recover_durable_namespace_prepares_on_shard_pass(
+                    &crate::DfsMetadataShardId::new(shard.shard_id),
+                    &cancelled,
+                )?,
+                None => self.recover_durable_namespace_prepares_pass(&cancelled)?,
+            };
             // A sealed move that has not committed must not be planned over;
             // the job stays running and resumes once it commits.
             if let Some(unknown) = pass.first_unknown {
@@ -203,8 +254,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// One maintenance pass over the Running namespace jobs of the shards
+    /// this node is primary of, at most `max_jobs` of them, each for at most
+    /// `max_steps_per_job` steps. Without cluster configuration this node is
+    /// the only authority of its copies and resumes the jobs of every copy.
+    /// A configuration the pass cannot read names no primary: the pass
+    /// resumes nothing, and the next publication of the configuration
+    /// requests a jobs turn. Each job's outcome is its own (see
+    /// [`Self::resume_namespace_job_in_pass`]).
     pub fn posix_resume_namespace_jobs_bounded(
         &mut self,
+        max_jobs: usize,
+        max_steps_per_job: usize,
+    ) -> Result<DfsNamespaceJobMaintenanceReport> {
+        self.posix_resume_namespace_jobs_on_shards_bounded(None, max_jobs, max_steps_per_job)
+    }
+
+    /// [`Self::posix_resume_namespace_jobs_bounded`], paging only the shards
+    /// of `only` among those this node is primary of: a jobs turn's pass. A
+    /// job whose handed-off read came back runs first wherever its shard is.
+    pub(crate) fn posix_resume_namespace_jobs_on_shards_bounded(
+        &mut self,
+        only: Option<&std::collections::BTreeSet<crate::DfsMetadataShardId>>,
         max_jobs: usize,
         max_steps_per_job: usize,
     ) -> Result<DfsNamespaceJobMaintenanceReport> {
@@ -212,13 +283,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.metadata_backend.is_none() {
             return Ok(DfsNamespaceJobMaintenanceReport::default());
         }
+        let mut report = DfsNamespaceJobMaintenanceReport::default();
+        let Some(scope) = self.namespace_job_resume_scope() else {
+            return Ok(report);
+        };
         // Under a maintenance host that sends them, a job step's reads on
         // other nodes' primaries are handed off rather than waited for.
         let reads = self.handed_off_reads_root();
-        // A shard's primary resumes its own jobs; a local copy of a shard this
-        // node does not replicate is not kept current.
-        let replicated = self.locally_replicated_sifs_metadata_shards();
-        let mut report = DfsNamespaceJobMaintenanceReport::default();
         // A job whose handed-off read came back runs first, with its answer.
         let mut ran = std::collections::BTreeSet::new();
         if let Some(root) = reads.as_deref() {
@@ -236,14 +307,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if report.resumed_job_count >= max_jobs {
                     break;
                 }
-                match self.namespace_job(job_id)? {
-                    Some(job)
-                        if job.status == DfsNamespaceJobStatus::Running
-                            && !self.path_in_unreplicated_sifs_shard(
-                                replicated.as_ref(),
-                                &job.file_system_id,
-                                &job.root_path,
-                            )? =>
+                // A row this pass cannot read runs, if it still runs here,
+                // when its shard's page reaches it.
+                match self.namespace_job(job_id) {
+                    Ok(Some(job))
+                        if job.status == DfsNamespaceJobStatus::Running && scope.resumes(&job) =>
                     {
                         ran.insert(job_id.clone());
                         self.resume_namespace_job_in_pass(
@@ -258,55 +326,111 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        let mut cursor = None;
-        loop {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .list_namespace_jobs_page(
-                    cursor.as_ref(),
-                    POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
-                )?;
-            report.scanned_job_count = report.scanned_job_count.saturating_add(page.jobs.len());
-            for job in page.jobs {
-                if job.status != DfsNamespaceJobStatus::Running
-                    || ran.contains(&job.job_id)
-                    || self.path_in_unreplicated_sifs_shard(
-                        replicated.as_ref(),
-                        &job.file_system_id,
-                        &job.root_path,
-                    )?
-                {
-                    continue;
-                }
-                // A job that waits for its handed-off read runs again when
-                // the answer, or the event its parked read waits for, comes.
-                if report.resumed_job_count >= max_jobs
-                    || reads.as_deref().is_some_and(|root| {
-                        crate::read_handoff::waiting(
-                            root,
-                            &crate::read_handoff::DfsReadOwner::Job(job.job_id.clone()),
-                        )
-                    })
-                {
-                    report.remaining_running_job_count =
-                        report.remaining_running_job_count.saturating_add(1);
-                    continue;
-                }
-                self.resume_namespace_job_in_pass(
-                    job,
-                    max_steps_per_job,
-                    reads.as_deref(),
-                    &mut report,
-                )?;
+        for shard in scope.shards() {
+            if let (Some(only), Some(shard)) = (only, &shard)
+                && !only.contains(shard)
+            {
+                continue;
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
+            let mut cursor = None;
+            loop {
+                let backend = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above");
+                let page = match &shard {
+                    Some(shard) => {
+                        match backend.running_namespace_jobs_on_shard_page(
+                            shard,
+                            cursor.as_ref(),
+                            POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
+                        ) {
+                            Ok(Some(page)) => page,
+                            // This node holds no copy of the shard.
+                            Ok(None) => break,
+                            // A closed copy runs no jobs; its activation
+                            // brings them back to a pass.
+                            Err(error)
+                                if crate::metadata_sharded_backend::metadata_shard_storage_is_closed(
+                                    &error,
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    None => backend.running_namespace_jobs_page(
+                        cursor.as_ref(),
+                        POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
+                    )?,
+                };
+                report.scanned_job_count = report.scanned_job_count.saturating_add(page.jobs.len());
+                for job in page.jobs {
+                    if job.status != DfsNamespaceJobStatus::Running || ran.contains(&job.job_id) {
+                        continue;
+                    }
+                    // A job that waits for its handed-off read runs again when
+                    // the answer, or the event its parked read waits for, comes.
+                    if report.resumed_job_count >= max_jobs
+                        || reads.as_deref().is_some_and(|root| {
+                            crate::read_handoff::waiting(
+                                root,
+                                &crate::read_handoff::DfsReadOwner::Job(job.job_id.clone()),
+                            )
+                        })
+                    {
+                        report.remaining_running_job_count =
+                            report.remaining_running_job_count.saturating_add(1);
+                        continue;
+                    }
+                    self.resume_namespace_job_in_pass(
+                        job,
+                        max_steps_per_job,
+                        reads.as_deref(),
+                        &mut report,
+                    )?;
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
         }
         Ok(report)
+    }
+
+    /// The shards whose Running jobs this node's maintenance pass resumes:
+    /// those its configuration names it primary of and its resident lease
+    /// holds. `None` when the configuration cannot be read. The pass then
+    /// resumes nothing, and records that for this node, so the next
+    /// publication of the configuration requests a jobs turn. The record is
+    /// made before the configuration is read again: a publication that
+    /// comes between the two reads is seen by the second one or takes the
+    /// record.
+    fn namespace_job_resume_scope(&mut self) -> Option<DfsJobResumeScope> {
+        let file_system_id = sifs_file_system_id();
+        let shards = match self.metadata_shard_config_snapshot(&file_system_id) {
+            Ok(shards) => shards,
+            Err(_) => {
+                crate::maintenance::job_triggers::note_configuration_unreadable(&self.node_id);
+                let shards = self.metadata_shard_config_snapshot(&file_system_id).ok()?;
+                crate::maintenance::job_triggers::take_configuration_unreadable(&self.node_id);
+                shards
+            }
+        };
+        let Some(shards) = shards else {
+            return Some(DfsJobResumeScope::Local);
+        };
+        let primaries = shards
+            .iter()
+            .filter(|shard| {
+                shard.primary_node_id == self.node_id
+                    && !self.metadata_lease_omits_shard(&shard.shard_id)
+            })
+            .map(|shard| crate::DfsMetadataShardId::new(shard.shard_id.clone()))
+            .collect();
+        Some(DfsJobResumeScope::Primary { shards, primaries })
     }
 
     /// Run one job of a maintenance pass and record its outcome in `report`.
@@ -320,6 +444,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         report: &mut DfsNamespaceJobMaintenanceReport,
     ) -> Result<()> {
         report.resumed_job_count = report.resumed_job_count.saturating_add(1);
+        self.read_handoff.rerun = false;
         let outcome = match reads {
             Some(root) => {
                 let owner = crate::read_handoff::DfsReadOwner::Job(job.job_id.clone());
@@ -348,8 +473,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cancellation
             .as_ref()
             .is_some_and(crate::DfsCancellationFlag::is_cancelled);
+        // A step whose park met an activation published before the park was
+        // recorded runs again first, too.
+        let rerun = std::mem::take(&mut self.read_handoff.rerun);
         let resume = |job_id: &str| {
-            if cut_short && let Some(root) = reads {
+            if (cut_short || rerun)
+                && let Some(root) = reads
+            {
                 crate::read_handoff::resume(
                     root,
                     &crate::read_handoff::DfsReadOwner::Job(job_id.to_owned()),
@@ -399,14 +529,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }));
                     }
                     self.pending_namespace_request_recovery = Some(Box::new(request));
+                    self.pending_namespace_job_continuation = Some(job.job_id.clone());
                     return Err(error);
                 }
                 let reason = error.to_string();
                 let cancelled = cut_short
                     || matches!(&error, DfsPosixError::Dfs(error) if error.is_cancellation());
-                let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
+                let latest = match self.namespace_job(&job.job_id) {
+                    Ok(latest) => latest.unwrap_or(job),
+                    Err(read) => {
+                        // What the step left is unknown here; the row keeps
+                        // whatever it recorded.
+                        report.remaining_running_job_count =
+                            report.remaining_running_job_count.saturating_add(1);
+                        report.failures.push(DfsNamespaceJobFailure {
+                            job_id: job.job_id,
+                            kind: job.kind,
+                            reason: format!("{reason}; its row could not be read again: {read}"),
+                        });
+                        return Ok(());
+                    }
+                };
                 if latest.status == DfsNamespaceJobStatus::Running {
                     resume(&latest.job_id);
+                    // A step another move's guard or a fence refused as busy,
+                    // and that does not wait for a shard's activation, runs
+                    // again on the end that clears it.
+                    if !cancelled
+                        && matches!(&error, DfsPosixError::Dfs(DfsError::Busy { .. }))
+                        && crate::maintenance::storage_waits::job_storage_waits(
+                            &self.node_id,
+                            &latest,
+                        )
+                        .is_empty()
+                        && let Some(root) = reads
+                    {
+                        crate::maintenance::job_claims::rerun_on_busy_release(
+                            &self.node_id,
+                            root.to_path_buf(),
+                            crate::read_handoff::DfsReadOwner::Job(latest.job_id.clone()),
+                        );
+                    }
                 }
                 match latest.status {
                     DfsNamespaceJobStatus::Completed => {
@@ -422,6 +585,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 DfsPosixError::Dfs(
                                     crate::DfsError::Cancelled { .. }
                                         | crate::DfsError::MetadataCommitOutcomeUnknown { .. }
+                                        | crate::DfsError::StaleOwnerEpoch { .. }
                                 )
                             ) =>
                     {
@@ -429,13 +593,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             report.remaining_running_job_count.saturating_add(1);
                     }
                     DfsNamespaceJobStatus::Running => {
-                        let failed = self.fail_namespace_job(latest, reason.clone())?;
-                        report.failed_job_count = report.failed_job_count.saturating_add(1);
-                        report.failures.push(DfsNamespaceJobFailure {
-                            job_id: failed.job_id,
-                            kind: failed.kind,
-                            reason,
-                        });
+                        self.settle_namespace_job_error(latest, reason, report);
                     }
                     DfsNamespaceJobStatus::Failed => {
                         report.failed_job_count = report.failed_job_count.saturating_add(1);
@@ -449,6 +607,61 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(())
+    }
+
+    /// The outcome of a Running job whose step ended with the error
+    /// `reason` that is neither a cancellation nor an unknown outcome. The
+    /// job fails only while this node is still its shard's primary: once
+    /// authority moved, the job stays Running for the new primary. A failure
+    /// this node cannot record leaves the job Running, and is the job's line
+    /// in `report`; the pass goes on either way.
+    fn settle_namespace_job_error(
+        &mut self,
+        job: DfsNamespaceJobRecord,
+        reason: String,
+        report: &mut DfsNamespaceJobMaintenanceReport,
+    ) {
+        let unrecorded = |job: DfsNamespaceJobRecord,
+                          report: &mut DfsNamespaceJobMaintenanceReport,
+                          why: String| {
+            report.remaining_running_job_count =
+                report.remaining_running_job_count.saturating_add(1);
+            report.failures.push(DfsNamespaceJobFailure {
+                job_id: job.job_id,
+                kind: job.kind,
+                reason: why,
+            });
+        };
+        match self.namespace_job_primary_shard(&job) {
+            Ok(_) => {}
+            Err(DfsPosixError::Dfs(crate::DfsError::StaleOwnerEpoch { .. })) => {
+                report.remaining_running_job_count =
+                    report.remaining_running_job_count.saturating_add(1);
+                return;
+            }
+            Err(check) => {
+                return unrecorded(
+                    job,
+                    report,
+                    format!("{reason}; whether this node still runs the job is unknown: {check}"),
+                );
+            }
+        }
+        match self.fail_namespace_job(job.clone(), reason.clone()) {
+            Ok(failed) => {
+                report.failed_job_count = report.failed_job_count.saturating_add(1);
+                report.failures.push(DfsNamespaceJobFailure {
+                    job_id: failed.job_id,
+                    kind: failed.kind,
+                    reason,
+                });
+            }
+            Err(record) => unrecorded(
+                job,
+                report,
+                format!("{reason}; recording the failure did not complete: {record}"),
+            ),
+        }
     }
 
     pub fn posix_rename_directory_bounded(
@@ -703,8 +916,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if ended {
             // A conversion of a shard the job touched may wait on it.
             self.note_namespace_job_ended(job);
+            // So may a job step another job's move refused as busy.
+            crate::maintenance::job_claims::note_busy_wait_event(&self.node_id);
         }
         Ok(())
+    }
+
+    /// This driver's claim on the step of the job `job_id` (see
+    /// `maintenance/job_claims.rs`). While another driver's step holds it, a
+    /// run maintenance makes leaves its owner to the claim's release and
+    /// ends with a cancellation, which leaves the job and its request as they
+    /// are; a served request hands the wait to its host; and a caller without
+    /// a host waits in place.
+    pub(crate) fn claim_namespace_job_step(
+        &mut self,
+        job_id: &str,
+    ) -> Result<crate::maintenance::job_claims::DfsJobStepClaim> {
+        use crate::maintenance::job_claims;
+        loop {
+            if let Some(claim) = job_claims::try_claim(&self.node_id, job_id) {
+                return Ok(claim);
+            }
+            if let Some(root) = self.handed_off_reads_root() {
+                let owner = match (
+                    self.read_handoff.job.as_deref(),
+                    self.namespace_execution.request(),
+                ) {
+                    (Some(job), _) => crate::read_handoff::DfsReadOwner::Job(job.to_owned()),
+                    (None, Some(request)) => crate::read_handoff::DfsReadOwner::request(
+                        &request.requester_node_id,
+                        &request.request_id,
+                    ),
+                    (None, None) => crate::read_handoff::DfsReadOwner::Job(job_id.to_owned()),
+                };
+                let request = matches!(owner, crate::read_handoff::DfsReadOwner::Request { .. });
+                if !job_claims::rerun_on_release(&self.node_id, job_id, root, owner) {
+                    continue;
+                }
+                self.read_handoff.awaits_job_claim |= request;
+                return Err(DfsPosixError::Dfs(DfsError::Cancelled {
+                    operation: "namespace job step held by another driver",
+                }));
+            }
+            if self.transport.serves_routed_request() && self.remote_namespace_phase.is_none() {
+                self.remote_namespace_phase = Some(Box::new(
+                    crate::source_adoption::RemoteNamespacePhase::AwaitJobStepClaim(
+                        crate::source_adoption::AwaitJobStepClaimPhase {
+                            node_id: self.node_id.clone(),
+                            job_id: job_id.to_owned(),
+                            deadline: self.transport.operation_deadline(),
+                        },
+                    ),
+                ));
+                return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: "namespace job step waits for another driver's step".into(),
+                }));
+            }
+            job_claims::wait_for_release(&self.node_id, job_id, None);
+        }
     }
 
     pub(super) fn fail_namespace_job(
@@ -719,6 +988,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(job)
     }
 
+    /// The shard of `job`'s root, which runs the job: a node that is not
+    /// that shard's current primary refuses with
+    /// [`crate::DfsError::StaleOwnerEpoch`] before the job reads or writes
+    /// anything, and the job stays Running for the primary. A replica keeps
+    /// the job's row as its failover copy; once it is primary at a later
+    /// epoch, the same row runs here. `None` without cluster configuration,
+    /// where this node is the only authority.
+    pub(crate) fn namespace_job_primary_shard(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+    ) -> Result<Option<crate::DfsMetadataShardConfig>> {
+        let shards =
+            self.namespace_shards_for_exact_paths(&job.file_system_id, [job.root_path.as_str()])?;
+        if let Some(shard) = shards
+            .iter()
+            .find(|shard| shard.primary_node_id != self.node_id)
+        {
+            return Err(DfsPosixError::Dfs(DfsError::StaleOwnerEpoch {
+                file_system_id: job.file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id.clone(),
+                epoch: shard.epoch,
+            }));
+        }
+        Ok(shards.into_iter().next())
+    }
+
     fn run_clear_dir_recursive_job_batch(
         &mut self,
         mut job: DfsNamespaceJobRecord,
@@ -726,6 +1022,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsNamespaceJobRecord> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if job.status == DfsNamespaceJobStatus::Completed {
+            return Ok(job);
+        }
+        self.namespace_job_primary_shard(&job)?;
+        let _claim = self.claim_namespace_job_step(&job.job_id)?;
+        // Another driver may have stepped the job before this one claimed it.
+        if let Some(current) = self.namespace_job(&job.job_id)? {
+            job = current;
+        }
+        if job.status != DfsNamespaceJobStatus::Running {
             return Ok(job);
         }
         if max_steps == 0 {
@@ -959,6 +1264,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsNamespaceJobRecord> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if job.status == DfsNamespaceJobStatus::Completed {
+            return Ok(job);
+        }
+        self.namespace_job_primary_shard(&job)?;
+        let _claim = self.claim_namespace_job_step(&job.job_id)?;
+        // Another driver may have stepped the job before this one claimed it.
+        if let Some(current) = self.namespace_job(&job.job_id)? {
+            job = current;
+        }
+        if job.status != DfsNamespaceJobStatus::Running {
             return Ok(job);
         }
         if max_steps == 0 {

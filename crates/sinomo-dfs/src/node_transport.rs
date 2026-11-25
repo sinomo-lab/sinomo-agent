@@ -6685,6 +6685,7 @@ mod tests {
             frame_id,
             message_id: frame_id,
             message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: format!("namespace_request_{frame_id}"),
                 file_system_id: sifs_file_system_id(),
                 requesting_node_id: source.clone(),
@@ -6737,6 +6738,7 @@ mod tests {
             frame_id,
             message_id: frame_id,
             message: DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+                storage_revision: None,
                 publication: Default::default(),
                 patch: None,
                 request_id: format!("write_request_{frame_id}"),

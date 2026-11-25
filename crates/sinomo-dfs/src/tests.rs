@@ -29,6 +29,7 @@ fn test_dfs_lookup_routed_message(
         frame_id,
         frame_id,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            storage_revision: None,
             request_id: format!("dfs_test_lookup_{frame_id}"),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: source_node_id.clone(),
@@ -148,6 +149,7 @@ fn test_routed_write_command(
     object_id: &DfsObjectId,
 ) -> DfsDistributedWriteCommand {
     DfsDistributedWriteCommand {
+        storage_revision: None,
         publication: Default::default(),
         patch: None,
         request_id: request_id.to_string(),
@@ -1595,6 +1597,7 @@ mod durability_barrier_resend;
 mod effect_publication;
 mod cross_shard;
 
+mod job_resume;
 mod locks;
 mod maintenance;
 mod metadata_commit_delivery;

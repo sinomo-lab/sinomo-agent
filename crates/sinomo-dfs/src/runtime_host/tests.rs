@@ -1946,6 +1946,7 @@ fn placement_and_promotions_wait_for_repairs_but_user_requests_still_preempt() {
     let node = NodeId::from_legacy_named("placement_priority_node").unwrap();
     let mut message =
         sinomo_dfs::DfsNetworkMessage::NamespaceRequest(sinomo_dfs::DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "placement-poll".into(),
             file_system_id: sinomo_dfs::sifs_file_system_id(),
             requesting_node_id: node.clone(),
@@ -4056,6 +4057,7 @@ fn test_dfs_lookup_routed_message(
     path: &str,
 ) -> DfsRoutedMessage {
     let message = DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+        storage_revision: None,
         request_id: format!("daemon_dfs_lookup_{frame_id}"),
         file_system_id: sinomo_dfs::sifs_file_system_id(),
         requesting_node_id: source_node_id.clone(),
@@ -4144,6 +4146,7 @@ fn test_dfs_write_routed_message(
         tombstone_provenance: None,
     };
     let message = DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+        storage_revision: None,
         publication: Default::default(),
         patch: None,
         request_id: format!("daemon_dfs_write_{frame_id}"),
@@ -9767,6 +9770,7 @@ fn daemon_dfs_exact_service_lane_requires_complete_single_shard_state() {
                 frame_id: 1,
                 message_id: 1,
                 message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    storage_revision: None,
                     request_id: "dfs-exact-scope-namespace".to_string(),
                     file_system_id: file_system_id.clone(),
                     requesting_node_id: source.clone(),

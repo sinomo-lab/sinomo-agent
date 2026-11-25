@@ -145,6 +145,7 @@ fn guard_query(local: &NodeId) -> DfsRoutedMessage {
         frame_id: 7,
         message_id: 7,
         message: dfs::DfsNetworkMessage::NamespaceRequest(dfs::DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "guard-query".into(),
             file_system_id: dfs::sifs_file_system_id(),
             requesting_node_id: local.clone(),

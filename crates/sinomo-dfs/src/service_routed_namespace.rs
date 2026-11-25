@@ -1205,6 +1205,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStableNamespaceOperationReconciliation, DfsError> {
         let file_system_id = stable_namespace_operation_file_system_id(operation);
         let mut command = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: operation_id.to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: requester_node_id.clone(),
@@ -1401,6 +1402,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         if let DfsStableNamespaceOperationReconciliation::Applied { receipt } = &reconciliation {
             let command = DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: operation_id.to_string(),
                 file_system_id: file_system_id.clone(),
                 requesting_node_id: requester_node_id.clone(),
@@ -1701,6 +1703,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
 
             let command = DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: request.request_id.clone(),
                 file_system_id: request.file_system_id.clone(),
                 requesting_node_id: request.requester_node_id.clone(),
@@ -1739,6 +1742,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if handed_off {
                 // The request handed its read to the host and recorded nothing
                 // after it: it stays pending and runs again with the answer.
+                continue;
+            }
+            if std::mem::take(&mut self.read_handoff.awaits_job_claim) {
+                // Another driver steps its job: the request stays pending,
+                // and the claim's release marks it due.
                 continue;
             }
             let cut_short = self
@@ -1812,6 +1820,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         Ok(report)
+    }
+
+    /// End the continuation of the pending `request`, whose remote phase
+    /// failed definitely with `error`: the request is answered with the
+    /// failure, as its own run would have been had it sent the phase in
+    /// place. A request no longer pending here keeps the answer it has.
+    pub(crate) fn answer_failed_namespace_request_continuation(
+        &mut self,
+        request: &crate::DfsNamespaceRequestRecord,
+        error: &DfsError,
+    ) -> Result<(), DfsError> {
+        let Some(current) = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "namespace continuation lost its durable request backend".into(),
+            })?
+            .get_namespace_request(&request.requester_node_id, &request.request_id)?
+        else {
+            return Ok(());
+        };
+        if current.status != DfsNamespaceRequestStatus::Pending
+            || !request.matches_immutable_payload(&current)
+        {
+            return Ok(());
+        }
+        let failure = posix_model::DfsPosixError::Dfs(error.clone());
+        let shard_id = current.authority_shard_id.clone();
+        self.complete_durable_namespace_request(
+            &shard_id,
+            current,
+            DfsNamespaceResult::Rejected {
+                current_primary_node_id: None,
+                posix_error: posix_model::namespace_posix_error_for(&failure),
+                reason: failure.to_string(),
+            },
+            None,
+        )?;
+        Ok(())
     }
 
     /// Whether this node is primary of the shard that admitted `request`,
@@ -3191,7 +3238,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         self.read_yield_fresh_requests.remove(&key);
                                     }
                                 }
+                                // A request that waits for another driver's
+                                // step of its job stays pending.
+                                let awaits_job = matches!(
+                                    self.remote_namespace_phase.as_deref(),
+                                    Some(crate::source_adoption::RemoteNamespacePhase::AwaitJobStepClaim(_))
+                                );
                                 let retryable_error = read_yield_without_effects
+                                    || awaits_job
                                     || (!fresh_busy_rejection
                                         && outcome.as_ref().err().is_some_and(|error| {
                                             namespace_execution_must_remain_pending(
@@ -3565,6 +3619,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (event, coordination) = self.handle_namespace_request_internal(
             requester.clone(),
             DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: operation_id,
                 file_system_id,
                 requesting_node_id: requester.clone(),
@@ -4741,6 +4796,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
+        let storage_revision = self.storage_record_revision(&authority_shards);
         Ok((
             DfsNamespaceCommand {
                 request_id: request_id.to_string(),
@@ -4749,6 +4805,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 include_metadata_journal_batches: replay_journal_batches,
                 metadata_journal_after_sequences,
                 authority_shards: authority_shards.clone(),
+                storage_revision,
                 operation,
             },
             PendingRoutedNamespaceOp {
@@ -5100,6 +5157,7 @@ mod admission_tests {
 
         let path = "/services/reconcile-me";
         let command = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "stable-operation-42".to_string(),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: NodeId::from_legacy_named("node_reconcile").expect("node"),
@@ -5129,6 +5187,7 @@ mod admission_tests {
         mode: u32,
     ) -> DfsNamespaceCommand {
         DfsNamespaceCommand {
+            storage_revision: None,
             request_id: operation_id.to_string(),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: requester.clone(),

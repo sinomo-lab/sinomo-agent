@@ -487,6 +487,8 @@ pub(super) async fn run_component_maintenance(
     let mut repair_retry_at = None::<Instant>;
     // A wake that concerns only the repair executor runs only its pass.
     let mut executor_requested = false;
+    // A requested jobs turn runs only the namespace jobs pass.
+    let mut jobs_requested = false;
     let mut resources = node_resources.take_latest();
     let data_dir = paths.data_dir().expect("validated data root");
     let notify = match daemon_dfs_maintenance_notify(&data_dir) {
@@ -510,6 +512,15 @@ pub(super) async fn run_component_maintenance(
             executor_wake.notify_one();
         },
     );
+    // A jobs turn's request reaches this loop on its own edge, as an
+    // executor wake does, and runs only the jobs pass over the shards it
+    // names (see `maintenance/job_triggers.rs`).
+    let jobs_notify = Arc::new(tokio::sync::Notify::new());
+    let jobs_wake = Arc::clone(&jobs_notify);
+    let _jobs_turn_wake =
+        crate::maintenance::job_triggers::register_jobs_turn_wake(&data_root, move || {
+            jobs_wake.notify_one();
+        });
     // The executor timer value that already fired, with the executor's pass
     // count then. It stays consumed until a pass publishes the executor's
     // work again, so a turn that ran no pass, because it was held, found no
@@ -598,6 +609,9 @@ pub(super) async fn run_component_maintenance(
             }
             _ = executor_notify.notified() => {
                 executor_requested = true;
+            }
+            _ = jobs_notify.notified() => {
+                jobs_requested = true;
             }
             updated = node_resources.changed() => {
                 resources = updated;
@@ -801,7 +815,37 @@ pub(super) async fn run_component_maintenance(
             }
         }
 
-        if due.is_none() && !triggered && !executor_requested {
+        // A requested jobs turn runs once no full tick ran first; one held
+        // back while network work is deferred runs on the resource change.
+        if jobs_requested
+            && !*shutdown.borrow()
+            && !daemon_dfs_background_network_work_deferred(resources)
+        {
+            jobs_requested = false;
+            if crate::maintenance::job_triggers::jobs_turn_requested(&data_root) {
+                #[cfg(test)]
+                crate::maintenance::phase_runs::record_launch(
+                    &data_root,
+                    crate::maintenance::phase_runs::JOBS_TURN_LAUNCH,
+                );
+                // A turn that leaves its request asks for the next one
+                // itself: on the admission release that cut it short, at
+                // once at its bound, or when the remote phase it stopped at
+                // completes.
+                if let Err(error) = run_daemon_dfs_namespace_jobs_turn_in_blocking_task(
+                    paths.clone(),
+                    runtime.clone(),
+                    resources,
+                    shutdown.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(%error, "DFS namespace jobs turn failed");
+                }
+            }
+        }
+
+        if due.is_none() && !triggered && !executor_requested && !jobs_requested {
             tokio::time::sleep(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL).await;
         }
     }

@@ -313,6 +313,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         destination_primary: NodeId,
     ) -> Result<()> {
+        // A request that waited for its job answers from that job.
+        if self.resume_or_replay_cross_shard_mutation_for_active_request(
+            &sifs_file_system_id(),
+            from,
+            Some(to),
+            &[
+                DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+            ],
+        )? {
+            return Ok(());
+        }
         self.coordinate_cross_shard_rename_kind(
             from,
             to,
@@ -1312,17 +1324,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !self.shard_storage_record_is_closed(&owner)? {
             return Ok(());
         }
-        self.note_namespace_job_parked(job, frame, std::slice::from_ref(&owner));
-        crate::maintenance::storage_waits::record_parked_on_shard_storage(
-            &self.node_id,
-            [(
-                owner.file_system_id.clone(),
-                crate::DfsMetadataShardId::new(owner.shard_id.clone()),
-            )],
-        );
-        Err(DfsPosixError::Dfs(DfsError::Busy {
-            path: committed_target.path.clone(),
-        }))
+        Err(self.park_namespace_step_on_shard_storage(
+            job,
+            frame,
+            vec![owner],
+            committed_target.path.clone(),
+        ))
     }
 
     /// The first moved alias whose target's shard is not Active, with the
@@ -1334,7 +1341,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// that resolution: the search goes on past it, and a target found
     /// nowhere else is unknown, not dangling, so the alias waits on those
     /// shards. A failed resolution while any shard is closed waits on the
-    /// closed shards. A dangling alias names no target and moves no
+    /// closed shards; a resolution that handed off its read or was cancelled
+    /// ends with that error. A dangling alias names no target and moves no
     /// contribution.
     fn hardlink_target_storage_wait<'a>(
         &mut self,
@@ -1364,6 +1372,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
             };
             let mut closed = fan_out.closed().to_vec();
+            // A read the resolution handed off ends this run, and a cancelled
+            // one cuts it short: neither says anything about storage.
+            if let Err(error) = &resolved
+                && (self.remote_namespace_phase.is_some()
+                    || matches!(error, DfsPosixError::Dfs(error) if error.is_cancellation()))
+            {
+                return Err(resolved.unwrap_err());
+            }
             let target = match resolved {
                 Ok(target) => target,
                 Err(DfsPosixError::NotFound { .. } | DfsPosixError::InvalidPath { .. })
@@ -2182,6 +2198,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if link_path == "/" {
             return Err(DfsPosixError::InvalidPath { path: link_path });
+        }
+        // A request that waited for its job answers from that job.
+        if self.resume_or_replay_cross_shard_mutation_for_active_request(
+            &sifs_file_system_id(),
+            &existing_path,
+            Some(&link_path),
+            &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+        )? {
+            return Ok(());
         }
         let existing =
             self.lookup_sifs_path(&existing_path)?
@@ -3023,7 +3048,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Runs a cross-shard saga inline to completion, in bounded slices.
     fn drive_cross_shard_namespace_job(&mut self, mut job: DfsNamespaceJobRecord) -> Result<()> {
         loop {
-            job = self.run_cross_shard_namespace_job(job, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS)?;
+            let job_id = job.job_id.clone();
+            job = match self
+                .run_cross_shard_namespace_job(job, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS)
+            {
+                Ok(job) => job,
+                Err(error) => {
+                    // A phase the step handed to the host is this job's: its
+                    // continuation's failure runs the job again.
+                    if self.remote_namespace_phase.is_some() {
+                        self.pending_namespace_job_continuation = Some(job_id);
+                    }
+                    return Err(error);
+                }
+            };
             match job.status {
                 DfsNamespaceJobStatus::Completed => return Ok(()),
                 DfsNamespaceJobStatus::Running => continue,
@@ -3080,26 +3118,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "legacy hardlink job has no sealed count successor; explicit migration is required".into(),
             }));
         }
-        let file_system_id = job.file_system_id.clone();
         // Snapshot-copied or stale jobs must not run on a node that is no
-        // longer the source-side authority.
-        let source_shards =
-            self.namespace_shards_for_exact_paths(&file_system_id, [job.root_path.as_str()])?;
-        if let Some(shard) = source_shards
-            .iter()
-            .find(|shard| shard.primary_node_id != self.node_id)
-        {
-            // Replicas retain the running job as a failover reservation, but
-            // must never append a local failure or otherwise advance its
-            // journal. Only the current source-shard primary may drive the
-            // saga; after a certified primary transfer this same copy becomes
-            // executable under the new authority epoch.
-            return Err(DfsPosixError::Dfs(DfsError::StaleOwnerEpoch {
-                file_system_id,
-                local_node_id: self.node_id.clone(),
-                primary_node_id: shard.primary_node_id.clone(),
-                epoch: shard.epoch,
-            }));
+        // longer the source-side authority. Replicas retain the running job
+        // as a failover reservation, but must never append a local failure
+        // or otherwise advance its journal.
+        self.namespace_job_primary_shard(&job)?;
+        let _claim = self.claim_namespace_job_step(&job.job_id)?;
+        // Another driver may have stepped the job before this one claimed it.
+        if let Some(current) = self.namespace_job(&job.job_id)? {
+            job = current;
+        }
+        if job.status != DfsNamespaceJobStatus::Running {
+            return Ok(job);
         }
         self.apply_cross_shard_namespace_job_guard(&job)?;
         let mut steps = 0usize;
@@ -4426,6 +4456,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_path,
             kinds,
             DfsNamespaceJobStatus::Running,
+            Some(request.created_at),
+            Some(&origin),
+        )? {
+            self.drive_cross_shard_namespace_job(job)?;
+            return Ok(true);
+        }
+        // The request's job failed: the request answers with its failure.
+        if let Some(job) = self.cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+            DfsNamespaceJobStatus::Failed,
             Some(request.created_at),
             Some(&origin),
         )? {

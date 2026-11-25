@@ -423,6 +423,16 @@ pub struct DfsDistributedWriteCommand {
     /// Reject the write at the metadata authority if the path already names a
     /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
     pub exclusive_create: bool,
+    /// The revision at which the sender's configuration projection holds the
+    /// storage records of the shards this request depends on: the highest
+    /// such record's modify revision, `None` when it holds none. The sender's
+    /// view is a lower bound on the receiver's: a receiver whose projection
+    /// holds a closed record for one of those shards older than this revision
+    /// waits on its projection until it changes that, within the request's
+    /// budget and before the request takes admission, so a primary does not
+    /// refuse as closed a shard whose activation its sender has seen.
+    #[serde(deserialize_with = "required_optional")]
+    pub storage_revision: Option<sinomo_core::kv::KvRevision>,
 }
 
 impl DfsDistributedWriteCommand {
@@ -538,6 +548,16 @@ pub struct DfsNamespaceCommand {
     /// Exact current metadata-shard configurations used to route this request.
     /// Network receivers recompute and validate the complete stamp.
     pub authority_shards: Vec<DfsMetadataShardConfig>,
+    /// The revision at which the sender's configuration projection holds the
+    /// storage records of the shards this request depends on: the highest
+    /// such record's modify revision, `None` when it holds none. The sender's
+    /// view is a lower bound on the receiver's: a receiver whose projection
+    /// holds a closed record for one of those shards older than this revision
+    /// waits on its projection until it changes that, within the request's
+    /// budget and before the request takes admission, so a primary does not
+    /// refuse as closed a shard whose activation its sender has seen.
+    #[serde(deserialize_with = "required_optional")]
+    pub storage_revision: Option<sinomo_core::kv::KvRevision>,
     pub operation: DfsNamespaceOperation,
 }
 

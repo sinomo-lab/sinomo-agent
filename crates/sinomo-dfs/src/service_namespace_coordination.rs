@@ -47,6 +47,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsError::from)
     }
 
+    /// The storage-record revision a request to the primaries of `shards`
+    /// carries: the highest revision at which this node's configuration
+    /// projection holds one of their storage records. `None` without a
+    /// control plane, without such a record, or when the projection cannot
+    /// be read; the receiver then answers from its own projection as it is.
+    pub(crate) fn storage_record_revision(
+        &self,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Option<sinomo_core::kv::KvRevision> {
+        let snapshot = self.published_configuration_snapshot().ok().flatten()?;
+        shards
+            .iter()
+            .filter_map(|shard| {
+                snapshot
+                    .entry(&metadata_shard_storage_key(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    ))
+                    .flatten()
+                    .map(|entry| entry.modify_revision)
+            })
+            .max()
+    }
+
     pub(crate) fn namespace_shards_for_normalized_paths_from_snapshot<'a>(
         file_system_id: &DfsFileSystemId,
         shards: &[DfsMetadataShardConfig],

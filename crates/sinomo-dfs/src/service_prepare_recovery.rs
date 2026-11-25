@@ -78,14 +78,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<DfsPreparedRecoveryPass, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(DfsPreparedRecoveryPass {
+                completed: true,
+                first_unknown: None,
+            });
+        };
+        let records = backend.list_prepared_operations()?;
+        self.recover_prepared_operations_pass(records, should_cancel)
+    }
+
+    /// [`Self::recover_durable_namespace_prepares_pass`] over the durable
+    /// prepares of the local copy of `shard_id` only.
+    pub(crate) fn recover_durable_namespace_prepares_on_shard_pass(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DfsPreparedRecoveryPass, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(DfsPreparedRecoveryPass {
+                completed: true,
+                first_unknown: None,
+            });
+        };
+        let records = backend.prepared_operations_on_shard(shard_id)?;
+        self.recover_prepared_operations_pass(records, should_cancel)
+    }
+
+    fn recover_prepared_operations_pass(
+        &mut self,
+        mut records: Vec<crate::DfsPreparedOperationRecord>,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DfsPreparedRecoveryPass, DfsError> {
         let mut pass = DfsPreparedRecoveryPass {
             completed: true,
             first_unknown: None,
         };
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(pass);
-        };
-        let mut records = backend.list_prepared_operations()?;
         sort_prepared_operations(&mut records);
         for record in records {
             if should_cancel() {

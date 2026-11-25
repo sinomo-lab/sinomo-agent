@@ -771,6 +771,13 @@ pub(crate) struct DfsReadHandoff {
     /// The job whose step maintenance runs now: a read the step hands off is
     /// that job's own, and the job runs again with its answer.
     pub(crate) job: Option<String>,
+    /// The request maintenance recovers met its job claimed by another
+    /// driver's step: the request stays pending, and the claim's release
+    /// marks it due.
+    pub(crate) awaits_job_claim: bool,
+    /// The job step that ran parked on a shard whose storage activated before
+    /// the park was recorded: the job runs again first.
+    pub(crate) rerun: bool,
     /// The reads this pass's work handed off, by owner, for the host to send
     /// once the pass has released admission.
     pub(crate) reads: Vec<(
@@ -823,6 +830,9 @@ pub struct NetworkedDfsService<T> {
     pub(crate) remote_namespace_phase: Option<Box<crate::source_adoption::RemoteNamespacePhase>>,
     /// SAME durable request retained across the existing host's remote-phase yield.
     pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
+    /// The job whose step yielded the remote phase that request carries: a
+    /// failure of that phase runs the job again.
+    pub(crate) pending_namespace_job_continuation: Option<String>,
     pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
     /// Answers to the reads a holder of admission sent to other nodes'
     /// primaries with its lanes and admission released, keyed by the request

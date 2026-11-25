@@ -707,8 +707,8 @@ fn component_factory_with_selected_layout(
                             )),
                         );
                         scope.own_task(
-                            "DFS repair primary assignments",
-                            runtime.spawn(crate::runtime_host::watch_dfs_repair_primary_assignments(
+                            "DFS primary assignments",
+                            runtime.spawn(crate::runtime_host::watch_dfs_primary_assignments(
                                 data_dir.clone(),
                                 Arc::clone(authority),
                                 state.local_node_id.clone(),

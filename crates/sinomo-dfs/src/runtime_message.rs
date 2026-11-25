@@ -2007,6 +2007,7 @@ mod tests {
                 frame_id: 1,
                 message_id: 1,
                 message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    storage_revision: None,
                     request_id: "reactive-event-namespace".to_string(),
                     file_system_id: crate::sifs_file_system_id(),
                     requesting_node_id: source.clone(),

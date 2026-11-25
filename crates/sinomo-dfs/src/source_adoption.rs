@@ -1938,6 +1938,16 @@ pub(crate) enum RemoteNamespacePhase {
     /// shard's primary with its lanes and admission released, so the
     /// answering primary never waits on a lane the request holds.
     ReadAtPrimary(RemoteReadNamespacePhase),
+    /// A served request whose job another driver's step holds waits for that
+    /// step's claim to be released with its lanes and admission released,
+    /// then runs again and reads its job afresh.
+    AwaitJobStepClaim(AwaitJobStepClaimPhase),
+}
+#[derive(Debug)]
+pub(crate) struct AwaitJobStepClaimPhase {
+    pub(crate) node_id: sinomo_core::node::NodeId,
+    pub(crate) job_id: String,
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 #[derive(Debug)]
 pub(crate) struct RemoteReadNamespacePhase {
@@ -1974,6 +1984,9 @@ pub(crate) enum CompletedRemoteNamespacePhase {
         version: crate::DfsVersion,
         deadline: Option<std::time::Instant>,
     },
+    /// The step claim a request waited for was released, or the request's
+    /// deadline came.
+    JobStepClaimReleased,
     /// A read the request yielded came back from its primary, or failed as
     /// its send would have failed on the request's own run.
     ReadAnswered {
@@ -2003,9 +2016,10 @@ impl RemoteNamespacePhase {
 
     pub(crate) fn cancel_before_dispatch(&self) -> Result<()> {
         match self {
-            Self::PrepareSource { .. } | Self::AwaitRepairProgress(_) | Self::ReadAtPrimary(_) => {
-                Ok(())
-            }
+            Self::PrepareSource { .. }
+            | Self::AwaitRepairProgress(_)
+            | Self::ReadAtPrimary(_)
+            | Self::AwaitJobStepClaim(_) => Ok(()),
             Self::PublishTarget(phase) => match phase.source_offer()? {
                 Some(offer) => phase.actor.cancel_unclaimed(offer),
                 None => Ok(()),
@@ -2051,6 +2065,14 @@ impl RemoteNamespacePhase {
                     version: phase.version,
                     deadline: phase.deadline,
                 })
+            }
+            Self::AwaitJobStepClaim(phase) => {
+                crate::maintenance::job_claims::wait_for_release(
+                    &phase.node_id,
+                    &phase.job_id,
+                    phase.deadline,
+                );
+                Ok(CompletedRemoteNamespacePhase::JobStepClaimReleased)
             }
             // The read's own failure is its answer: the re-run meets it where
             // the read would have been sent.
@@ -2362,6 +2384,8 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 self.answered_remote_reads.insert(key, answer);
                 return Ok(());
             }
+            // The re-run reads its job again.
+            CompletedRemoteNamespacePhase::JobStepClaimReleased => return Ok(()),
             CompletedRemoteNamespacePhase::RepairProgress {
                 object_id,
                 version,

@@ -577,6 +577,33 @@ pub(crate) fn namespace_jobs_page_from_tables(
     DfsNamespaceJobPage { jobs, next_cursor }
 }
 
+/// One cursor-bounded page of the Running namespace jobs in `tables`, in job
+/// id order, read from the Running-job index.
+pub(crate) fn running_namespace_jobs_page_from_tables(
+    tables: &DfsMetadataTables,
+    after: Option<&DfsNamespaceJobPageCursor>,
+    max_entries: usize,
+) -> DfsNamespaceJobPage {
+    if max_entries == 0 {
+        return DfsNamespaceJobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        };
+    }
+    let mut entries = Vec::new();
+    for job in tables.running_namespace_jobs_after(after.map(|after| after.job_id.as_str())) {
+        let cursor = DfsNamespaceJobPageCursor {
+            job_id: job.job_id.clone(),
+        };
+        entries.push((job.clone(), cursor));
+        if entries.len() > max_entries {
+            break;
+        }
+    }
+    let (jobs, next_cursor) = finish_cursor_page(entries, max_entries);
+    DfsNamespaceJobPage { jobs, next_cursor }
+}
+
 pub(crate) fn pending_namespace_requests_page_from_tables(
     tables: &DfsMetadataTables,
     after: Option<&DfsPendingNamespaceRequestPageCursor>,

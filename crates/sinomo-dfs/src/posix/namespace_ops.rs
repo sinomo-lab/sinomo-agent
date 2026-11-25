@@ -1436,6 +1436,7 @@ mod atomic_namespace_tests {
         let path = "/services/routed-rmdir-replay";
         let original = service.posix_mkdir(path).unwrap();
         let command = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: "dfs_net_req_routed_rmdir_replay".into(),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: requester.clone(),

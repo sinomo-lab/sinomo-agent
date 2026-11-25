@@ -2672,9 +2672,9 @@ fn file_history_restore_recovers_a_commit_after_later_edit_and_replays_compacted
             }
         }
     } else {
-        // Compacted-only evidence must join a full terminal job actually seen
-        // before this edit/GC. An unobserved Running->compacted race fails.
-        assert_restore_compacted_receipt(observed, after_gc.receipt.as_ref().unwrap());
+        // Compacted-only evidence joins the job seen before this edit/GC;
+        // Main may have completed it only after that observation.
+        assert_restore_receipt_of_observed_job(observed, after_gc.receipt.as_ref().unwrap());
         let receipt = after_gc
             .write_receipt
             .as_ref()
@@ -2714,7 +2714,7 @@ fn file_history_restore_recovers_a_commit_after_later_edit_and_replays_compacted
         ));
         current
     } else {
-        assert_restore_compacted_receipt(observed, recovered.receipt.as_ref().unwrap());
+        assert_restore_receipt_of_observed_job(observed, recovered.receipt.as_ref().unwrap());
         observed
     };
     assert!(
@@ -2764,7 +2764,7 @@ fn file_history_restore_recovers_a_commit_after_later_edit_and_replays_compacted
         .get_namespace_job_receipt(&job.job_id)
         .unwrap()
         .unwrap();
-    assert_restore_compacted_receipt(completed, &compacted);
+    assert_restore_receipt_of_observed_job(completed, &compacted);
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
@@ -2902,7 +2902,8 @@ fn file_history_cancelled_restore_keeps_its_source_until_recovery() {
     } else {
         // A receipt can join a full terminal body already observed above; it
         // cannot reconstruct unobserved cleanup or source-release evidence.
-        assert_restore_compacted_receipt(persisted, after_gc.receipt.as_ref().unwrap());
+        // Main may have completed the job after that observation.
+        assert_restore_receipt_of_observed_job(persisted, after_gc.receipt.as_ref().unwrap());
         assert_eq!(restore_observed_revision(&after_gc.current), state.planned);
         assert!(
             !after_gc
@@ -2929,7 +2930,7 @@ fn file_history_cancelled_restore_keeps_its_source_until_recovery() {
         assert_eq!(resumed.status, DfsNamespaceJobStatus::Completed);
     } else {
         let terminal = after_gc.job.as_ref().unwrap_or(persisted);
-        assert_restore_compacted_receipt(terminal, reopened.receipt.as_ref().unwrap());
+        assert_restore_receipt_of_observed_job(terminal, reopened.receipt.as_ref().unwrap());
         assert_eq!(restore_observed_revision(&reopened.current), state.planned);
     }
     assert_eq!(dfs.posix_read_file_distributed(path).unwrap(), b"saved");
@@ -3046,7 +3047,10 @@ fn file_history_restore_cleanup_survives_restart_and_lost_unpin_reply() {
     assert!(report.failures.is_empty());
     assert_eq!(report.failed_job_count, 0);
     assert_eq!(report.remaining_running_job_count, 0);
-    assert_eq!(report.scanned_job_count, 1);
+    // The pass pages Running jobs only: it meets this job unless the reopened
+    // owner's own maintenance completed it first.
+    assert!(report.scanned_job_count <= 1);
+    assert_eq!(report.scanned_job_count, report.resumed_job_count);
     assert!(report.completed_job_count <= 1);
     assert_eq!(report.resumed_job_count, report.completed_job_count);
     let completed = runtime
@@ -4176,6 +4180,35 @@ fn assert_restore_compacted_receipt(
     assert_eq!(actual.request, state.request);
     assert_eq!(actual.requester_node_id, state.requester_node_id);
     assert_eq!(&actual.result, state.result.as_ref().unwrap());
+}
+
+/// `receipt` is the compacted end of the job `observed` saw, which Main may
+/// have completed only after that observation: the receipt keeps the job's
+/// identity and request, and completed it with a result. Its terminal time and
+/// result match the observation only when the observation saw the job end.
+fn assert_restore_receipt_of_observed_job(
+    observed: &DfsNamespaceJobRecord,
+    receipt: &DfsNamespaceJobReceipt,
+) {
+    if observed.status == DfsNamespaceJobStatus::Completed {
+        return assert_restore_compacted_receipt(observed, receipt);
+    }
+    assert_eq!(observed.status, DfsNamespaceJobStatus::Running);
+    let state = assert_restore_checkpoint_matches_admission(observed, observed);
+    assert_eq!(receipt.status, DfsNamespaceJobStatus::Completed);
+    assert_eq!(receipt.job_id, observed.job_id);
+    assert_eq!(receipt.file_system_id, observed.file_system_id);
+    assert_eq!(receipt.origin, observed.origin);
+    assert_eq!(receipt.kind, observed.kind);
+    assert_eq!(receipt.root_path, observed.root_path);
+    assert_eq!(receipt.target_path, observed.target_path);
+    assert_eq!(receipt.created_at, observed.created_at);
+    let actual = receipt
+        .content_copy
+        .as_ref()
+        .expect("actual compact content-copy result");
+    assert_eq!(actual.request, state.request);
+    assert_eq!(actual.requester_node_id, state.requester_node_id);
 }
 
 // The native owner may finish this same durable job between bounded calls.

@@ -240,6 +240,7 @@ impl LegacyProjection {
         let source_digest = text(&row, "command_digest")?;
         let mut request = wire::normalize_namespace_request(row)?;
         let command = DfsNamespaceCommand {
+            storage_revision: None,
             request_id: request.request_id.clone(),
             file_system_id: request.file_system_id.clone(),
             requesting_node_id: request.requester_node_id.clone(),

@@ -3878,6 +3878,7 @@ fn routed_namespace_rejects_stale_authority_stamp_before_mutation() {
         .handle_namespace_request(
             replica_node.clone(),
             DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: "dfs_net_req_stale_namespace_stamp".to_string(),
                 file_system_id,
                 requesting_node_id: replica_node,

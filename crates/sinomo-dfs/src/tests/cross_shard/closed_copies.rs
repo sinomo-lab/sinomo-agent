@@ -319,3 +319,172 @@ fn a_shard_closed_on_another_node_leaves_authority_lookups_serving() {
     drop(kv);
     cluster.close();
 }
+
+/// Users reopens, and its primary's configuration projection is held behind
+/// the asker's: the root primary has seen users' storage record turn Active,
+/// while users' primary still holds the Converting one. A lookup only users
+/// can answer carries the storage revision the asker saw. Users' primary
+/// waits on its own projection instead of refusing as closed, and answers
+/// once that projection holds the reopening: with no timer and nothing else
+/// happening, the held repair of its projection going on alone ends the wait.
+#[test]
+fn a_primary_behind_its_askers_storage_view_answers_once_its_projection_catches_up() {
+    let (mut cluster, nodes) =
+        super::namespace_counts::disjoint_shard_cluster("native-lagging-storage-view");
+    let users_node = cluster.users_primary_node.clone();
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let fs = sifs_file_system_id();
+    let held = "/users/lagging-storage-view-held";
+    cluster
+        .replica
+        .posix_write_file(
+            held,
+            b"users bytes",
+            DfsWriteOptions::replicated_eventual(vec![root_node.clone()]),
+        )
+        .unwrap();
+    let held = cluster.replica.posix_stat_distributed(held).unwrap();
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+
+    // Users' primary misses the reopening's delta; the next delta it observes
+    // shows the gap, and the rebuild that repairs it is held, so its
+    // projection keeps the Converting record until the rebuild goes on.
+    let storage_key = crate::metadata_shard_storage_key(&fs, "users");
+    let lagging = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(&users_node, storage_key.clone())
+        .unwrap();
+    let put = |kv: &mut dyn DfsControlPlaneKvClient, entry: &sinomo_core::kv::KvEntry, value| {
+        kv.txn(KvTxn {
+            compares: vec![sinomo_core::kv::KvCompare::ValueEquals {
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+            }],
+            success: vec![sinomo_core::kv::KvOp::Put {
+                key: entry.key.clone(),
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })
+        .unwrap()
+        .succeeded
+    };
+    assert!(put(kv.as_mut(), &converting, active.value.clone()));
+    lagging
+        .wait_dropped_delta(Duration::from_secs(30))
+        .expect("users' primary misses the reopening");
+    // The next delta users' primary observes, services closing, shows the
+    // gap.
+    close_shard_for_conversion(
+        &cluster._runtime,
+        kv.as_mut(),
+        &[root_node.clone(), services_node.clone()],
+        "services",
+    );
+    lagging
+        .wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .expect("users' primary holds its repair");
+
+    let current = std::thread::scope(|scope| {
+        let asker = &mut cluster.replica;
+        let (fs, object_id) = (fs.clone(), held.object_id.clone());
+        let (sender, lookup) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = sender.send(asker.current_object_from_authority(&fs, &object_id));
+        });
+        assert!(
+            lookup.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the lagging primary does not answer from the Converting record"
+        );
+        lagging.release();
+        lookup
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the primary answers once its projection holds the reopening")
+    });
+    let current = current
+        .unwrap()
+        .expect("the reopened shard answers for its object");
+    assert_eq!(current.object_id, held.object_id);
+    drop(kv);
+    cluster.close();
+}
+
+/// Users converts and every node closes its copy. Its primary then misses
+/// the delta that reopens users; the next delta it observes shows the gap,
+/// and its rebuild repairs the projection. The rebuild reports the
+/// reopening as the delta would have, so the primary's copy opens and
+/// serves, with nothing else happening.
+#[test]
+fn a_primary_that_missed_the_reopening_reopens_its_copy_once_its_rebuild_repairs_it() {
+    let (mut cluster, nodes) =
+        super::namespace_counts::disjoint_shard_cluster("native-rebuild-reopens-copy");
+    let users_node = cluster.users_primary_node.clone();
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let fs = sifs_file_system_id();
+    let held = "/users/rebuild-reopens-held";
+    cluster
+        .replica
+        .posix_write_file(
+            held,
+            b"users bytes",
+            DfsWriteOptions::replicated_eventual(vec![root_node.clone()]),
+        )
+        .unwrap();
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    let storage_key = crate::metadata_shard_storage_key(&fs, "users");
+    let gap = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(&users_node, storage_key)
+        .unwrap();
+    let put = |kv: &mut dyn DfsControlPlaneKvClient, entry: &sinomo_core::kv::KvEntry, value| {
+        kv.txn(KvTxn {
+            compares: vec![sinomo_core::kv::KvCompare::ValueEquals {
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+            }],
+            success: vec![sinomo_core::kv::KvOp::Put {
+                key: entry.key.clone(),
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })
+        .unwrap()
+        .succeeded
+    };
+    assert!(put(kv.as_mut(), &converting, active.value.clone()));
+    gap.wait_dropped_delta(Duration::from_secs(30))
+        .expect("users' primary misses the reopening");
+    // The next delta users' primary observes, services closing, shows the
+    // gap.
+    close_shard_for_conversion(
+        &cluster._runtime,
+        kv.as_mut(),
+        &[root_node.clone(), services_node.clone()],
+        "services",
+    );
+    gap.wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .expect("users' primary rebuilds its projection");
+    gap.release();
+    drop(gap);
+    for node in &nodes {
+        cluster
+            ._runtime
+            .wait_published_configuration_current(node)
+            .unwrap();
+    }
+    assert_eq!(
+        cluster.replica.posix_read_file_distributed(held).unwrap(),
+        b"users bytes",
+        "users' primary serves its reopened copy"
+    );
+    drop(kv);
+    cluster.close();
+}

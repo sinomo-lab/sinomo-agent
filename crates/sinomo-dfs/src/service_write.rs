@@ -1658,6 +1658,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (operation_id.as_deref(), captured_manifest.as_ref())
         {
             let replay_command = DfsDistributedWriteCommand {
+                storage_revision: None,
                 publication: options.publication.clone(),
                 patch: None,
                 request_id: operation_id.to_string(),
@@ -2096,6 +2097,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         if let Some(operation_id) = operation_id.as_deref() {
             let mut replay_command = DfsDistributedWriteCommand {
+                storage_revision: None,
                 publication: publication.clone(),
                 patch: None,
                 request_id: operation_id.to_string(),
@@ -2539,6 +2541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         if let Some(operation_id) = operation_id.as_deref() {
             let mut replay_command = DfsDistributedWriteCommand {
+                storage_revision: None,
                 publication: options.publication.clone(),
                 patch: None,
                 request_id: operation_id.to_string(),
@@ -3262,6 +3265,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             object_metadata: Some(object.clone()),
             authority_shard: Some(shard.clone()),
+            storage_revision: self.storage_record_revision(std::slice::from_ref(&shard)),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create,
@@ -3528,6 +3532,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             object_metadata: Some(object.clone()),
             authority_shard: Some(shard.clone()),
+            storage_revision: self.storage_record_revision(std::slice::from_ref(&shard)),
             touch_parent_on_create: false,
             foreground_replica_repair,
             wait_for_commit,
@@ -3653,6 +3658,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             object_metadata: Some(object.clone()),
             authority_shard: Some(shard.clone()),
+            storage_revision: self.storage_record_revision(std::slice::from_ref(&shard)),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create,
@@ -3869,6 +3875,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             object_metadata: Some(object.clone()),
             authority_shard: Some(shard.clone()),
+            storage_revision: self.storage_record_revision(std::slice::from_ref(&shard)),
             touch_parent_on_create,
             foreground_replica_repair,
             exclusive_create,

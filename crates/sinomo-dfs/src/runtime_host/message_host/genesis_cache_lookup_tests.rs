@@ -221,6 +221,7 @@ fn mutation_for_genesis_check(
             1,
             1,
             crate::DfsNetworkMessage::NamespaceRequest(crate::DfsNamespaceCommand {
+                storage_revision: None,
                 request_id: format!("genesis-check-{}", sinomo_core::Id::generate()),
                 file_system_id: shard.file_system_id.clone(),
                 requesting_node_id: local.clone(),

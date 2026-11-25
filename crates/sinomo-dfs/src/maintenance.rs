@@ -4,6 +4,8 @@
 //! cluster-aware entrypoints that open DFS services, bind transports, and run a
 //! maintenance tick against configured metadata shards.
 
+pub(crate) mod job_claims;
+pub(crate) mod job_triggers;
 mod progress;
 pub(crate) mod storage_waits;
 pub(crate) use progress::DfsMaintenanceProgressState;
@@ -106,6 +108,26 @@ impl DfsPendingMaintenanceWork {
 
     pub fn has_deferred_work(&self) -> bool {
         self.deferred_work_count > 0
+    }
+}
+
+/// The report of a jobs turn, which runs only the namespace jobs pass.
+pub(crate) fn dfs_namespace_jobs_turn_report(
+    namespace_jobs: DfsNamespaceJobMaintenanceReport,
+) -> DfsMaintenanceTickReport {
+    DfsMaintenanceTickReport {
+        namespace_jobs,
+        write_intents: Default::default(),
+        placement_reconciliation: None,
+        lifecycle_reports: Vec::new(),
+        scheduled_repairs: Vec::new(),
+        followup_events: Vec::new(),
+        repair_budget_exhausted: false,
+        repair_examined_count: 0,
+        repair_tracked_need_count: 0,
+        metadata_replication: DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        },
     }
 }
 
@@ -3087,6 +3109,7 @@ pub(crate) mod phase_runs {
     pub(crate) const FULL_TICK_LAUNCH: &str = "full_tick_launch";
     pub(crate) const FULL_TICK_COMPLETION: &str = "full_tick_completion";
     pub(crate) const EXECUTOR_TURN_LAUNCH: &str = "executor_turn_launch";
+    pub(crate) const JOBS_TURN_LAUNCH: &str = "jobs_turn_launch";
 
     static RUNS: Mutex<BTreeMap<(PathBuf, &'static str), u64>> = Mutex::new(BTreeMap::new());
     static LAUNCHES: Mutex<BTreeMap<PathBuf, Vec<&'static str>>> = Mutex::new(BTreeMap::new());
