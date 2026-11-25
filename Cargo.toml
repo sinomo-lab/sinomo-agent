@@ -92,60 +92,25 @@ version = "0.1.0"
 [profile.release]
 panic = "unwind"
 
+# Development builds keep debug assertions, tracing and profiling, and the
+# Docker gates measure them at unchanged thresholds. Membership, KV, service
+# discovery, serialization and hashing sit on every request path beside the
+# network and DFS code, so the whole workspace and its dependencies are
+# optimized: an unoptimized crate anywhere on that path otherwise dominates
+# what the debug cluster measures.
 [profile.dev]
 debug = "limited"
 incremental = true
+opt-level = 2
 
 # Test executables contain many transport specializations. Local ThinLTO
 # reoptimizes their imports across codegen units after small edits; retain the
-# package optimization levels while avoiding that additional test link pass.
+# profile's optimization level while avoiding that additional test link pass.
 [profile.test]
 lto = "off"
 
 [profile.dev.package."*"]
 debug = "limited"
-
-# The network data plane remains on the ordinary incremental dev pipeline, but
-# bodyless routed RPCs otherwise spend most of their budget in unoptimized mux,
-# framing, and authenticated-stream code before device/network latency is even
-# visible. Optimize only that hot crate so Docker debug-cluster measurements
-# exercise the production-shaped data path without making the full workspace
-# expensive to rebuild while iterating.
-[profile.dev.package.sinomo-network]
-opt-level = 2
-
-# DFS metadata authority is part of the same latency-sensitive distributed
-# data plane. Keep the rest of the workspace cheap to build while avoiding
-# debug-only multi-millisecond table/query overhead in cluster benchmarks.
-[profile.dev.package.sinomo-dfs]
-opt-level = 2
-
-# The daemon owns the service adapter around that data plane; leaving only the
-# adapter unoptimized makes a warmed metadata lookup slower than the network
-# and DFS work it encloses.
-[profile.dev.package.sinomo-daemon]
-opt-level = 2
-
-# SOBJ decoding is shared by the network, metadata and membership paths above.
-# Keep its codec optimized too, so debug-cluster latency does not primarily
-# measure unoptimized framing and deserialization.
-[profile.dev.package.sinomo-object]
-opt-level = 2
-
-# Docker gates keep tracing, debugging and profiling enabled. Their recorders
-# and dispatch layers are part of the measured path, so optimize that code
-# under the same dev profile without removing observations or relaxing gates.
-[profile.dev.package.sinomo-observe]
-opt-level = 2
-
-[profile.dev.package.tracing]
-opt-level = 2
-
-[profile.dev.package.tracing-core]
-opt-level = 2
-
-[profile.dev.package.tracing-subscriber]
-opt-level = 2
 
 # Keep the Android media hot path representative while retaining debugging,
 # assertions and observability for the rest of the application.
