@@ -14,6 +14,9 @@ pub(super) enum DaemonDfsMaintenanceKind {
     /// Only the namespace jobs pass, over the shards a jobs turn's request
     /// names (see `maintenance/job_triggers.rs`).
     NamespaceJobs,
+    /// Only the shard lanes' unfinished-write phase, for refused stages that
+    /// are due again (see `maintenance/stage_wakes.rs`).
+    UnfinishedWrites,
     MountedMutationRecovery,
     AuthoritativeReconciliation {
         content_gc_requested: bool,
@@ -29,14 +32,22 @@ impl DaemonDfsMaintenanceKind {
         // work merely because its first phase has not reached a checkpoint.
         !matches!(
             self,
-            Self::Routine | Self::RepairExecutor | Self::NamespaceJobs
+            Self::Routine | Self::RepairExecutor | Self::NamespaceJobs | Self::UnfinishedWrites
         )
     }
 
     /// A turn that runs one pass for a wake that concerns only it, and none
     /// of the node's other maintenance.
     fn runs_one_pass(self) -> bool {
-        matches!(self, Self::RepairExecutor | Self::NamespaceJobs)
+        matches!(
+            self,
+            Self::RepairExecutor | Self::NamespaceJobs | Self::UnfinishedWrites
+        )
+    }
+
+    /// Whether the turn runs the shard lanes' unfinished-write phase.
+    fn runs_lane_write_phase(self) -> bool {
+        !self.runs_one_pass() || self == Self::UnfinishedWrites
     }
 
     pub(super) fn replica_dispatch_is_deferred(self) -> bool {
@@ -45,6 +56,7 @@ impl DaemonDfsMaintenanceKind {
             Self::Routine
                 | Self::RepairExecutor
                 | Self::NamespaceJobs
+                | Self::UnfinishedWrites
                 | Self::MountedMutationRecovery
                 | Self::AuthoritativeReconciliation {
                     content_gc_requested: false,
@@ -242,6 +254,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         DaemonDfsMaintenanceKind::Routine => "routine",
         DaemonDfsMaintenanceKind::RepairExecutor => "repair-executor",
         DaemonDfsMaintenanceKind::NamespaceJobs => "namespace-jobs",
+        DaemonDfsMaintenanceKind::UnfinishedWrites => "unfinished-writes",
         DaemonDfsMaintenanceKind::MountedMutationRecovery => "mounted-mutation-recovery",
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
     };
@@ -1065,8 +1078,12 @@ fn wake_daemon_dfs_maintenance_after_admission_release(
     after: u64,
     runtime: &tokio::runtime::Handle,
 ) {
-    let due = crate::read_handoff::due_count(&data_dir.root()) > 0;
-    if !due && !crate::maintenance::job_triggers::jobs_turn_requested(&data_dir.root()) {
+    let root = data_dir.root();
+    let due = crate::read_handoff::due_count(&root) > 0;
+    if !due
+        && !crate::maintenance::job_triggers::jobs_turn_requested(&root)
+        && !crate::maintenance::stage_wakes::has_due(&root, Instant::now())
+    {
         return;
     }
     let Ok(Some(task_owner)) = registered_dfs_runtime_host(data_dir) else {
@@ -1083,6 +1100,7 @@ fn wake_daemon_dfs_maintenance_after_admission_release(
             notify_daemon_dfs_maintenance_work(&data_dir);
         }
         crate::maintenance::job_triggers::wake_requested_jobs_turn(&data_dir.root());
+        crate::maintenance::stage_wakes::wake_due_writes_turn(&data_dir.root());
     }));
 }
 
@@ -1577,6 +1595,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             DaemonDfsMaintenanceKind::Routine | DaemonDfsMaintenanceKind::NamespaceJobs => {
                 daemon_dfs_routine_maintenance_tick_options(node_resources)
             }
+            // The lane write phase below is the whole turn.
+            DaemonDfsMaintenanceKind::UnfinishedWrites => {
+                return Ok(Some(crate::maintenance::dfs_namespace_jobs_turn_report(
+                    Default::default(),
+                )));
+            }
             DaemonDfsMaintenanceKind::RepairExecutor => {
                 let options = daemon_dfs_routine_maintenance_tick_options(node_resources);
                 let shards = crate::metadata_shards_from_authority_projection(
@@ -1603,7 +1627,8 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
                     DaemonDfsMaintenanceKind::Routine
                     | DaemonDfsMaintenanceKind::RepairExecutor
-                    | DaemonDfsMaintenanceKind::NamespaceJobs => {
+                    | DaemonDfsMaintenanceKind::NamespaceJobs
+                    | DaemonDfsMaintenanceKind::UnfinishedWrites => {
                         unreachable!("routine and one-pass turns handled above")
                     }
                 };
@@ -2006,7 +2031,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // durably still owes that write's reply. The global service's backend
     // lease has been returned above, so each lane checks out its own shard
     // while this turn still holds the global admission.
-    if !maintenance_kind.runs_one_pass()
+    if maintenance_kind.runs_lane_write_phase()
         && let Some(owners) = write_phase_owners.as_ref()
     {
         run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
@@ -2124,6 +2149,11 @@ async fn run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
     foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
 ) -> Result<(), DaemonError> {
+    // The refused stages due now are sent again by the lanes that hold
+    // their writes. One whose lane another holder has now is due again
+    // after the first backoff; one no lane holds any more has ended.
+    let due = crate::maintenance::stage_wakes::take_due(&data_dir.root(), Instant::now());
+    let mut held = BTreeSet::new();
     for taken in take_daemon_dfs_unfinished_write_services(data_dir)? {
         let mut write_return = DaemonDfsMaintenanceWriteServiceReturn {
             data_dir,
@@ -2152,6 +2182,7 @@ async fn run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
                 .set_committed_work_tracker(committed_work_tracker.clone());
             lane.service
                 .add_cancellation(foreground_preemption.cancellation_flag());
+            held.extend(lane.service.make_refused_stages_due(&due));
             // An outcome settled elsewhere is replied first; retries follow.
             let mut events = Vec::new();
             lane.service
@@ -2191,6 +2222,7 @@ async fn run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
         }
         if let Err(error) = phase {
             if error.is_cancellation() && foreground_preemption.is_requested() {
+                refused_stages_again_after_backoff(data_dir, &due, &held);
                 return Ok(());
             }
             tracing::warn!(
@@ -2200,7 +2232,35 @@ async fn run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
             );
         }
     }
+    refused_stages_again_after_backoff(data_dir, &due, &held);
     Ok(())
+}
+
+/// The due refused stages no lane this phase ran holds: those whose write a
+/// lane still serves, under another holder now, are due again after the
+/// first backoff. Any other has ended with its write.
+fn refused_stages_again_after_backoff(
+    data_dir: &SinomoDataDir,
+    due: &BTreeSet<crate::maintenance::stage_wakes::DfsRefusedStage>,
+    held: &BTreeSet<crate::maintenance::stage_wakes::DfsRefusedStage>,
+) {
+    let unheld = due.difference(held).collect::<Vec<_>>();
+    if unheld.is_empty() {
+        return;
+    }
+    let Ok(live) = daemon_dfs_live_write_lane_intents(data_dir) else {
+        return;
+    };
+    let backoff = Duration::from_nanos(crate::transfer::repair_retry_delay_nanos_for_ticks(
+        crate::transfer::repair_retry_delay_ticks(1),
+    ));
+    for (intent_id, member) in unheld {
+        if live.contains(intent_id) {
+            crate::maintenance::stage_wakes::note_stage_refused(
+                data_dir, intent_id, member, backoff,
+            );
+        }
+    }
 }
 
 /// Whether this pass itself proved that it stopped with bounded, immediately
@@ -2264,6 +2324,24 @@ pub(crate) async fn run_daemon_dfs_repair_executor_turn_in_blocking_task(
         node_resources,
         shutdown,
         Some(DaemonDfsMaintenanceKind::RepairExecutor),
+    )
+    .await
+}
+
+/// Run one writes turn from Tokio's blocking pool, owned and cancelled
+/// exactly like a maintenance tick.
+pub(crate) async fn run_daemon_dfs_unfinished_writes_turn_in_blocking_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    run_daemon_dfs_maintenance_in_blocking_task(
+        paths,
+        runtime,
+        node_resources,
+        shutdown,
+        Some(DaemonDfsMaintenanceKind::UnfinishedWrites),
     )
     .await
 }

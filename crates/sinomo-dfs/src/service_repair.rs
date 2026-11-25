@@ -337,6 +337,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             outcome.delivery_state
         };
         state.inflight = outcome.sent;
+        let attempts = state.attempts;
         if state.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent) {
             pending.stage_inflight_request_ids.remove(target);
         }
@@ -349,6 +350,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 crate::repair_executor::DfsRepairAttemptOutcome::Failed,
                 outcome.last_error.clone(),
             );
+            self.note_refused_stage(intent_id, target, attempts);
         }
         Ok(())
     }
@@ -832,17 +834,30 @@ where
                 if full_stage_targets.is_empty() {
                     continue;
                 }
-                if self.open_pending_write_blob_stream(&pending).is_err() {
-                    let fetch_requested = self
-                        .request_stage_blob_from_alternate_async(&intent, &pending)
-                        .await?;
-                    if !fetch_requested {
-                        for (replica_node_id, _) in full_stage_targets {
-                            self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                let size_bytes = match self.open_pending_write_blob_stream(&pending) {
+                    // A write hydrated before its size was known takes it from
+                    // the verified content it holds now, as a fetched blob
+                    // gives it.
+                    Ok(reader) if pending.size_bytes == 0 => {
+                        let size_bytes = reader.size_bytes();
+                        if let Some(pending) = self.writes.pending_writes.get_mut(&intent_id) {
+                            pending.size_bytes = size_bytes;
                         }
+                        size_bytes
                     }
-                    break;
-                }
+                    Ok(_) => pending.size_bytes,
+                    Err(_) => {
+                        let fetch_requested = self
+                            .request_stage_blob_from_alternate_async(&intent, &pending)
+                            .await?;
+                        if !fetch_requested {
+                            for (replica_node_id, _) in full_stage_targets {
+                                self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                            }
+                        }
+                        break;
+                    }
+                };
                 let outcomes = self
                     .send_stage_blob_attachments_if_routable_async(
                         &full_stage_targets,
@@ -852,7 +867,7 @@ where
                         intent.base_version.clone(),
                         &intent.target_version,
                         &pending.content_hash,
-                        pending.size_bytes,
+                        size_bytes,
                         object_metadata,
                     )
                     .await?;
@@ -1461,15 +1476,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if full_stage_targets.is_empty() {
                 continue;
             }
-            if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self.request_stage_blob_from_alternate(&intent, &pending)?;
-                if !fetch_requested {
-                    for (replica_node_id, _) in full_stage_targets {
-                        self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+            let size_bytes = match self.open_pending_write_blob_stream(&pending) {
+                // As in the asynchronous retry: a size unknown at hydration
+                // comes from the verified content held now.
+                Ok(reader) if pending.size_bytes == 0 => {
+                    let size_bytes = reader.size_bytes();
+                    if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
+                        pending.size_bytes = size_bytes;
                     }
+                    size_bytes
                 }
-                break;
-            }
+                Ok(_) => pending.size_bytes,
+                Err(_) => {
+                    let fetch_requested =
+                        self.request_stage_blob_from_alternate(&intent, &pending)?;
+                    if !fetch_requested {
+                        for (replica_node_id, _) in full_stage_targets {
+                            self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+                        }
+                    }
+                    break;
+                }
+            };
             let outcomes = self.send_stage_blob_attachments_if_routable(
                 &full_stage_targets,
                 intent_id,
@@ -1478,7 +1506,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent.base_version.clone(),
                 &intent.target_version,
                 &pending.content_hash,
-                pending.size_bytes,
+                size_bytes,
                 Some(object_metadata.clone()),
             )?;
             for ((replica_node_id, request_id), outcome) in
@@ -1696,8 +1724,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 state.attempts = state.attempts.saturating_add(1);
             }
             state.inflight = false;
-            state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
+            let attempts = state.attempts;
+            state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(attempts));
+            self.note_refused_stage(intent_id, replica_node_id, attempts);
         }
+    }
+
+    /// The stage of the write `intent_id` to `member` was refused on its
+    /// `attempts`th attempt: the member's path coming back, or the stage's
+    /// re-send timer with that attempt's backoff, runs the lane's write phase
+    /// that sends it again (see `maintenance/stage_wakes.rs`).
+    fn note_refused_stage(&self, intent_id: &str, member: &NodeId, attempts: u32) {
+        if let Some(data_dir) = self.stage_wake_data_dir.as_ref() {
+            crate::maintenance::stage_wakes::note_stage_refused(
+                data_dir,
+                intent_id,
+                member,
+                Duration::from_nanos(crate::transfer::repair_retry_delay_nanos_for_ticks(
+                    repair_retry_delay_ticks(attempts.max(1)),
+                )),
+            );
+        }
+    }
+
+    /// Make the refused stages in `due` due now, for the writes this service
+    /// holds; returns those it holds.
+    pub(crate) fn make_refused_stages_due(
+        &mut self,
+        due: &BTreeSet<crate::maintenance::stage_wakes::DfsRefusedStage>,
+    ) -> BTreeSet<crate::maintenance::stage_wakes::DfsRefusedStage> {
+        let mut held = BTreeSet::new();
+        for (intent_id, member) in due {
+            if let Some(state) = self
+                .writes
+                .pending_writes
+                .get_mut(intent_id)
+                .and_then(|pending| pending.stage_retries.get_mut(member))
+            {
+                if !state.inflight {
+                    state.next_retry_tick = 0;
+                }
+                held.insert((intent_id.clone(), member.clone()));
+            }
+        }
+        held
     }
 
     pub(crate) fn record_stage_patch_fallback(

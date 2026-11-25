@@ -7,6 +7,7 @@
 pub(crate) mod job_claims;
 pub(crate) mod job_triggers;
 mod progress;
+pub(crate) mod stage_wakes;
 pub(crate) mod storage_waits;
 pub(crate) use progress::DfsMaintenanceProgressState;
 
@@ -3110,6 +3111,7 @@ pub(crate) mod phase_runs {
     pub(crate) const FULL_TICK_COMPLETION: &str = "full_tick_completion";
     pub(crate) const EXECUTOR_TURN_LAUNCH: &str = "executor_turn_launch";
     pub(crate) const JOBS_TURN_LAUNCH: &str = "jobs_turn_launch";
+    pub(crate) const WRITES_TURN_LAUNCH: &str = "writes_turn_launch";
 
     static RUNS: Mutex<BTreeMap<(PathBuf, &'static str), u64>> = Mutex::new(BTreeMap::new());
     static LAUNCHES: Mutex<BTreeMap<PathBuf, Vec<&'static str>>> = Mutex::new(BTreeMap::new());

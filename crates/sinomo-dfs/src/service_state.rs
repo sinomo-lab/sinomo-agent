@@ -899,6 +899,10 @@ pub struct NetworkedDfsService<T> {
     /// The node this requester runs on, for the network verdicts its held
     /// writes watch. `None` for a service that is not a node's requester.
     pub(crate) node_data_dir: Option<sinomo_core::local::SinomoDataDir>,
+    /// The node whose maintenance sends this service's refused stages again
+    /// (see `maintenance/stage_wakes.rs`). `None` for a service that serves
+    /// no routed write on a shard lane.
+    pub(crate) stage_wake_data_dir: Option<sinomo_core::local::SinomoDataDir>,
     /// The routed write a settle that is not a mounted call holds, and what
     /// watches it (see [`crate::held_write_watch`]).
     pub(crate) held_write: Option<(String, crate::held_write_watch::DfsHeldWriteWatch)>,

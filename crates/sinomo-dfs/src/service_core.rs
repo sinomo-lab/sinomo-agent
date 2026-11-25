@@ -100,6 +100,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             attribute_read_replans: false,
             attribute_read_resend: None,
             node_data_dir: None,
+            stage_wake_data_dir: None,
             held_write: None,
             unclaimed_answers: None,
         }
@@ -277,6 +278,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         data_dir: sinomo_core::local::SinomoDataDir,
     ) -> Self {
         self.node_data_dir = Some(data_dir);
+        self
+    }
+
+    /// Name the node whose maintenance sends this service's refused stages
+    /// again.
+    pub(crate) fn with_stage_wakes(mut self, data_dir: sinomo_core::local::SinomoDataDir) -> Self {
+        self.stage_wake_data_dir = Some(data_dir);
         self
     }
 

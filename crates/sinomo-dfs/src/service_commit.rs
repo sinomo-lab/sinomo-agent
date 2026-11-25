@@ -580,7 +580,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The size of an open write's content: the size its row recorded, or
     /// the size of matching content this node holds. A write whose size is
     /// unknown has no transfer until a retry brings its verified content.
-    fn open_write_content_size(
+    pub(crate) fn open_write_content_size(
         &self,
         record: &DfsWriteIntentRecord,
         content_hash: &str,
@@ -1245,8 +1245,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 effects.push(DfsPreparedMetadataEffect::PutObject { object: updated });
             }
         }
+        #[cfg(test)]
+        opening_races::run(&intent.intent_id);
         if !effects.is_empty() {
-            if let Some(shard) = planning_shard {
+            let published = if let Some(shard) = planning_shard {
                 if shard.file_system_id != object.file_system_id
                     || shard.primary_node_id != self.node_id
                 {
@@ -1266,9 +1268,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         operation_id: format!("metadata:{}", sinomo_core::Id::generate()),
                     },
                     effects,
-                )?;
+                )
+                .map(drop)
             } else {
-                self.publish_object_metadata_effects(&object, effects)?;
+                self.publish_object_metadata_effects(&object, effects)
+                    .map(drop)
+            };
+            if let Err(error) = published {
+                // Another path of the same write may have committed it since
+                // this node read its row: the native tables then refuse to
+                // reopen the terminal row. A write under its operation id is
+                // answered from that commit.
+                if intent.operation_id.is_some()
+                    && intent.state == DfsWriteIntentState::AwaitingReceipts
+                {
+                    self.refresh_committed_write_projection(&intent.intent_id)?;
+                    if self
+                        .coordinator
+                        .intent(&intent.intent_id)
+                        .is_some_and(|current| {
+                            current.state != DfsWriteIntentState::AwaitingReceipts
+                        })
+                    {
+                        return Ok(());
+                    }
+                }
+                return Err(error);
             }
         }
         Ok(())
@@ -2924,6 +2949,37 @@ mod atomic_create_parent_touch_tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+        }
+    }
+}
+
+/// Test support: run work of another path of a write between this node's
+/// read of the write's row and the publication of its opening.
+#[cfg(test)]
+pub(crate) mod opening_races {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    type Race = Box<dyn FnOnce() + Send>;
+
+    static RACES: Mutex<BTreeMap<String, Race>> = Mutex::new(BTreeMap::new());
+
+    /// Run `race` once, before the next publication of the opening of the
+    /// write `intent_id`.
+    pub(crate) fn before_opening_of(intent_id: &str, race: impl FnOnce() + Send + 'static) {
+        RACES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(intent_id.to_owned(), Box::new(race));
+    }
+
+    pub(super) fn run(intent_id: &str) {
+        let race = RACES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(intent_id);
+        if let Some(race) = race {
+            race();
         }
     }
 }

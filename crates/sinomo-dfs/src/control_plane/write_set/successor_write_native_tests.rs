@@ -437,9 +437,41 @@ fn write_over(
 /// Cut the primary off and lose it; `successor` takes over, as only its
 /// keeper runs, and activates.
 fn takes_over(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, successor: &NodeId) {
+    take_over(runtime, config, successor, false);
+}
+
+/// [`takes_over`] with the maintenance a successor may run early: one tick
+/// once the record names it primary but before it activates, and one once
+/// it activates.
+fn takes_over_with_early_ticks(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    successor: &NodeId,
+) {
+    take_over(runtime, config, successor, true);
+}
+
+/// One maintenance tick at `node`.
+fn tick(runtime: &DfsTestRuntime, node: &NodeId) {
+    runtime
+        .maintenance_tick(node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap()
+        .outcome
+        .unwrap();
+}
+
+fn take_over(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    successor: &NodeId,
+    early_ticks: bool,
+) {
     let p = config.primary_node_id.clone();
     let b = config.replica_node_ids[0].clone();
     let c = config.replica_node_ids[1].clone();
+    if early_ticks {
+        runtime.hold_takeover_activation(successor, true);
+    }
     runtime.partition_node(
         &p,
         Partition {
@@ -448,6 +480,19 @@ fn takes_over(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, success
         },
     );
     lose(runtime, &[&b, &c], &p);
+    if early_ticks {
+        wait_until(
+            "the record names the member primary",
+            runtime,
+            &[successor],
+            || {
+                try_record_from(runtime, config, successor)
+                    .is_some_and(|record| &record.shard.primary_node_id == successor)
+            },
+        );
+        tick(runtime, successor);
+        runtime.hold_takeover_activation(successor, false);
+    }
     wait_until(
         "the member takes over and activates",
         runtime,
@@ -468,13 +513,17 @@ fn takes_over(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, success
             .primary_node_id,
         successor
     );
+    if early_ticks {
+        tick(runtime, successor);
+    }
 }
 
 /// `requester`'s own client writes over `base` under `operation` while the
 /// primary cannot stage to either member: the primary keeps the write's
 /// only copy and answers it `Pending`, and the client keeps the write's
 /// request. Both members hold the write's row when the primary is lost and
-/// `successor` takes over. Returns the client and the write's intent id.
+/// `successor` takes over, with its early ticks when `early_ticks`.
+/// Returns the client and the write's intent id.
 fn open_write_past_a_lost_primary(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
@@ -482,6 +531,7 @@ fn open_write_past_a_lost_primary(
     operation: &str,
     requester: &NodeId,
     successor: &NodeId,
+    early_ticks: bool,
 ) -> (crate::NetworkedDfsService<crate::DfsNodeTransport>, String) {
     let b = config.replica_node_ids[0].clone();
     let c = config.replica_node_ids[1].clone();
@@ -507,74 +557,116 @@ fn open_write_past_a_lost_primary(
             .into_iter()
             .all(|member| intent_at(runtime, member, config, &base.object_id, &intent_id).is_some())
     });
-    takes_over(runtime, config, successor);
+    take_over(runtime, config, successor, early_ticks);
     runtime.clear_faults();
     (writer, intent_id)
 }
 
-/// An open write the lost primary answered `Pending` is aborted at the
-/// member that took over, from the write's row: the requester's abort
-/// closes it once. A repeat of the abort under its id, as a requester whose
-/// answer was lost sends it, is answered from the row as that same abort.
-#[test]
-fn native_abort_of_an_open_write_at_a_successor_aborts_it_once() {
-    let (runtime, config) = owned_shard("native-successor-abort");
+/// How the member `owner` that took over answered the requester's abort
+/// `answer` of the open write `intent_id` over `base`, once: the write is
+/// aborted and never commits, or `owner` completed it first from a live copy
+/// of its bytes and the abort is answered with that commit. Returns the
+/// version and bytes the file then holds.
+fn assert_abort_answered_once(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    owner: &NodeId,
+    base: &crate::DfsStat,
+    intent_id: &str,
+    answer: &crate::DistributedWriteIntent,
+    operation: &str,
+) -> (crate::DfsVersion, Vec<u8>) {
+    let row = intent_at(runtime, owner, config, &base.object_id, intent_id).unwrap();
+    assert_eq!(*answer, crate::intent::distributed_intent_from_record(&row));
+    match row.status {
+        crate::DfsWriteIntentStatus::Aborted => {
+            assert_eq!(answer.state, crate::DfsWriteIntentState::Aborted);
+            (base.version.clone(), b"before".to_vec())
+        }
+        crate::DfsWriteIntentStatus::Committed => {
+            assert_eq!(answer.state, crate::DfsWriteIntentState::Committed);
+            (answer.target_version.clone(), operation.as_bytes().to_vec())
+        }
+        other => panic!("the abort is answered with the write's end: {other:?}"),
+    }
+}
+
+/// An open write the lost primary answered `Pending` is answered once at
+/// the member that took over, from the write's row, when the requester
+/// aborts it: aborted, or answered with the commit if the member completed
+/// the write first from the requester's copy. A repeat of an abort under its
+/// id, as a requester whose answer was lost sends it, is answered from the
+/// row as that same abort.
+fn abort_of_an_open_write_at_a_successor(name: &str, early_ticks: bool) {
+    let (runtime, config) = owned_shard(name);
     let b = config.replica_node_ids[0].clone();
     let c = config.replica_node_ids[1].clone();
     let path = "/services/owned/aborted.txt";
     let operation = "successor-abort";
     let before = committed_before(&runtime, &config, path);
     let (mut writer, intent_id) =
-        open_write_past_a_lost_primary(&runtime, &config, &before, operation, &c, &b);
+        open_write_past_a_lost_primary(&runtime, &config, &before, operation, &c, &b, early_ticks);
     writer.set_transport_operation_deadline(Some(Instant::now() + EVENT_BOUND));
-    let aborted = writer
+    let answer = writer
         .abort_pending_write(&intent_id)
-        .expect("the member that took over aborts the write");
-    let row = intent_at(&runtime, &b, &config, &before.object_id, &intent_id).unwrap();
-    assert_eq!(row.status, crate::DfsWriteIntentStatus::Aborted);
-    assert_eq!(aborted.state, crate::DfsWriteIntentState::Aborted);
-    assert_eq!(aborted, crate::intent::distributed_intent_from_record(&row));
-    let repeat = writer
-        .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-            crate::service_ownership::pending_write_abort_request_id(&intent_id),
-            before.file_system_id.clone(),
-            b.clone(),
-            crate::DfsNamespaceOperation::AbortPendingWrite {
-                path: path.into(),
-                object_id: before.object_id.clone(),
-                target_version: aborted.target_version.clone(),
-                intent_id: intent_id.clone(),
-                write_operation_id: operation.into(),
-            },
-            EVENT_BOUND,
-            false,
-            false,
-        )
-        .expect("the repeat is answered");
-    assert_eq!(repeat.result, crate::DfsNamespaceResult::Applied);
-    assert!(
-        matches!(
-            &repeat.posix_coordination_result,
-            Some(crate::DfsPosixCoordinationResult::AbortedWriteIntent(intent))
-                if **intent == aborted
-        ),
-        "the repeat is answered as the same abort: {:?}",
-        repeat.posix_coordination_result
+        .expect("the member that took over answers the abort");
+    let (version, content) = assert_abort_answered_once(
+        &runtime, &config, &b, &before, &intent_id, &answer, operation,
     );
-    assert_eq!(
-        intent_at(&runtime, &b, &config, &before.object_id, &intent_id),
-        Some(row),
-        "the repeat changes nothing"
-    );
+    if answer.state == crate::DfsWriteIntentState::Aborted {
+        let row = intent_at(&runtime, &b, &config, &before.object_id, &intent_id);
+        let repeat = writer
+            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                crate::service_ownership::pending_write_abort_request_id(&intent_id),
+                before.file_system_id.clone(),
+                b.clone(),
+                crate::DfsNamespaceOperation::AbortPendingWrite {
+                    path: path.into(),
+                    object_id: before.object_id.clone(),
+                    target_version: answer.target_version.clone(),
+                    intent_id: intent_id.clone(),
+                    write_operation_id: operation.into(),
+                },
+                EVENT_BOUND,
+                false,
+                false,
+            )
+            .expect("the repeat is answered");
+        assert_eq!(repeat.result, crate::DfsNamespaceResult::Applied);
+        assert!(
+            matches!(
+                &repeat.posix_coordination_result,
+                Some(crate::DfsPosixCoordinationResult::AbortedWriteIntent(intent))
+                    if **intent == answer
+            ),
+            "the repeat is answered as the same abort: {:?}",
+            repeat.posix_coordination_result
+        );
+        assert_eq!(
+            intent_at(&runtime, &b, &config, &before.object_id, &intent_id),
+            row,
+            "the repeat changes nothing"
+        );
+    }
     drop(writer);
     heal(&runtime, &config);
     let (stat, bytes) = read(&runtime, &c, path);
-    assert_eq!(
-        stat.version, before.version,
-        "the aborted write never committed"
-    );
-    assert_eq!(bytes, b"before");
+    assert_eq!(stat.version, version, "the write ended once");
+    assert_eq!(bytes, content);
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_abort_of_an_open_write_at_a_successor_is_answered_once() {
+    abort_of_an_open_write_at_a_successor("native-successor-abort", false);
+}
+
+/// [`native_abort_of_an_open_write_at_a_successor_is_answered_once`] after the
+/// successor's early maintenance ticks, which can complete the write from the
+/// requester's copy before the abort arrives.
+#[test]
+fn native_abort_of_an_open_write_at_a_successor_after_early_ticks_is_answered_once() {
+    abort_of_an_open_write_at_a_successor("native-successor-abort-early", true);
 }
 
 /// C's own client writes over `base` under `operation`; the primary staged
@@ -753,34 +845,108 @@ fn native_abort_of_a_write_its_successor_committed_is_answered_with_the_commit()
     runtime.close().unwrap();
 }
 
-/// [`native_abort_of_an_open_write_at_a_successor_aborts_it_once`] where the
-/// requester's own node took over: its abort closes the write from the row.
-/// The requester is B, the member the takeover ranks first, so it takes over
+/// [`native_abort_of_an_open_write_at_a_successor_is_answered_once`] where the
+/// requester's own node took over: its abort is answered from the row, as an
+/// abort or with the commit it completed first from its own copy. The
+/// requester is B, the member the takeover ranks first, so it takes over
 /// without handing the takeover to a member whose keeper does not run.
-#[test]
-fn native_abort_of_an_open_write_its_requester_took_over_aborts_it_once() {
-    let (runtime, config) = owned_shard("native-successor-abort-local");
+fn abort_of_an_open_write_its_requester_took_over(name: &str, early_ticks: bool) {
+    let (runtime, config) = owned_shard(name);
     let b = config.replica_node_ids[0].clone();
     let path = "/services/owned/aborted-local.txt";
     let operation = "successor-abort-local";
     let before = committed_before(&runtime, &config, path);
     let (mut writer, intent_id) =
-        open_write_past_a_lost_primary(&runtime, &config, &before, operation, &b, &b);
+        open_write_past_a_lost_primary(&runtime, &config, &before, operation, &b, &b, early_ticks);
     writer.set_transport_operation_deadline(Some(Instant::now() + EVENT_BOUND));
-    let aborted = writer
+    let answer = writer
         .abort_pending_write(&intent_id)
-        .expect("the requester's node aborts the write it took over");
-    let row = intent_at(&runtime, &b, &config, &before.object_id, &intent_id).unwrap();
-    assert_eq!(row.status, crate::DfsWriteIntentStatus::Aborted);
-    assert_eq!(aborted, crate::intent::distributed_intent_from_record(&row));
+        .expect("the requester's node answers the abort of the write it took over");
+    let (version, content) = assert_abort_answered_once(
+        &runtime, &config, &b, &before, &intent_id, &answer, operation,
+    );
     drop(writer);
     heal(&runtime, &config);
     let (stat, bytes) = read(&runtime, &b, path);
+    assert_eq!(stat.version, version, "the write ended once");
+    assert_eq!(bytes, content);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn native_abort_of_an_open_write_its_requester_took_over_is_answered_once() {
+    abort_of_an_open_write_its_requester_took_over("native-successor-abort-local", false);
+}
+
+/// [`native_abort_of_an_open_write_its_requester_took_over_is_answered_once`]
+/// after the successor's early maintenance ticks, which can complete the
+/// write from its own copy before the abort arrives.
+#[test]
+fn native_abort_of_an_open_write_its_requester_took_over_after_early_ticks_is_answered_once() {
+    abort_of_an_open_write_its_requester_took_over("native-successor-abort-local-early", true);
+}
+
+/// An open write whose only copy is on the primary that wrote it: the
+/// primary's own client wrote it, the primary could stage it to neither
+/// member and answered it `Pending`, and the primary is lost. The member that
+/// took over holds the write's row and none of its bytes, and no live node
+/// holds them. Its early maintenance ticks, before and after it activates,
+/// and the reconciliation its activation requests leave the write open: a
+/// write commits only with W durable receipts of its bytes.
+#[test]
+fn native_open_write_whose_only_copy_is_on_the_lost_primary_stays_open() {
+    let (runtime, config) = owned_shard("native-successor-only-copy-lost");
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let path = "/services/owned/only-copy.txt";
+    let operation = "successor-only-copy-lost";
+    let before = committed_before(&runtime, &config, path);
+    let (writer, intent_id) =
+        open_write_past_a_lost_primary(&runtime, &config, &before, operation, &p, &b, true);
+    let paths = crate::runtime_host::DfsRuntimePaths::new(runtime.data_dir(&b));
+    let mut rounds = 0;
+    while crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&paths).is_some() {
+        rounds += 1;
+        assert!(rounds <= 16, "the activation's reconciliation completes");
+        tick(&runtime, &b);
+    }
+    let row = intent_at(&runtime, &b, &config, &before.object_id, &intent_id).unwrap();
+    assert_eq!(row.status, crate::DfsWriteIntentStatus::ReceiptsPending);
     assert_eq!(
-        stat.version, before.version,
-        "the aborted write never committed"
+        prepared_at(&runtime, &b, &config, &format!("write:{intent_id}")),
+        None,
+        "no commit was prepared"
     );
-    assert_eq!(bytes, b"before");
+    let copy = crate::LocalSobjMetadataBackend::open_for_inspection(
+        crate::DfsMetadataShardId::new(config.shard_id.clone()),
+        shard_root(&runtime, &b, &config),
+    )
+    .unwrap()
+    .export_table_snapshot()
+    .unwrap();
+    let receipts = copy
+        .tables
+        .receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.receipt.object_id == before.object_id
+                && receipt.receipt.committed_version == row.target_version
+        })
+        .count();
+    assert!(
+        receipts < row.policy.min_commit_replicas,
+        "the write holds fewer than W receipts: {receipts}"
+    );
+    assert_eq!(
+        copy.tables
+            .objects
+            .iter()
+            .find(|object| object.object_id == before.object_id)
+            .map(|object| object.version.clone()),
+        Some(before.version.clone()),
+        "the file keeps its committed version"
+    );
+    drop(writer);
     runtime.close().unwrap();
 }
 
@@ -929,7 +1095,7 @@ fn native_retry_meeting_its_openings_recovery_commits_once() {
 /// one of two: B answers the retry `Pending` while it cannot stage to C,
 /// and commits once its copy to C lands. Ends with the call answered and the
 /// write committed once.
-fn retry_after_its_successor_adopted_the_write(name: &str, held: bool) {
+fn retry_after_its_successor_adopted_the_write(name: &str, held: bool, early_ticks: bool) {
     let (runtime, config) = owned_shard(name);
     let p = config.primary_node_id.clone();
     let b = config.replica_node_ids[0].clone();
@@ -1002,12 +1168,29 @@ fn retry_after_its_successor_adopted_the_write(name: &str, held: bool) {
             });
         }
     }
-    takes_over(&runtime, &config, &b);
+    if early_ticks {
+        takes_over_with_early_ticks(&runtime, &config, &b);
+        // Every tick the takeover asks of B runs before the retry reaches
+        // it, as an early tick can leave it.
+        let paths = crate::runtime_host::DfsRuntimePaths::new(runtime.data_dir(&b));
+        let mut rounds = 0;
+        while crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&paths)
+            .is_some()
+        {
+            rounds += 1;
+            assert!(rounds <= 16, "B's reconciliation completes");
+            tick(&runtime, &b);
+        }
+    } else {
+        takes_over(&runtime, &config, &b);
+    }
     let epoch = record_from(&runtime, &config, &b).shard.epoch;
     wait_until("B adopts the write at its epoch", &runtime, &[&b], || {
         intent_at(&runtime, &b, &config, &before.object_id, &intent_id)
             .is_some_and(|row| row.owner_epoch == epoch)
     });
+    let b_root = runtime.data_dir(&b).root();
+    let refused_before = crate::maintenance::stage_wakes::refused_stages_noted(&b_root);
     super::commit_native_tests::release(&resend);
     if held {
         wait_until("B answers the retry", &runtime, &[&b], || answered_by(&b));
@@ -1017,6 +1200,17 @@ fn retry_after_its_successor_adopted_the_write(name: &str, held: bool) {
             "B holds the write below W: {early:?}; C's calls {:?}",
             write_calls_from(&runtime, &c, operation)
         );
+        // B's stage to C was refused: its re-send timer, or C's path coming
+        // back, sends it again, with no tick to run it.
+        assert!(
+            crate::maintenance::stage_wakes::refused_stages_noted(&b_root) > refused_before,
+            "B records its refused stage to C"
+        );
+        if early_ticks {
+            // A tick under the refusal sends the stage again from the write B
+            // hydrated before the retry, with the size its row recorded.
+            tick(&runtime, &b);
+        }
         // B's copy to C lands: the write commits, and its commit answers
         // the call.
         runtime.clear_faults();
@@ -1055,7 +1249,7 @@ fn retry_after_its_successor_adopted_the_write(name: &str, held: bool) {
 /// binds to the write there, and the write commits once.
 #[test]
 fn native_retry_after_its_successor_adopted_the_write_commits_once() {
-    retry_after_its_successor_adopted_the_write("native-successor-adopted-retry", false);
+    retry_after_its_successor_adopted_the_write("native-successor-adopted-retry", false, false);
 }
 
 /// As [`native_retry_after_its_successor_adopted_the_write_commits_once`],
@@ -1064,5 +1258,15 @@ fn native_retry_after_its_successor_adopted_the_write_commits_once() {
 /// answer, and the write's commit answers the caller's one call.
 #[test]
 fn native_retry_held_at_its_successor_is_answered_by_its_commit() {
-    retry_after_its_successor_adopted_the_write("native-successor-held-retry", true);
+    retry_after_its_successor_adopted_the_write("native-successor-held-retry", true, false);
+}
+
+/// [`native_retry_held_at_its_successor_is_answered_by_its_commit`] where B
+/// runs every tick its takeover asks for before the retry reaches it: before
+/// it activates, once it activates and its reconciliation. No tick follows
+/// the refusal of B's stage to C; the stage's own wake sends it again once C
+/// takes it, and the commit answers the call.
+#[test]
+fn native_retry_held_at_its_successor_after_early_ticks_is_answered_by_its_commit() {
+    retry_after_its_successor_adopted_the_write("native-successor-held-retry-early", true, true);
 }

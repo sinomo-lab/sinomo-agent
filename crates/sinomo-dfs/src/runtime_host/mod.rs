@@ -3978,6 +3978,7 @@ pub(crate) use maintenance_runtime::{
     run_daemon_dfs_maintenance_tick_in_blocking_task,
     run_daemon_dfs_namespace_jobs_turn_in_blocking_task,
     run_daemon_dfs_repair_executor_turn_in_blocking_task,
+    run_daemon_dfs_unfinished_writes_turn_in_blocking_task,
 };
 mod peer_verdicts;
 #[cfg(any(test, feature = "test-support"))]

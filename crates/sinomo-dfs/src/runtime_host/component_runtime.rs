@@ -489,6 +489,11 @@ pub(super) async fn run_component_maintenance(
     let mut executor_requested = false;
     // A requested jobs turn runs only the namespace jobs pass.
     let mut jobs_requested = false;
+    // A refused stage that is due again runs only the lanes' write phase. A
+    // writes turn that yielded to foreground work runs again at this time,
+    // or on the release of the admission it gave way to.
+    let mut writes_requested = false;
+    let mut writes_retry_at = None::<Instant>;
     let mut resources = node_resources.take_latest();
     let data_dir = paths.data_dir().expect("validated data root");
     let notify = match daemon_dfs_maintenance_notify(&data_dir) {
@@ -520,6 +525,12 @@ pub(super) async fn run_component_maintenance(
     let _jobs_turn_wake =
         crate::maintenance::job_triggers::register_jobs_turn_wake(&data_root, move || {
             jobs_wake.notify_one();
+        });
+    let writes_notify = Arc::new(tokio::sync::Notify::new());
+    let writes_wake = Arc::clone(&writes_notify);
+    let _writes_turn_wake =
+        crate::maintenance::stage_wakes::register_writes_turn_wake(&data_root, move || {
+            writes_wake.notify_one();
         });
     // The executor timer value that already fired, with the executor's pass
     // count then. It stays consumed until a pass publishes the executor's
@@ -579,6 +590,21 @@ pub(super) async fn run_component_maintenance(
             Some(wait) => Some(due.map_or(wait, |due| due.min(wait))),
             None => due,
         };
+        // A refused stage's re-send timer: a fallback, never a network
+        // deadline. A turn that yielded waits for its own retry time instead.
+        let writes_wait = if executor_deferred {
+            None
+        } else if writes_requested {
+            Some(Duration::ZERO)
+        } else {
+            writes_retry_at
+                .or_else(|| crate::maintenance::stage_wakes::next_due(&data_root))
+                .map(|at| at.saturating_duration_since(now))
+        };
+        let due = match writes_wait {
+            Some(wait) => Some(due.map_or(wait, |due| due.min(wait))),
+            None => due,
+        };
         // Biased: a maintenance request is taken before an executor wake or
         // timer that is ready at the same time. Its full tick serves executor
         // work too, and executor work it leaves runs as the executor's turn
@@ -612,6 +638,10 @@ pub(super) async fn run_component_maintenance(
             }
             _ = jobs_notify.notified() => {
                 jobs_requested = true;
+            }
+            _ = writes_notify.notified() => {
+                writes_requested = true;
+                writes_retry_at = None;
             }
             updated = node_resources.changed() => {
                 resources = updated;
@@ -673,6 +703,18 @@ pub(super) async fn run_component_maintenance(
             if repair_retry_at.is_some_and(|at| Instant::now() >= at) {
                 repair_retry_at = None;
                 executor_requested = true;
+            }
+            match writes_retry_at {
+                Some(at) if Instant::now() >= at => {
+                    writes_retry_at = None;
+                    writes_requested = true;
+                }
+                Some(_) => {}
+                None => {
+                    if crate::maintenance::stage_wakes::has_due(&data_root, Instant::now()) {
+                        writes_requested = true;
+                    }
+                }
             }
             if let Some((due_unix_nanos, at)) = executor_due_at
                 && Instant::now() >= at
@@ -845,7 +887,57 @@ pub(super) async fn run_component_maintenance(
             }
         }
 
-        if due.is_none() && !triggered && !executor_requested && !jobs_requested {
+        // A refused stage that is due again runs the lanes' write phase, once
+        // no full tick ran it first.
+        if writes_requested
+            && !*shutdown.borrow()
+            && !daemon_dfs_background_network_work_deferred(resources)
+        {
+            writes_requested = false;
+            if crate::maintenance::stage_wakes::has_due(&data_root, Instant::now()) {
+                #[cfg(test)]
+                crate::maintenance::phase_runs::record_launch(
+                    &data_root,
+                    crate::maintenance::phase_runs::WRITES_TURN_LAUNCH,
+                );
+                match run_daemon_dfs_unfinished_writes_turn_in_blocking_task(
+                    paths.clone(),
+                    runtime.clone(),
+                    resources,
+                    shutdown.clone(),
+                )
+                .await
+                {
+                    // A turn that ran no lane phase leaves its stages due:
+                    // they wait for the re-send timer, never in a loop.
+                    Ok(DaemonDfsMaintenanceTickOutcome::Completed { .. }) => {
+                        if crate::maintenance::stage_wakes::has_due(&data_root, Instant::now()) {
+                            writes_retry_at = Instant::now()
+                                .checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                        }
+                    }
+                    // Foreground work took admission first: the release of
+                    // that admission, or this bounded re-send timer.
+                    Ok(DaemonDfsMaintenanceTickOutcome::Deferred)
+                    | Ok(DaemonDfsMaintenanceTickOutcome::Continued) => {
+                        writes_retry_at = Instant::now()
+                            .checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "DFS unfinished writes turn failed");
+                        writes_retry_at = Instant::now()
+                            .checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    }
+                }
+            }
+        }
+
+        if due.is_none()
+            && !triggered
+            && !executor_requested
+            && !jobs_requested
+            && !writes_requested
+        {
             tokio::time::sleep(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL).await;
         }
     }

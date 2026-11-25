@@ -2077,7 +2077,8 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
     );
     let service = with_daemon_dfs_control_plane_on_runtime(
         NetworkedDfsService::new(transport, content)
-            .with_cross_shard_namespace_lock_registry(cross_shard_namespace_locks),
+            .with_cross_shard_namespace_lock_registry(cross_shard_namespace_locks)
+            .with_stage_wakes(data_dir.clone()),
         cluster_paths,
         Some(runtime),
     );
