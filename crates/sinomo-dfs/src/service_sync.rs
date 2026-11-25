@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
-use crate::metadata_journal::metadata_prefix_proof_after_exact_frame;
 use crate::metadata_records::DfsMetadataPrefixProof;
 
 use crate::{
@@ -298,28 +297,18 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff_for(
     write_set_shard: bool,
 ) -> Result<bool, DfsError> {
     // Another already-bound writer can append after the read-side lineage
-    // check and before the backend acquires its write gate. Retry only that
-    // typed comparison failure, re-reading the marker and revalidating the
-    // complete proof/lineage each time. Never relax the under-lock comparison.
-    let mut prefix_retries = 2;
-    loop {
-        match rebind_completed_metadata_shard_membership_handoff_once(
-            backend,
-            local_node_id,
-            active,
-            pending,
-            proof,
-            write_set_shard,
-        ) {
-            Err(DfsError::MetadataRejection {
-                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
-                ..
-            }) if prefix_retries > 0 => {
-                prefix_retries -= 1;
-            }
-            result => return result,
-        }
-    }
+    // check and before the backend acquires its write gate. The backend
+    // proves the head it finds under that hold descends from the checked
+    // prefix and rebinds in the same hold, so such an append never refuses
+    // the rebind.
+    rebind_completed_metadata_shard_membership_handoff_once(
+        backend,
+        local_node_id,
+        active,
+        pending,
+        proof,
+        write_set_shard,
+    )
 }
 
 /// Read-only qualification of the existing certified handoff marker and its
@@ -3450,8 +3439,8 @@ pub(crate) fn metadata_shard_state_fingerprint_at(
 /// A successfully rebound authority may append before another process opens
 /// the same shard. Equality is therefore sufficient only for the first bind;
 /// later fresh lanes reconstruct the hash chain from the durable marker to the
-/// current exact prefix. A missing entry, sequence gap, divergent digest, or
-/// concurrently moving head leaves the lane fenced for a later retry.
+/// current exact prefix. A missing entry, sequence gap or divergent digest
+/// leaves the lane fenced.
 /// Read-only native inspection of the exact installed anchor or its verified
 /// journal descendant. This grants no mutation authority and never performs
 /// writer recovery. Missing/pruned ancestry returns `None`, never a clock-only
@@ -3571,52 +3560,25 @@ fn metadata_shard_prefix_matches_or_extends_marker_with_reader(
     marker_sequence: u64,
     marker_fingerprint: &str,
     rebind_prefix_proof: &DfsMetadataPrefixProof,
-    mut read_batch: impl FnMut(u64) -> Result<Option<DfsMetadataJournalBatch>, DfsError>,
+    read_batch: impl FnMut(u64) -> Result<Option<DfsMetadataJournalBatch>, DfsError>,
 ) -> Result<Option<DfsMetadataPrefixProof>, DfsError> {
     let Some(current) = backend.metadata_prefix_proof(shard_id)? else {
         return Ok(None);
     };
-    let mut reconstructed = rebind_prefix_proof.clone();
-    if !current.is_well_formed()
-        || !reconstructed.is_well_formed()
-        || reconstructed.journal_sequence < marker_sequence
-        || current.journal_sequence < reconstructed.journal_sequence
+    if rebind_prefix_proof.journal_sequence < marker_sequence
+        || (rebind_prefix_proof.journal_sequence == marker_sequence
+            && rebind_prefix_proof.digest != marker_fingerprint)
     {
         return Ok(None);
     }
-    if reconstructed.journal_sequence == marker_sequence
-        && reconstructed.digest != marker_fingerprint
-    {
-        return Ok(None);
-    }
-    while reconstructed.journal_sequence < current.journal_sequence {
-        let Some(batch) = read_batch(reconstructed.journal_sequence)? else {
-            return Ok(None);
-        };
-        if batch.entries.is_empty() || batch.shard_id != *shard_id {
-            return Ok(None);
-        }
-        let frames = backend.journal_frames_for_batch(&batch)?;
-        if frames.len() != batch.entries.len() {
-            return Ok(None);
-        }
-        for (entry, frame) in batch.entries.iter().zip(frames) {
-            if entry.shard_id != *shard_id
-                || entry.sequence != reconstructed.journal_sequence.checked_add(1).unwrap_or(0)
-                || entry.sequence > current.journal_sequence
-                || frame.sequence != entry.sequence
-            {
-                return Ok(None);
-            }
-            reconstructed = metadata_prefix_proof_after_exact_frame(
-                &reconstructed,
-                entry,
-                shard_id,
-                &frame.exact_bytes,
-            )?;
-        }
-    }
-    Ok((reconstructed == current).then_some(current))
+    Ok(crate::metadata_journal::metadata_prefix_descends(
+        backend,
+        shard_id,
+        rebind_prefix_proof,
+        &current,
+        read_batch,
+    )?
+    .then_some(current))
 }
 
 fn metadata_shard_snapshot_at(
@@ -4086,8 +4048,10 @@ mod tests {
             .is_some()
         );
         drop(cold);
-        // Continuous real appends cannot turn bounded retry into unchecked
-        // authority or an unbounded cold-open loop.
+        // A writer that keeps appending does not refuse the rebind: the head
+        // the rebind finds under its writer hold descends from its checked
+        // prefix, and it rebinds in that same hold, so one hold suffices
+        // however often the writer appends ahead of it.
         fn arm_append(
             writer: std::sync::Arc<std::sync::Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
             hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -4122,28 +4086,9 @@ mod tests {
             std::sync::Arc::clone(&hits),
             4,
         );
-        let error = rebind_completed_metadata_shard_membership_handoff(
-            &mut cold,
-            &owner,
-            &active,
-            None,
-            Some(&proof),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            DfsError::MetadataRejection {
-                code: crate::DfsMetadataRejectionCode::PrefixMismatch,
-                ..
-            }
-        ));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert!(
-            cold.metadata_shard_instance_writes_frozen(&shard_id)
-                .unwrap()
-        );
-        drop(clear_hook);
-        drop(writer);
+        let before_appends = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+            .unwrap()
+            .unwrap();
         assert!(
             rebind_completed_metadata_shard_membership_handoff(
                 &mut cold,
@@ -4154,11 +4099,26 @@ mod tests {
             )
             .unwrap()
         );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the rebind took its writer hold once"
+        );
         assert!(
             !cold
                 .metadata_shard_instance_writes_frozen(&shard_id)
                 .unwrap()
         );
+        assert!(
+            DfsMetadataBackend::metadata_prefix_proof(&cold, &shard_id)
+                .unwrap()
+                .unwrap()
+                .journal_sequence
+                > before_appends.journal_sequence,
+            "the rebound head includes the append made ahead of the hold"
+        );
+        drop(clear_hook);
+        drop(writer);
         drop(cold);
         runtime.close().unwrap();
     }

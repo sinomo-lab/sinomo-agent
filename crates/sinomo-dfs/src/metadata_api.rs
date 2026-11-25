@@ -2804,9 +2804,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// complete active shard configuration before clearing the pending freeze
     /// or running append-producing recovery. The calling backend instance is
     /// rebound to that exact generation; independently opened stale instances
-    /// stay fenced until they separately prove and observe it. The exact
-    /// prefix checked by the caller is revalidated under the refreshed writer
-    /// before epoch binding, marker changes, rebind checkpointing or explicit recovery.
+    /// stay fenced until they separately prove and observe it. Under the
+    /// refreshed writer, before epoch binding, marker changes, rebind
+    /// checkpointing or explicit recovery, the head must be the prefix the
+    /// caller checked or its exact journal extension, and the rebind ends in
+    /// that same writer hold.
     fn clear_metadata_shard_membership_handoff_freeze(
         &mut self,
         _shard_id: &DfsMetadataShardId,
