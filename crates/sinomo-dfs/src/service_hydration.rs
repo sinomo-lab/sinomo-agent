@@ -934,11 +934,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
                 );
             if needs_pending_write && let Some(content_hash) = intent_record.content_hash.clone() {
-                let size_hint = self.pending_write_size_hint(
-                    &intent_record.object_id,
-                    &intent_record.target_version,
-                    &content_hash,
-                )?;
+                // The size the write's row recorded when it opened, or that of
+                // matching content this node holds.
+                let size_hint = self.open_write_content_size(&intent_record, &content_hash)?;
                 if missing_visible_object && commit_ready && size_hint.is_none() {
                     continue;
                 }

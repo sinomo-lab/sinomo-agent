@@ -115,6 +115,76 @@ fn native_cancelled_attempts_of_one_write_commit_it_once() {
     runtime.close().unwrap();
 }
 
+/// Two services of the primary write the same file under the same operation
+/// id. The second commits the write between the first's read of the write's
+/// row and the first's publication of its opening, which the native tables
+/// then refuse to reopen: the first is answered from that commit, and the
+/// write commits once.
+#[test]
+fn native_same_id_write_meeting_its_commit_is_answered_from_it() {
+    let (runtime, config) = switched("native-identity-raced", None);
+    let primary = config.primary_node_id.clone();
+    let mut options = on_the_primary(&config);
+    // An opening of its own before the commit.
+    options.foreground_replica_repair = true;
+    let path = "/services/identity-raced.txt";
+    let operation = "identity-raced";
+    write(
+        &runtime,
+        options.clone(),
+        &primary,
+        path,
+        "identity-raced-base",
+        None,
+    )
+    .expect("the file exists");
+    let open = |runtime: &DfsTestRuntime| {
+        crate::runtime_host::open_dfs_runtime_service_on_shard(
+            runtime.data_dir(&primary),
+            Some(executor().handle()),
+            &config,
+        )
+        .unwrap()
+    };
+    let mut first = open(&runtime);
+    let object_id = first.posix_stat_distributed(path).unwrap().object_id;
+    let intent_id = crate::intent::stable_write_intent_id(&primary, &object_id, operation);
+    let second = std::sync::Arc::new(std::sync::Mutex::new(Some(open(&runtime))));
+    let raced = std::sync::Arc::new(std::sync::Mutex::new(None));
+    crate::service_commit::opening_races::before_opening_of(&intent_id, {
+        let second = std::sync::Arc::clone(&second);
+        let raced = std::sync::Arc::clone(&raced);
+        let options = options.clone();
+        move || {
+            let mut second = second.lock().unwrap().take().unwrap();
+            *raced.lock().unwrap() = Some(second.posix_write_file_with_operation_id(
+                path,
+                operation.as_bytes(),
+                options,
+                operation,
+            ));
+        }
+    });
+    let answered = first
+        .posix_write_file_with_operation_id(path, operation.as_bytes(), options, operation)
+        .expect("the same operation id is answered from its commit");
+    let committed = raced
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the other path ran")
+        .expect("the other path commits the write");
+    assert_eq!(answered.version, committed.version);
+    drop(first);
+    let (stat, bytes) = read(&runtime, &primary, path);
+    assert_eq!(
+        stat.version,
+        crate::intent::stable_write_target_version(&primary, &object_id, operation)
+    );
+    assert_eq!(bytes, operation.as_bytes());
+    runtime.close().unwrap();
+}
+
 /// A write to an object is cancelled while its prepare cannot commit, and a
 /// second write to the same object, stacked behind that prepare, is
 /// cancelled as well. Once the member answers, each write's same operation
