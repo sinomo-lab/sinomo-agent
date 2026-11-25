@@ -94,8 +94,8 @@ SINOMO_TEST_ARTIFACTS=/absolute/path/to/fresh-baseline-artifacts \
 flock /tmp/sinomo-maintenance-build.lock bash docker/test-cluster.sh
 ```
 
-This retains formation, authenticated network readiness, explicit guarded six-member
-metadata assignment, all-node mutation/convergence, and required debug/tracing
+This retains formation, authenticated network readiness, the metadata membership
+each shard's placement rules give it, all-node mutation/convergence, and required debug/tracing
 support, plus CPU profiler support with `SINOMO_TEST_CPU_PROFILE=1`. It then runs baseline invariants, read-your-write, cross-node
 visibility, prefix rename, real disk damage, network interruption/heal, process
 restart durability, core-only component removal/restoration with lost replies,
@@ -105,16 +105,31 @@ gate are attempted even after an earlier functional failure. Existing scenario
 commands, operation IDs, deadlines and byte/receipt assertions are unchanged.
 A failed functional or quiet gate remains a failed baseline.
 
-The maintained network interruption case seeds a real file under the complete
-six-member metadata assignment, then disconnects assigned node6. The attempted
+A metadata commit must reach every member of the serving shard's write set. A
+member the primary cannot reach is removed, unless that would take the write set
+below the shard's W floor: then it stays, and the write stays prepared until the
+member returns or a recruit replaces it. The maintained network interruption case
+tests that last rule where only the member's return can complete the write. It
+installs its own run-scoped placement rule, with W and N equal to the node count,
+on an empty directory beside its fixture: the Services write set becomes all six
+nodes, exactly at the W floor, with no node left to recruit, while the fixture
+file keeps its ordinary content policy. It seeds a real file under that write
+set, then disconnects a seg_b leaf that is not the Services primary (node6, or
+node5 when node6 is the primary). The attempted
 overwrite must leave its exact caller-owned operation durably Prepared and its
-new version nonvisible; a generic CLI error is insufficient evidence. The probe
+new version nonvisible; a generic CLI error is insufficient evidence. The write
+waits for the cut member until its caller stops waiting, so the probe gives the
+write half of its unchanged deadline and reads the witness in the rest. The probe
 reads the native primary's typed prepare/canonical cut, without classifying error
-text or claiming that every internal failure is a quorum failure. After the real
+text or claiming that every internal failure is a quorum failure, and it refuses
+to run unless the interrupted node is a non-primary member of a write set that is
+every configured member at the W floor. After the real
 network heals, the same node, operation ID, bytes and captured ordinary write
 options must produce the matching Applied receipt. Cross-node reads, a fresh new
-write and node6 process restart/read then verify recovery. Neither partial
-metadata publication nor a replacement operation is accepted. Both the baseline
+write and the leaf's process restart/read then verify recovery. Neither partial
+metadata publication nor a replacement operation is accepted. The case clears its
+rule and waits for the shard to return to the members its other rules give it,
+also after a failure. Both the baseline
 and full lanes use this contract with their existing deadlines and transports.
 
 
@@ -137,18 +152,34 @@ explicitly authorize coexistence with `SINOMO_TEST_ALLOW_OTHER_COMPOSE=1` when n
 Convergence checks obtain pending handoffs and shard epochs from one authoritative
 KV snapshot per probe; the asynchronous on-disk checkpoint is not readiness evidence.
 
-A fresh harness run explicitly requests its six-node metadata assignment through
-`sinomo dfs metadata shard set-replicas SHARD --expected-epoch EPOCH --replica NODE`
-(repeat `--replica` for every non-primary member), then uses the existing
-`transfer-primary` command to place root, services, and users on node1, node2,
-and node3. Each phase leaves the active assignment unchanged until the native
-retiring fence and joint prefix acknowledgements authorize activation. The
-replica command rejects a stale epoch, duplicate replica, or current primary in
-the replica list; its existing participant admission also requires authorized
-members with the current prepare capability. The harness records intents and
-exact activated epochs within its unchanged convergence deadline. Retained
-`REUSE=1` projects keep their administrative assignments; discovery never expands
-a committed assignment automatically.
+A shard's metadata members are what its placement rules give it. The shard's own
+write-set keeper sizes them to the rules' N, never below their W, and holds every
+one of them in the write set; with the default policy that is the primary and one
+replica. No harness step assigns members, and every lane runs on this layout. A
+fresh harness run waits until each shard has switched to the write-set protocol
+with exactly those members, then uses the existing `transfer-primary` command to
+ask for the root, services and users primaries on node1, node2 and node3. A
+primary moves only to a node that is already a member of its shard, so a shard
+whose members do not include the requested node keeps its primary, and the three
+primaries are not always distinct. A transfer leaves the active assignment
+unchanged until the native retiring fence and joint prefix acknowledgements
+authorize activation; one refused because the keeper changed the shard's record
+first is decided again from a fresh read. The harness records intents and exact
+activated epochs within its unchanged convergence deadline. Retained `REUSE=1`
+projects keep their primaries.
+
+Convergence requires, in two unchanged observations, no pending handoff and every
+shard's write set equal to its configured members and to the member count its
+rules give; `cluster.dfs.shard-layout` reports that count and the W floor beside
+each shard. A scenario that needs another membership installs its own run-scoped
+rule with `cluster.dfs.placement-rule`, waits for convergence, and clears the
+rule before it ends. Scenarios choose members from the observed layout: a primary
+handoff promotes an actual member of the shard, preferring one that is primary of
+no shard, and a node that holds no copy of a shard reports only that shard's
+topology in its DFS status. `sinomo dfs path` reads the copy of the node it runs
+on, so a scenario takes a native object view on the shard's current primary;
+probe observations of a path, such as `cluster.dfs.expect-replicated`, ask that
+primary when their own node holds no copy of the shard.
 
 
 Each of the six development nodes has a hard 2 GiB cgroup memory limit and no
@@ -316,6 +347,22 @@ in the artifact directory. `--max-p95-us 0`, reduced `--iterations`, `--policies
 the reduced acceptance scope. `SINOMO_TEST_COMPOSE_OVERRIDE` must match the
 override used to create the project, including any tmpfs experiment. Ordinary
 acceptance uses the normal durable data volumes.
+
+Write latency depends on how many metadata members a commit must reach. Each
+shard has the members its placement rules give it, so a measured policy's own
+rule sizes the write set of the shard it is measured on: the keeper recruits up
+to the policy's N when the fixture's rule is installed. The driver records every
+shard's final members in `write-latency.json` and fails when a shard's write set
+is not its configured members at the count its rules give.
+
+The development host keeps every node's volume on one filesystem, where
+durable writes from different nodes wait for each other. To judge a latency
+target that assumes independent storage per node, create the project with the
+`docker-compose.dfs-tmpfs.yml` override and `SINOMO_DFS_TMPFS_SIZE=8g`: DFS
+admits content only on a volume with more free space than its storage reserve,
+which the overlay's default size does not provide. Report the tmpfs result as
+protocol and network latency only, and keep the durable-volume run as the
+durability evidence.
 
 For a short diagnostic run of one origin/shard, the underlying probe is:
 
@@ -950,8 +997,9 @@ revision, portability patchset, mount evidence, cleanup evidence, cluster
 health, and wrapper environment land under
 `target/pjdfstest-results/<run>/` by default. The
 harness first selects a root, services, or users path whose metadata primary is
-provably remote from the `node5` mount while `node5` is a configured metadata
-replica. Through FUSE it then creates ordinary zero-byte `O_CREAT` and
+provably remote from the `node5` mount. A shard `node5` holds a replica of is
+preferred; the evidence records whether `node5` is a member of the selected
+shard. Through FUSE it then creates ordinary zero-byte `O_CREAT` and
 `O_CREAT|O_EXCL` files, repeats both calls, requires the second exclusive create
 to return `EEXIST`, and checks both sizes remain zero.
 After the suite, distant nodes read both files, `node5` is restarted, and the

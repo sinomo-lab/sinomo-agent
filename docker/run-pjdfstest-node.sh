@@ -30,6 +30,8 @@ PJDFSTEST_PATCHSET="${SINOMO_PJDFSTEST_PATCHSET:-$PJDFSTEST_PATCHSET_DEFAULT}"
 PROFILE_DIR="${SINOMO_PJDFSTEST_PROFILE_DIR:-/usr/local/share/sinomo/pjdfstest}"
 ZERO_BYTE_PREFIX="${SINOMO_PJDFSTEST_ZERO_BYTE_PREFIX:-}"
 ZERO_BYTE_MOUNT_NODE_ID="${SINOMO_PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID:-}"
+# Whether the mount node holds a copy of the selected shard, as observed.
+ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA="${SINOMO_PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA:-}"
 ZERO_BYTE_METADATA_PRIMARY_NODE_ID="${SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID:-}"
 ZERO_BYTE_METADATA_SHARD_ID="${SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID:-}"
 ZERO_BYTE_METADATA_SHARD_EPOCH="${SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH:-}"
@@ -1097,6 +1099,7 @@ write_zero_byte_routed_write_json() {
     "$ZERO_BYTE_ROUTED_WRITE_STATUS" \
     "$ZERO_BYTE_MOUNT_NODE_ID" "$ZERO_BYTE_METADATA_PRIMARY_NODE_ID" \
     "$ZERO_BYTE_METADATA_SHARD_ID" "$ZERO_BYTE_METADATA_SHARD_EPOCH" \
+    "$ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA" \
     "$ZERO_BYTE_O_CREAT_PATH" "$ZERO_BYTE_O_EXCL_PATH" \
     "$ZERO_BYTE_O_CREAT_FIRST_RESULT" "$ZERO_BYTE_O_CREAT_REPEAT_RESULT" \
     "$ZERO_BYTE_O_CREAT_SIZE_RESULT" "$ZERO_BYTE_O_EXCL_FIRST_RESULT" \
@@ -1110,6 +1113,7 @@ use JSON::PP;
 
 my (
     $output, $status, $mount_node_id, $primary_node_id, $shard_id, $epoch,
+    $mount_is_replica,
     $o_creat_path, $o_excl_path, $o_creat_first, $o_creat_repeat,
     $o_creat_size, $o_excl_first, $o_excl_repeat, $o_excl_size,
     $o_creat_first_exit, $o_creat_repeat_exit, $o_creat_size_exit,
@@ -1124,7 +1128,9 @@ my $document = {
         metadata_primary_node_id => $primary_node_id,
         metadata_shard_id => $shard_id,
         metadata_shard_epoch => 0 + $epoch,
-        mount_node_is_metadata_replica => JSON::PP::true,
+        mount_node_is_metadata_replica => $mount_is_replica eq 'true'
+            ? JSON::PP::true
+            : JSON::PP::false,
         remote_metadata_primary => $mount_node_id ne $primary_node_id
             ? JSON::PP::true
             : JSON::PP::false,
@@ -1326,6 +1332,7 @@ PERL
   ARTIFACT_DIR="$temp_root/artifacts"
   ZERO_BYTE_ROUTED_WRITE_STATUS="passed"
   ZERO_BYTE_MOUNT_NODE_ID="node-mount"
+  ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA="false"
   ZERO_BYTE_METADATA_PRIMARY_NODE_ID="node-primary"
   ZERO_BYTE_METADATA_SHARD_ID="services"
   ZERO_BYTE_METADATA_SHARD_EPOCH="7"
@@ -1357,7 +1364,9 @@ my $probe = JSON::PP->new->decode(<$fh>);
 close $fh or die "close $path: $!";
 die "zero-byte probe status" if $probe->{status} ne 'passed';
 die "remote-primary proof" if !$probe->{placement}{remote_metadata_primary};
-die "metadata-replica proof" if !$probe->{placement}{mount_node_is_metadata_replica};
+die "observed mount-node membership" if
+    !JSON::PP::is_bool($probe->{placement}{mount_node_is_metadata_replica})
+    || $probe->{placement}{mount_node_is_metadata_replica};
 die "O_CREAT evidence" if
     $probe->{cases}{o_creat}{first_result} ne '0'
     || $probe->{cases}{o_creat}{first_exit} != 0
@@ -1416,6 +1425,13 @@ validate_configuration() {
       fail_reason "zero_byte_remote_primary_unproven"
       return 1
     fi
+    case "$ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA" in
+      true|false) ;;
+      *)
+        fail_reason "zero_byte_mount_node_membership_unobserved"
+        return 1
+        ;;
+    esac
     case "$ZERO_BYTE_METADATA_SHARD_ID:$ZERO_BYTE_PREFIX" in
       root:/cluster-tests/pjdfstest-zero-byte|\
       services:/services/cluster-tests/pjdfstest-zero-byte|\

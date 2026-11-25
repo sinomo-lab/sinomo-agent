@@ -115,6 +115,27 @@ def partition_verified_fixtures(fixtures, project, selected):
     return verified, skipped
 
 
+def metadata_membership(layout):
+    """Each shard's members beside what its placement rules give it.
+
+    A measured policy's own rule sizes the write set of the shard it is
+    measured on. A shard that never reached that membership measured another
+    commit path than its policy names.
+    """
+    rows, errors = [], []
+    for shard in layout["diagnostics"]["shards"]:
+        members = sorted([shard["primary_node_id"], *shard["replica_node_ids"]])
+        write_set = sorted(shard.get("write_set") or [])
+        expected = shard.get("policy_member_count")
+        rows.append({"lane": shard["lane"], "shard_id": shard["shard_id"], "epoch": shard["epoch"],
+                     "members": members, "write_set": write_set, "w_floor": shard.get("w_floor"),
+                     "policy_member_count": expected})
+        if write_set != members or len(write_set) != expected:
+            errors.append(f"{shard['lane']} shard has {len(write_set)} write-set members of "
+                          f"{len(members)} configured; its placement rules give {expected}")
+    return rows, errors
+
+
 def validate_report(report, iterations, warmup, max_p95_us, scenario):
     """Reject missing, censored, pooled, or incorrectly classified evidence."""
     diagnostics = report.get("diagnostics", {})
@@ -326,6 +347,9 @@ def main():
                     (run.artifacts / "write-latency.json").write_text(json.dumps(result, indent=2) + "\n")
         for node in [f"node{i}" for i in range(1, 7)]:
             run.probe(node, "invariants", timeout_seconds=60)
+        result["final_metadata_membership"], membership_errors = metadata_membership(
+            json.loads(run.probe("node1", "shard-layout")))
+        result["errors"] += [f"final metadata membership: {error}" for error in membership_errors]
         run.verify_processes("final")
         result["final_identity_verified"] = True
         result["passed"] = not result["errors"] and all(group["passed"] for group in result["groups"])

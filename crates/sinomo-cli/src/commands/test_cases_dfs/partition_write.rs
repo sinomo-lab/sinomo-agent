@@ -1,4 +1,13 @@
 //! Normal Main write interruption, proved by its exact durable prepare/canonical cut.
+//!
+//! A commit must reach every member of the shard's write set. A member the
+//! primary cannot reach is removed unless that would take the write set below
+//! the shard's W floor; then it stays, and the write stays prepared until the
+//! member returns or a recruit replaces it. This probe therefore requires the
+//! serving shard's write set to be every configured member, exactly at the W
+//! floor its placement rules give it, with no other write-set capable member
+//! left to recruit: only the interrupted member's return can complete the
+//! write.
 use super::*;
 use sinomo_runtime::dfs::{
     DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectMetadata, DfsPreparedMetadataEffect,
@@ -9,7 +18,7 @@ use sinomo_runtime::dfs::{
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_partition_write(ctx) {
         id: "cluster.dfs.partition-write",
-        summary: "Capture, deny publication during an assigned-participant cut, and recover the same ordinary write identity",
+        summary: "Capture, deny publication while a write-set member at the W floor is cut off, and recover the same ordinary write identity",
         tags: ["cluster-dfs", "probe"],
         requirements: [SinomoTestRequirement::ClusterRuntime, SinomoTestRequirement::ClusterKvSnapshot],
         run: { run_partition_write(ctx) }
@@ -199,12 +208,20 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     dfs::validate_write_operation_id(&operation_id).map_err(|error| fail(error.to_string()))?;
     let payload = required_payload_bytes(ctx)?;
     let hash = format!("blake3:{}", blake3::hash(&payload).to_hex());
-    let required = optional_usize_parameter(ctx, "required-participants", 6)?;
-    require_positive("required-participants", required)?;
     let unavailable = NodeId::new(ctx.required_parameter("unavailable-node-id")?)
         .map_err(|error| fail(error.to_string()))?;
     let started = Instant::now();
-    let deadline = started + expect_timeout(ctx)?;
+    let timeout = expect_timeout(ctx)?;
+    let deadline = started + timeout;
+    // A write-set commit waits for its members until its caller stops
+    // waiting. While the member is cut off that wait is the caller's whole
+    // budget, so the blocked phase gives the write half of this probe's clock
+    // and keeps the rest to read the durable witness the write left.
+    let write_deadline = if phase == "blocked" {
+        started + timeout / 2
+    } else {
+        deadline
+    };
     let authority = ctx
         .authoritative_cluster_snapshot()
         .ok_or_else(|| fail("exact current assignment proof is unavailable"))?;
@@ -214,17 +231,38 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map_err(fail)?
         .ok_or_else(|| fail("path has no actual assigned metadata shard"))?;
     let caller = NodeId::new(observation.node_label()).map_err(|error| fail(error.to_string()))?;
-    let participants = std::iter::once(assignment.primary_node_id.clone())
+    let configured = std::iter::once(assignment.primary_node_id.clone())
         .chain(assignment.replica_node_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    if participants.len() != required
+    // The same admitted snapshot gives the shard, its write set and the rules
+    // that size it.
+    let snapshot = authority.snapshot();
+    let rules = DfsShardRulesView::read(&snapshot)?;
+    let membership = rules.membership(&snapshot, &assignment)?;
+    let participants = membership
+        .write_set
+        .ok_or_else(|| fail("the Services shard has not switched to the write-set protocol"))?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    ctx.record("write_set", &participants);
+    ctx.record("w_floor", membership.w_floor);
+    ctx.record("write_set_member_count", rules.write_set_members);
+    if caller != assignment.primary_node_id || assignment.shard_id != "services" {
+        return Err(fail("probe must run at the actual Services primary"));
+    }
+    if participants != configured
+        || participants.len() != membership.w_floor
+        || participants.len() != rules.write_set_members
         || !participants.contains(&unavailable)
-        || caller != assignment.primary_node_id
-        || assignment.shard_id != "services"
+        || unavailable == caller
     {
-        return Err(fail(
-            "probe must run at the actual Services primary with the complete requested assignment containing the interrupted node",
-        ));
+        return Err(fail(format!(
+            "the interrupted node must be a non-primary member of a write set that is every configured member, exactly at the shard's W floor, with no member left to recruit: write set {}, configured {}, W floor {}, write-set capable members {}",
+            participants.len(),
+            configured.len(),
+            membership.w_floor,
+            rules.write_set_members,
+        )));
     }
     let data = SinomoDataDir::new(ctx.data_dir());
     let shard = DfsMetadataShardId::new(&assignment.shard_id);
@@ -247,7 +285,6 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("path", &path);
     ctx.record("operation_id", &operation_id);
     ctx.record("assignment", &assignment);
-    ctx.record("required_participants", required);
     ctx.record("unavailable_node_id", &unavailable);
     ctx.record("caller_node_id", &caller);
     ctx.record("target_root", root.display().to_string());
@@ -276,7 +313,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             || acknowledged != participants
         {
             return Err(fail(
-                "seed barrier did not certify the original file and complete actual assignment",
+                "seed barrier did not certify the original file on the whole write set",
             ));
         }
         let settled = capture()?;
@@ -306,7 +343,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ctx.record("new_content_hash", &hash);
         ctx.record("new_size_bytes", payload.len());
         return Ok(SinomoTestOutcome::passed(
-            "captured the genuine current file, complete assignment and ordinary write inputs",
+            "captured the genuine current file, its whole write set at the W floor and ordinary write inputs",
         ));
     }
     let expected_assignment: DfsMetadataShardConfig = parse(ctx, "original-assignment-json")?;
@@ -335,10 +372,11 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             &payload,
             &operation_id,
             options.clone(),
-            deadline,
+            write_deadline,
         )
         .map_err(fail)?;
     ctx.record("write_return", format!("{result:?}"));
+    ctx.record("write_wait_ms", started.elapsed().as_millis() as u64);
     let after = capture()?;
     ctx.record("prefix", &after.prefix_proof);
     let actual = after
@@ -351,7 +389,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     if phase == "blocked" {
         if result.is_ok() {
             return Err(fail(
-                "write published while an assigned metadata participant was disconnected",
+                "write published while a write-set member at the W floor was disconnected",
             ));
         }
         let matching = after
@@ -405,7 +443,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         // above prove unavailability; no error-text or transport classification
         // can substitute for this exact operation and canonical nonvisibility.
         return Ok(SinomoTestOutcome::passed(
-            "exact original write is durably Prepared and its new version remains nonvisible during the assigned-participant cut",
+            "exact original write is durably Prepared and its new version remains nonvisible while the write-set member is cut off",
         ));
     }
     let stat = result
@@ -455,7 +493,7 @@ mod original_pending_guard_tests {
     use super::*;
 
     // Protocol DATA for the pure selection predicate, never a native receipt,
-    // ACK, held owner, authenticated source or actual six-node outcome.
+    // ACK, held owner, authenticated source or actual cluster outcome.
     fn inputs() -> (
         DfsObjectMetadata,
         DfsMetadataShardConfig,

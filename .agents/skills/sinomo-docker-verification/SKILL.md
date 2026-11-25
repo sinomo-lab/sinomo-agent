@@ -19,6 +19,12 @@ mount definitions resolve stale command examples. Use the
 - Six containers do not imply six Raft voters. The default formation has a seed
   voter and learners; select a membership scenario with the required voter set
   before claiming quorum/failover coverage.
+- Six containers do not imply six metadata members. Each DFS shard has the
+  members its placement rules give it: its write-set keeper sizes them to the
+  rules' N, never below their W, and every lane runs on that layout. Choose a
+  scenario's nodes from `cluster.dfs.shard-layout`, not by position. A scenario
+  that needs another membership installs its own run-scoped placement rule and
+  clears it before it ends.
 - The thin [dev image](../../../docker/Dockerfile.dev) mounts a host-built Linux
   executable. `up --build` builds the runtime image, not Rust. On Windows, obtain
   a Linux binary from an appropriate build environment; a Windows `.exe` cannot

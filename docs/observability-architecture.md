@@ -476,8 +476,10 @@ restart, damage, or convergence gates.
 
 The shard gate measures the serial metadata boundary, not every CPU in the
 machine. One hot metadata-shard primary is expected to use roughly one core;
-the default root, services, and users lanes have three distinct primaries and
-target about three aggregate metadata cores under concurrent writes. Additional
+the gate requires three distinct primaries for the default root, services, and
+users lanes and targets about three aggregate metadata cores under concurrent
+writes. A primary moves only among its shard's members, so the gate refuses a
+layout whose members do not allow three. Additional
 hardware is used through more shards and writes or through content hashing,
 replica transfer, and transport work. Passing the configurable utilization
 floor means that this bounded target stayed work-conserving; it is not a claim

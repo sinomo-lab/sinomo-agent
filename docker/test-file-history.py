@@ -461,7 +461,13 @@ class Acceptance:
         before = json.loads(self.probe("node1", "shard-layout"))["diagnostics"]["shards"]
         shard = next(item for item in before if item["lane"] == "services")
         primaries = {item["primary_node_id"] for item in before}
-        target = next(node for node in shard["replica_node_ids"] if node not in primaries)
+        # A primary moves only among the shard's own members, which its
+        # write-set keeper owns. A member that is primary of no shard is
+        # preferred; a shard whose other members all are primaries elsewhere
+        # promotes one of those.
+        assert shard["replica_node_ids"], shard
+        target = next((node for node in shard["replica_node_ids"] if node not in primaries),
+                      shard["replica_node_ids"][0])
         target_container = next(
             node for node in [f"node{i}" for i in range(1, 7)]
             if json.loads(self.probe(node, "shard-layout"))["diagnostics"]["node"] == target)
@@ -505,6 +511,7 @@ class Acceptance:
         (self.artifacts / "handoff.json").write_text(json.dumps({
             "before": shard, "requested": requested, "after": current, "retained_identity": saved,
             "promoted_capture": promoted_capture, "promoted_container": target_container,
+            "promoted_was_primary_of_another_shard": target in primaries,
         }, indent=2) + "\n")
 
     def resume(self, checkpoint_path):

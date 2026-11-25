@@ -2771,13 +2771,17 @@ wait_for_dfs_ready() {
   done
 }
 
-# Discovery preserves committed assignments. A fresh disposable test project
-# therefore requests its advertised six-node layout as ordinary administration.
-# Membership expands first; primary rotation preserves that activated member ring.
-# Both phases share the EXISTING convergence deadline and native handoff protocol.
+# A shard's metadata members are what its placement rules give it: the shard's
+# own write-set keeper sizes them to the rules' N and never below their W, and
+# no harness step assigns members. A fresh disposable project waits for that
+# membership, then asks through ordinary administration for the root, services
+# and users primaries on node1, node2 and node3. A primary moves only to a node
+# that is already a member of its shard; a shard whose members do not include
+# the requested node keeps its primary. Both steps share the EXISTING
+# convergence deadline and the native primary handoff.
 request_fresh_dfs_topology() {
   local deadline="$1" command_timeout node node_id roster layout report
-  local lane primary_container desired_primary shard epoch current_primary fs members replicas
+  local lane primary_container desired_primary shard epoch current_primary fs members wanted
   local phase transition=0 pending_report="" rows expected observed
   local -a command
   roster="$ARTIFACTS/dfs-requested-topology.json"
@@ -2795,26 +2799,13 @@ request_fresh_dfs_topology() {
     "$rows" >"$roster" || return 1
   members="$(jq -c '[.[].node_id] | sort' "$roster")" || return 1
   layout="$ARTIFACTS/dfs-requested-topology.layout.last.json"
-  local placement="$ARTIFACTS/dfs-requested-topology.placement.json"
-  while :; do
-    command_timeout="$(deadline_command_timeout "$deadline" "$DFS_CONVERGENCE_WAIT")" || return 1
-    if compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.prepare-shard-layout \
-      --require-cluster --json >"$placement" 2>"${placement%.json}.stderr.log"; then
-      jq -e '.status == "passed"' "$placement" >/dev/null || return 1
-      break
-    fi
-    # Native singleton genesis can still own the shard at formation. Only its
-    # explicit pre-effect rejection permits re-entering the idempotent setup.
-    jq -e '.status == "failed" and (.summary | endswith("remains prepared; mutation deferred before content or request binding"))' \
-      "$placement" >/dev/null || return 1
-    sleep "$POLL_INTERVAL"
-  done
   while :; do
     command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
     if ! compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
       --require-cluster --json >"$layout" 2>"$ARTIFACTS/dfs-requested-topology.layout.last.stderr.log"; then
-      # Initial native bootstrap may still be publishing its layout. Only retry
-      # this read, within the same convergence deadline; never replay a mutation.
+      # Initial native bootstrap may still be publishing its layout, and a
+      # shard's record is rebound while its primary moves. Only retry this
+      # read, within the same convergence deadline; never replay a mutation.
       sleep "$POLL_INTERVAL"
       continue
     fi
@@ -2827,18 +2818,26 @@ request_fresh_dfs_topology() {
       continue
     fi
     if [ -n "$pending_report" ]; then
-      # Exact desired epoch and participants must be active before a later phase
-      # can be requested. The native activation requires its durable joint proof.
+      # The exact desired epoch, primary and members must be active before
+      # another primary is requested. The native activation requires its
+      # durable proof.
       expected="$(jq -c '.pending_handoff.desired_shard
         | {file_system_id, shard_id, epoch, primary_node_id,
-           replica_node_ids}' "$pending_report")" || return 1
+           members: ([.primary_node_id] + .replica_node_ids | sort)}' "$pending_report")" || return 1
       observed="$(jq -c --argjson desired "$expected" '.diagnostics.shards[]
         | select(.file_system_id == $desired.file_system_id and .shard_id == $desired.shard_id)
         | {file_system_id, shard_id, epoch, primary_node_id,
-           replica_node_ids}' "$layout")" || return 1
+           members: ([.primary_node_id] + .replica_node_ids | sort)}' "$layout")" || return 1
       [ "$observed" = "$expected" ] || { log "fresh topology: handoff did not activate its exact desired assignment"; return 1; }
       cp "$layout" "${pending_report%.json}.activated.json" || return 1
       pending_report=""
+    fi
+    # The keeper is still switching, reducing or recruiting until every shard
+    # has the members its rules give it, all of them in its write set.
+    if ! dfs_converged_epoch_signature "$layout" >/dev/null \
+      2>"$ARTIFACTS/dfs-requested-topology.membership.last.stderr.log"; then
+      sleep "$POLL_INTERVAL"
+      continue
     fi
     phase=""
     for lane in root services users; do
@@ -2848,42 +2847,32 @@ request_fresh_dfs_topology() {
       shard="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .shard_id' "$layout")" || return 1
       epoch="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .epoch' "$layout")" || return 1
       current_primary="$(jq -er --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .primary_node_id' "$layout")" || return 1
-      jq -e --arg lane "$lane" --argjson wanted "$members" '.diagnostics.shards[] | select(.lane == $lane)
+      jq -e --arg lane "$lane" --argjson known "$members" '.diagnostics.shards[] | select(.lane == $lane)
         | [.primary_node_id] + .replica_node_ids
-        | length == (unique | length) and all(.[]; . as $member | $wanted | index($member) != null)' \
+        | length == (unique | length) and all(.[]; . as $member | $known | index($member) != null)' \
         "$layout" >/dev/null || { log "fresh topology: current assignment contains an unexpected member"; return 1; }
-      if ! jq -e --arg lane "$lane" --argjson wanted "$members" '.diagnostics.shards[] | select(.lane == $lane)
-        | ([.primary_node_id] + .replica_node_ids | sort) == $wanted
-          and (.write_set == null or (.write_set | sort) == $wanted)' "$layout" >/dev/null; then
-        if ! jq -e --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .write_set == null' "$layout" >/dev/null; then
-          # Switched shards recruit and join through the native write-set keeper.
-          phase=recruiting
-          sleep "$POLL_INTERVAL"
-          break
-        fi
-        phase=membership
-        command=(sinomo dfs metadata shard set-replicas "$shard" --filesystem "$fs" --expected-epoch "$epoch" --json)
-        replicas="$(jq -c --arg primary "$current_primary" '[.[].node_id | select(. != $primary)] | sort' "$roster")" || return 1
-        while IFS= read -r node_id; do command+=(--replica "$node_id"); done < <(jq -r '.[]' <<<"$replicas")
-      elif [ "$current_primary" != "$desired_primary" ]; then
-        phase=primary
-        command=(sinomo dfs metadata shard transfer-primary "$shard" --filesystem "$fs" --to "$desired_primary" --expected-epoch "$epoch" --json)
-      else
-        continue
-      fi
+      wanted="$(jq -c --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane)
+        | [.primary_node_id] + .replica_node_ids | sort' "$layout")" || return 1
+      # The shard's own keeper owns its membership: a requested primary
+      # outside it stays where it is.
+      jq -e --arg desired "$desired_primary" 'index($desired) != null' <<<"$wanted" >/dev/null || continue
+      [ "$current_primary" != "$desired_primary" ] || continue
+      phase=primary
+      command=(sinomo dfs metadata shard transfer-primary "$shard" --filesystem "$fs" --to "$desired_primary" --expected-epoch "$epoch" --json)
       transition=$((transition + 1))
       report="$ARTIFACTS/dfs-requested-topology-$transition-$lane-$phase.json"
       command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
       if ! compose_exec_timeout "$command_timeout" node1 "${command[@]}" >"$report" 2>"${report%.json}.stderr.log"; then
-        # If the protocol switched after the read, this transition was explicitly
-        # refused. Re-read its authority before choosing the membership producer.
-        if [ "$phase" = membership ] && grep -Fq 'replica changes use recruit and remove' "${report%.json}.stderr.log"; then
+        # The keeper changed the shard's record after the read, so this
+        # guarded request was explicitly refused before any effect. Read the
+        # record again before deciding.
+        if grep -Fq 'changed while transferring primary' "${report%.json}.stderr.log"; then
           break
         fi
         return 1
       fi
-      jq -e --arg fs "$fs" --arg shard "$shard" --arg primary "$current_primary" --arg phase "$phase" \
-        --arg desired_primary "$desired_primary" --argjson epoch "$epoch" --argjson wanted "$members" '
+      jq -e --arg fs "$fs" --arg shard "$shard" --arg primary "$current_primary" \
+        --arg desired_primary "$desired_primary" --argjson epoch "$epoch" --argjson wanted "$wanted" '
         .pending_handoff as $h
         | $h.cause.kind == "membership"
           and $h.retiring_shard == .shard
@@ -2894,19 +2883,22 @@ request_fresh_dfs_topology() {
           and $h.desired_shard.assignment == $h.retiring_shard.assignment
           and $h.desired_shard.default_policy == $h.retiring_shard.default_policy
           and ([$h.desired_shard.primary_node_id] + $h.desired_shard.replica_node_ids | sort) == $wanted
-          and (if $phase == "membership" then $h.desired_shard.primary_node_id == $primary
-               else $h.desired_shard.primary_node_id == $desired_primary end)' "$report" >/dev/null || return 1
+          and $h.desired_shard.primary_node_id == $desired_primary' "$report" >/dev/null || return 1
       pending_report="$report"
       log "fresh topology: requested $lane $phase at epoch $epoch via native handoff"
       break
     done
     if [ -z "$phase" ]; then
-      log "fresh topology: six actual members and three requested primaries activated"
+      log "fresh topology: every shard has the members its placement rules give it; primaries moved among them"
       return 0
     fi
   done
 }
 
+# One line naming every shard, its epoch and its members, for a layout in
+# which no handoff is pending and every shard has switched to the write-set
+# protocol with exactly the members its placement rules give it, all of them
+# in its write set.
 dfs_converged_epoch_signature() {
   jq -er '
     if .status != "passed" then
@@ -2922,13 +2914,14 @@ dfs_converged_epoch_signature() {
         error("expected exactly three shard diagnostics")
       elif ([.[].lane] | sort) != ["root", "services", "users"] then
         error("expected root, services, and users lanes")
-      elif any(.[];
-        ((.replica_node_ids | type) != "array")
-          or ((.replica_node_ids | length) != 5)
-      ) then
-        error("expected five replicas on every shard")
-      elif ([.[].primary_node_id] | unique | length) != 3 then
-        error("expected three distinct shard primaries")
+      elif any(.[]; ((.primary_node_id | type) != "string") or ((.replica_node_ids | type) != "array")) then
+        error("invalid shard member diagnostic")
+      elif any(.[]; (.write_set | type) != "array") then
+        error("not yet on the write-set protocol: \([.[] | select((.write_set | type) != "array") | .shard_id] | join(","))")
+      elif any(.[]; (.write_set | sort) != ([.primary_node_id] + .replica_node_ids | sort)) then
+        error("configured member outside the write set: \([.[] | select((.write_set | sort) != ([.primary_node_id] + .replica_node_ids | sort)) | .shard_id] | join(","))")
+      elif any(.[]; ((.policy_member_count | type) != "number") or ((.write_set | length) != .policy_member_count)) then
+        error("members differ from what the placement rules give: \([.[] | select((.write_set | length) != .policy_member_count) | "\(.shard_id)=\(.write_set | length)/\(.policy_member_count)"] | join(","))")
       elif any(.[];
         ((.file_system_id | type) != "string")
           or ((.shard_id | type) != "string")
@@ -2937,7 +2930,7 @@ dfs_converged_epoch_signature() {
         error("invalid shard identity or epoch diagnostic")
       else
         sort_by(.shard_id)
-        | map("\(.file_system_id)/\(.shard_id)=\(.epoch)")
+        | map("\(.file_system_id)/\(.shard_id)=\(.epoch):\(.write_set | sort | join("+"))")
         | join(",")
       end
   ' "$1"
@@ -2959,7 +2952,7 @@ wait_for_dfs_converged() {
     log "dfs-converged: jq is required to validate stable shard epochs"
     return 1
   fi
-  log "dfs-converged: waiting for the fully distributed three-lane shard layout (<=${DFS_CONVERGENCE_WAIT}s)"
+  log "dfs-converged: waiting for the policy-sized three-lane shard layout (<=${DFS_CONVERGENCE_WAIT}s)"
   deadline=$(( $(date +%s) + DFS_CONVERGENCE_WAIT ))
   if [ "${SINOMO_TEST_REUSE:-0}" != 1 ] && [ "${DFS_FRESH_TOPOLOGY_REQUESTED:-0}" != 1 ]; then
     request_fresh_dfs_topology "$deadline" || return 1
@@ -2977,8 +2970,6 @@ wait_for_dfs_converged() {
       && compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
         --require-cluster \
         --json \
-        --param expected-replica-count=5 \
-        --param expected-distinct-primary-count=3 \
         >"$probe_log" 2>"$probe_err" \
       && epoch_signature="$(dfs_converged_epoch_signature "$probe_log" 2>>"$probe_err")"; then
       invariants_clean=1
@@ -3003,8 +2994,6 @@ wait_for_dfs_converged() {
           && compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
             --require-cluster \
             --json \
-            --param expected-replica-count=5 \
-            --param expected-distinct-primary-count=3 \
             >"$confirm_log" 2>"$confirm_err" \
           && confirm_epoch_signature="$(dfs_converged_epoch_signature "$confirm_log" 2>>"$confirm_err")" \
           && [ "$confirm_epoch_signature" = "$epoch_signature" ]; then
@@ -3025,7 +3014,7 @@ wait_for_dfs_converged() {
       previous_epoch_signature=""
     fi
     if [ "$consecutive" -ge 2 ]; then
-      log "  dfs-converged: exact layout, zero handoffs, and zero replica lag across two stable epoch probes"
+      log "  dfs-converged: policy-sized write sets, zero handoffs, and zero replica lag across two stable layout probes"
       return 0
     fi
     now="$(date +%s)"
@@ -3174,6 +3163,7 @@ PJDFSTEST_ZERO_BYTE_PREFIX=""
 PJDFSTEST_ZERO_BYTE_O_CREAT_PATH=""
 PJDFSTEST_ZERO_BYTE_O_EXCL_PATH=""
 PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID=""
+PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA=""
 PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID=""
 PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID=""
 PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH=""
@@ -3223,17 +3213,19 @@ cleanup_pjdfstest_mount() {
   fi
 }
 
+# The mounted zero-byte probe needs a shard whose metadata primary is remote
+# from the mount node. Whether the mount node holds a copy of that shard
+# follows the shard's actual members: a shard it is a replica of is preferred,
+# and the observed relation is recorded with the evidence.
 prepare_pjdfstest_zero_byte_placement() {
   local source_file="$PJDFSTEST_HOST_ARTIFACTS/zero-byte-shard-layout.json"
   local evidence_file="$PJDFSTEST_HOST_ARTIFACTS/zero-byte-placement.json"
-  local selected mount_node_id primary_node_id shard_id epoch lane prefix
+  local selected mount_node_id primary_node_id shard_id epoch lane prefix mount_is_replica
 
   mkdir -p "$PJDFSTEST_HOST_ARTIFACTS"
   if ! compose_exec_timeout "$PROBE_COMMAND_TIMEOUT" node5 \
       sinomo test run cluster.dfs.shard-layout \
         --require-cluster --json \
-        --param expected-replica-count=5 \
-        --param expected-distinct-primary-count=3 \
       >"$source_file" \
       2>"$PJDFSTEST_HOST_ARTIFACTS/zero-byte-shard-layout.stderr.log"; then
     log "pjdfstest: cannot resolve node5 metadata-shard layout for the mounted zero-byte probe"
@@ -3246,22 +3238,21 @@ prepare_pjdfstest_zero_byte_placement() {
         error("shard-layout probe did not pass")
       else
         .diagnostics as $diagnostics
-        | $diagnostics.shards
-        | map(select(.primary_node_id != $diagnostics.node))
-        | first as $shard
+        | ($diagnostics.shards | map(select(.primary_node_id != $diagnostics.node))) as $remote
+        | (($remote | map(select((.replica_node_ids | index($diagnostics.node)) != null)) | first)
+            // ($remote | first)) as $shard
         | if $shard == null then
             error("node5 has no remote metadata primary")
           elif ($shard.lane | IN("root", "services", "users") | not) then
             error("unsupported metadata shard lane")
-          elif ($shard.replica_node_ids | index($diagnostics.node)) == null then
-            error("node5 is not a metadata replica for the selected remote-primary shard")
           else
             [
               $diagnostics.node,
               $shard.primary_node_id,
               $shard.shard_id,
               ($shard.epoch | tostring),
-              $shard.lane
+              $shard.lane,
+              (($shard.replica_node_ids | index($diagnostics.node)) != null | tostring)
             ]
             | @tsv
           end
@@ -3272,7 +3263,7 @@ prepare_pjdfstest_zero_byte_placement() {
     return 1
   }
   IFS=$'\t' read -r \
-    mount_node_id primary_node_id shard_id epoch lane <<<"$selected"
+    mount_node_id primary_node_id shard_id epoch lane mount_is_replica <<<"$selected"
   case "$lane" in
     root) prefix="/cluster-tests/pjdfstest-zero-byte" ;;
     services) prefix="/services/cluster-tests/pjdfstest-zero-byte" ;;
@@ -3285,7 +3276,8 @@ prepare_pjdfstest_zero_byte_placement() {
   if [ -z "$mount_node_id" ] \
     || [ -z "$primary_node_id" ] \
     || [ "$mount_node_id" = "$primary_node_id" ] \
-    || [[ ! "$epoch" =~ ^[1-9][0-9]*$ ]]; then
+    || [[ ! "$epoch" =~ ^[1-9][0-9]*$ ]] \
+    || { [ "$mount_is_replica" != true ] && [ "$mount_is_replica" != false ]; }; then
     log "pjdfstest: invalid remote metadata-primary selection"
     return 1
   fi
@@ -3297,11 +3289,12 @@ prepare_pjdfstest_zero_byte_placement() {
     --argjson epoch "$epoch" \
     --arg lane "$lane" \
     --arg prefix "$prefix" \
+    --argjson mount_is_replica "$mount_is_replica" \
     '{
       schema_version: 1,
       status: "verified",
       remote_metadata_primary: true,
-      mount_node_is_metadata_replica: true,
+      mount_node_is_metadata_replica: $mount_is_replica,
       selection: {
         mount_node_id: $mount_node_id,
         metadata_primary_node_id: $primary_node_id,
@@ -3318,6 +3311,7 @@ prepare_pjdfstest_zero_byte_placement() {
 
   PJDFSTEST_ZERO_BYTE_PREFIX="$prefix"
   PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID="$mount_node_id"
+  PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA="$mount_is_replica"
   PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID="$primary_node_id"
   PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID="$shard_id"
   PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH="$epoch"
@@ -3346,6 +3340,7 @@ run_pjdfstest_compatibility_probe() {
     "SINOMO_PJDFSTEST_MOUNT_POINT=$PJDFSTEST_MOUNT_POINT" \
     "SINOMO_PJDFSTEST_ZERO_BYTE_PREFIX=$PJDFSTEST_ZERO_BYTE_PREFIX" \
     "SINOMO_PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID=$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA=$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA" \
     "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID=$PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID" \
     "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID=$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID" \
     "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH=$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH" \
@@ -3546,6 +3541,7 @@ write_pjdfstest_zero_byte_postcheck() {
     --arg primary_node_id "$PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID" \
     --arg shard_id "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID" \
     --argjson shard_epoch "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH" \
+    --argjson mount_is_replica "$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_IS_METADATA_REPLICA" \
     '{
       schema_version: 1,
       status: $status,
@@ -3562,7 +3558,7 @@ write_pjdfstest_zero_byte_postcheck() {
         metadata_primary_node_id: $primary_node_id,
         metadata_shard_id: $shard_id,
         metadata_shard_epoch: $shard_epoch,
-        mount_node_is_metadata_replica: true,
+        mount_node_is_metadata_replica: $mount_is_replica,
         remote_metadata_primary: ($mount_node_id != $primary_node_id)
       }
     }' >"$PJDFSTEST_HOST_ARTIFACTS/zero-byte-post-cluster.json"
@@ -4254,6 +4250,19 @@ large_file_performance() {
     --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+# The container of the node that currently is the metadata primary of one
+# lane's shard. `sinomo dfs path` reads the copy of the node it runs on, so a
+# native object view is taken on a node that holds the shard.
+dfs_lane_primary_container() {
+  local lane="$1" roster="$2" layout="$ARTIFACTS/dfs-lane-primary-$1.last.json"
+  compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" node1 sinomo test run cluster.dfs.shard-layout \
+    --require-cluster --json >"$layout" 2>"${layout%.json}.stderr.log" || return 1
+  jq -er --arg lane "$lane" --slurpfile roster "$roster" '
+    (.diagnostics.shards | map(select(.lane == $lane)) | .[0].primary_node_id) as $primary
+    | [$roster[0][] | select(.node_id == $primary) | .container]
+    | if length == 1 then .[0] else error("lane primary is not one observed node") end' "$layout"
+}
+
 # Observation DATA selects a real holder; the existing native fault probe
 # independently rechecks current membership and the exact expected identity.
 dfs_damage_roster_valid() {
@@ -4324,6 +4333,7 @@ disk_damage_recovery() {
   local seed="disk-damage-$RUN_ID"
   local roster="$ARTIFACTS/disk-damage-native-roster.json" rows="$ARTIFACTS/disk-damage-native-roster.tsv"
   local node native_id replicated object selection expected damage damage_id remaining remaining_id current fault_report
+  local inspector
   : >"$rows"
   for node in $NODES; do
     native_id="$(cluster_local_node_id "$node")" || return 1
@@ -4331,6 +4341,7 @@ disk_damage_recovery() {
   done
   jq -Rn '[inputs | split("\t") | {container:.[0],node_id:.[1]}]' <"$rows" >"$roster" || return 1
   dfs_damage_roster_valid "$roster" || return 1
+  inspector="$(dfs_lane_primary_container services "$roster")" || return 1
   run_probe node3 cluster.dfs.write \
     --param "path=$path" --param "payload-seed=$seed" --param "payload-bytes=$DAMAGE_BYTES" \
     --param "foreground-repair=true" || return 1
@@ -4338,7 +4349,7 @@ disk_damage_recovery() {
     --param "path=$path" --param "min-locations=2" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
   replicated="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node3-cluster.dfs.expect-replicated.json"
   object="$ARTIFACTS/disk-damage-object-before.json"
-  compose exec -T node1 sinomo dfs path "$path" --json >"$object" \
+  compose exec -T "$inspector" sinomo dfs path "$path" --json >"$object" \
     2>"$ARTIFACTS/disk-damage-object-before.stderr.log" || return 1
   selection="$(dfs_damage_participants_from_observation "$replicated" "$object" "$roster" "$path" \
     2>"$ARTIFACTS/disk-damage-selection.stderr.log")" || return 1
@@ -4356,7 +4367,7 @@ disk_damage_recovery() {
   [ "$(cluster_local_node_id "$damage")" = "$damage_id" ] || return 1
   [ "$(cluster_local_node_id "$remaining")" = "$remaining_id" ] || return 1
   current="$ARTIFACTS/disk-damage-object-pre-fault.json"
-  compose exec -T node1 sinomo dfs path "$path" --json >"$current" \
+  compose exec -T "$inspector" sinomo dfs path "$path" --json >"$current" \
     2>"$ARTIFACTS/disk-damage-object-pre-fault.stderr.log" || return 1
   dfs_damage_identity_matches "$expected" "$current" || return 1
   jq -e --arg damage "$damage_id" --arg remaining "$remaining_id" \
@@ -4379,7 +4390,7 @@ disk_damage_recovery() {
     --param "path=$path" --param "payload-seed=$seed" --param "payload-bytes=$DAMAGE_BYTES" \
     --param "timeout-seconds=$EXPECT_TIMEOUT" --param "max-proc-write-bytes=0" || return 1
   current="$ARTIFACTS/disk-damage-object-after-read.json"
-  compose exec -T node1 sinomo dfs path "$path" --json >"$current" \
+  compose exec -T "$inspector" sinomo dfs path "$path" --json >"$current" \
     2>"$ARTIFACTS/disk-damage-object-after-read.stderr.log" || return 1
   dfs_damage_identity_matches "$expected" "$current" || return 1
   run_probe node4 cluster.dfs.remove --param "path=$path" || return 1
@@ -4387,11 +4398,12 @@ disk_damage_recovery() {
     --param "path=$path" --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
-# Select the interrupted-write owner and distinct assigned seg_b leaf from
-# actual native observations. This never requests or rewrites placement.
-dfs_partition_participants_from_layout() {
+# Select the interrupted-write owner and its seg_b leaf from actual native
+# observations: the writer is the current Services primary and the leaf is
+# node6, or node5 when node6 is the writer. This never requests or rewrites
+# placement, and it says nothing about the leaf's membership.
+dfs_partition_roles_from_layout() {
   local layout="$1" roster="$2"
-  dfs_converged_epoch_signature "$layout" >/dev/null || return 1
   jq -ec --slurpfile roster "$roster" '
     $roster[0] as $nodes
     | if ($nodes | type) != "array"
@@ -4401,25 +4413,39 @@ dfs_partition_participants_from_layout() {
         or ([$nodes[].node_id] | unique | length) != 6 then
         error("interrupted-write requires six uniquely observed native node identities")
       else . end
+    | if .status != "passed" then error("shard-layout probe did not pass") else . end
     | (.diagnostics.shards | map(select(.lane == "services")) | .[0]) as $services
-    | ([$services.primary_node_id] + $services.replica_node_ids) as $assigned
     | ($nodes | map(select(.node_id == $services.primary_node_id))) as $writers
-    | if ($assigned | length) != 6
-        or ($assigned | unique | length) != 6
-        or ($assigned | sort) != ([$nodes[].node_id] | sort)
-        or ($writers | length) != 1 then
-        error("interrupted-write requires the complete observed six-node Services assignment")
+    | if ($writers | length) != 1 then
+        error("interrupted-write requires the observed Services primary among the six nodes")
       else . end
     | $writers[0] as $writer
     | (if $writer.container == "node6" then "node5" else "node6" end) as $leaf
     | ($nodes | map(select(.container == $leaf)) | .[0]) as $unavailable
-    | if $unavailable.node_id == $writer.node_id
-        or ($services.replica_node_ids | index($unavailable.node_id)) == null then
-        error("interrupted-write requires a distinct assigned nonprimary seg_b leaf")
+    | if $unavailable.node_id == $writer.node_id then
+        error("interrupted-write requires a seg_b leaf distinct from the Services primary")
       else {writer_container: $writer.container, writer_node_id: $writer.node_id,
             unavailable_container: $unavailable.container, unavailable_node_id: $unavailable.node_id}
       end
   ' "$layout"
+}
+
+# The same roles on a converged layout in which the Services write set is
+# every node, exactly at the shard's W floor: the leaf is then a write-set
+# member the primary can neither remove nor replace.
+dfs_partition_participants_from_layout() {
+  local layout="$1" roster="$2"
+  dfs_converged_epoch_signature "$layout" >/dev/null || return 1
+  jq -e --slurpfile roster "$roster" '
+    $roster[0] as $nodes
+    | (.diagnostics.shards | map(select(.lane == "services")) | .[0]) as $services
+    | if ($nodes | type) != "array"
+        or ($services.write_set | sort) != ([$nodes[].node_id] | sort)
+        or $services.w_floor != ($services.write_set | length) then
+        error("interrupted-write requires every node in the Services write set, exactly at its W floor")
+      else true end
+  ' "$layout" >/dev/null || return 1
+  dfs_partition_roles_from_layout "$layout" "$roster"
 }
 
 # Reconnect this exact observed endpoint, including dynamically assigned IPs.
@@ -4458,22 +4484,35 @@ dfs_network_endpoint_matches_snapshot() {
   ' "$2" >/dev/null
 }
 
+# A metadata commit must reach every member of the serving shard's write set.
+# A member the primary cannot reach is removed unless that would take the
+# write set below the shard's W floor; then it stays, and the write stays
+# prepared until the member returns or a recruit replaces it. This scenario
+# gives the Services shard its own run-scoped placement rule whose W and N are
+# every node, so the write set is all six nodes exactly at the W floor with
+# nobody left to recruit: only the interrupted member's return can complete
+# the write. The rule sits on an empty directory beside the fixture, so the
+# written file keeps its ordinary content policy. The rule is cleared and the
+# shard returns to the members its other rules give it before the scenario
+# ends, also after a failure.
 temporary_network_recovery() {
   local base="/services/cluster-tests/runs/$RUN_ID/network-heal"
   local path="$base/value.txt" new_path="$base/after-heal.txt"
+  local floor_rule="$base/write-set-floor"
   local original_payload="before network cut $RUN_ID"
   local payload="network heal $RUN_ID" new_payload="new write after network heal $RUN_ID"
   local operation_id="network-heal-$RUN_ID"
   local network="${PROJECT}_seg_b"
-  local unavailable unavailable_container unavailable_id baseline_report original_json assignment_json options_json
+  local unavailable unavailable_container unavailable_id
   local writer reader node node_id layout roster roster_rows selection network_observation
-  local restore_arguments restore_lines restored_networks reopened_networks
+  local restore_arguments restore_lines member_count rc=0
   local -a restore_args
 
   # A retained cohort may have completed a cooperative handoff. Resolve the
   # actual Services owner once and keep this SAME writer through every phase.
   # Reuse native layout/readiness validation and the ordinary local-ID reader;
-  # a missing/mismatched mapping fails before any fixture write or disconnect.
+  # a missing/mismatched mapping fails before any rule, fixture write or
+  # disconnect.
   roster="$ARTIFACTS/network-heal-native-roster.json"
   roster_rows="$ARTIFACTS/network-heal-native-roster.tsv"
   : >"$roster_rows"
@@ -4483,10 +4522,9 @@ temporary_network_recovery() {
   done
   jq -Rn '[inputs | split("\t") | {container: .[0], node_id: .[1]}]' \
     <"$roster_rows" >"$roster" || return 1
-  run_probe node1 cluster.dfs.shard-layout \
-    --param expected-replica-count=5 --param expected-distinct-primary-count=3 || return 1
+  run_probe node1 cluster.dfs.shard-layout || return 1
   layout="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node1-cluster.dfs.shard-layout.json"
-  selection="$(dfs_partition_participants_from_layout "$layout" "$roster" \
+  selection="$(dfs_partition_roles_from_layout "$layout" "$roster" \
     2>"$ARTIFACTS/network-heal-writer-selection.stderr.log")" || return 1
   writer="$(jq -er '.writer_container' <<<"$selection")" || return 1
   unavailable="$(jq -er '.unavailable_container' <<<"$selection")" || return 1
@@ -4500,7 +4538,7 @@ temporary_network_recovery() {
   docker inspect --format '{{json .NetworkSettings.Networks}}' "$unavailable_container" \
     >"$network_observation" || return 1
   # Both supported leaves belong only to seg_b. A second attached network
-  # would invalidate this cut; refuse before seeding or disconnecting.
+  # would invalidate this cut; refuse before any rule, seed or disconnect.
   jq -e --arg network "$network" 'keys == [$network]' "$network_observation" >/dev/null || return 1
   restore_arguments="$ARTIFACTS/network-heal-restore-arguments.json"
   dfs_network_endpoint_restore_arguments "$network_observation" "$network" \
@@ -4509,13 +4547,50 @@ temporary_network_recovery() {
   mapfile -t restore_args <<<"$restore_lines"
   reader=node5
   if [ "$unavailable" = node5 ]; then reader=node6; fi
+  member_count="$(jq -er 'length' "$roster")" || return 1
+
+  log "requesting every node in the Services write set at its W floor (W=N=$member_count at $floor_rule)"
+  if run_probe node1 cluster.dfs.placement-rule \
+      --param action=install --param "path=$floor_rule" \
+      --param "min-commit-replicas=$member_count" --param "desired-replicas=$member_count" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    && wait_for_dfs_converged; then
+    temporary_network_recovery_at_write_set_floor || rc=1
+  else
+    rc=1
+  fi
+  log "clearing the scenario's placement rule at $floor_rule"
+  run_probe node1 cluster.dfs.placement-rule \
+    --param action=clear --param "path=$floor_rule" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  wait_for_dfs_converged || rc=1
+  return "$rc"
+}
+
+# The interruption itself, run with temporary_network_recovery's locals while
+# the Services write set is every node at its W floor.
+temporary_network_recovery_at_write_set_floor() {
+  local baseline_report original_json assignment_json options_json
+  local floor_selection restored_networks reopened_networks
+
+  run_probe node1 cluster.dfs.shard-layout || return 1
+  layout="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node1-cluster.dfs.shard-layout.json"
+  floor_selection="$(dfs_partition_participants_from_layout "$layout" "$roster" \
+    2>>"$ARTIFACTS/network-heal-writer-selection.stderr.log")" || return 1
+  # The rule sizes the shard's members; it moves neither its primary nor the
+  # chosen leaf.
+  [ "$floor_selection" = "$selection" ] || {
+    log "the Services primary changed while its write set reached the W floor"
+    return 1
+  }
   jq -n --argjson selection "$selection" --arg container_id "$unavailable_container" \
-    --arg network "$network" --slurpfile layout "$layout" --slurpfile roster "$roster" \
+    --arg network "$network" --arg floor_rule "$floor_rule" \
+    --slurpfile layout "$layout" --slurpfile roster "$roster" \
     '$selection + {unavailable_container_id: $container_id, interrupted_network: $network,
-      native_layout: $layout[0], native_roster: $roster[0]}' \
+      write_set_floor_rule: $floor_rule, native_layout: $layout[0], native_roster: $roster[0]}' \
     >"$ARTIFACTS/network-heal-writer-selection.json" || return 1
 
-  # Seed under all six participants, then capture the actual immutable inputs
+  # Seed under the whole write set, then capture the actual immutable inputs
   # before disconnecting any member. Later phases retain this SAME node/ID/body.
   run_probe "$writer" cluster.dfs.write \
     --param "path=$path" --param "payload=$original_payload" || return 1
@@ -4523,14 +4598,14 @@ temporary_network_recovery() {
     --param "path=$path" --param "payload=$original_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
   run_probe "$writer" cluster.dfs.partition-write \
     --param phase=baseline --param "path=$path" --param "payload=$payload" \
-    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "operation-id=$operation_id" \
     --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
   baseline_report="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-$writer-cluster.dfs.partition-write.json"
   original_json="$(jq -ec '.diagnostics.original' "$baseline_report")" || return 1
   assignment_json="$(jq -ec '.diagnostics.assignment' "$baseline_report")" || return 1
   options_json="$(jq -ec '.diagnostics.write_options' "$baseline_report")" || return 1
 
-  log "disconnecting assigned $unavailable from $network for ${NETWORK_PARTITION_SECONDS}s"
+  log "disconnecting write-set member $unavailable from $network for ${NETWORK_PARTITION_SECONDS}s"
   if ! docker network disconnect "$network" "$unavailable_container" >/dev/null 2>&1; then
     log "failed to disconnect $unavailable from $network"
     return 1
@@ -4542,7 +4617,7 @@ temporary_network_recovery() {
   # Prepared body plus unchanged canonical content/nonvisible new generation.
   run_probe "$writer" cluster.dfs.partition-write \
     --param phase=blocked --param "path=$path" --param "payload=$payload" \
-    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "operation-id=$operation_id" \
     --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
     --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
     --param "original-options-json=$options_json" || rc=1
@@ -4564,7 +4639,7 @@ temporary_network_recovery() {
   wait_for_cluster_ready "post-network-heal" || rc=1
   run_probe "$writer" cluster.dfs.partition-write \
     --param phase=recover --param "path=$path" --param "payload=$payload" \
-    --param "operation-id=$operation_id" --param required-participants=6 \
+    --param "operation-id=$operation_id" \
     --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
     --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
     --param "original-options-json=$options_json" || rc=1
@@ -5102,9 +5177,9 @@ fi
 
 wait_for_dfs_benchmark_ready() {
   local phase phases="ready converged"
-  # Fresh nodes outside the bootstrap assignment have no resident metadata
-  # counts yet. Activate the requested six-member layout before requiring those
-  # observations on every node. Retained projects keep their existing ordering.
+  # A fresh project first lets every shard reach the members its placement
+  # rules give it and places the primaries among them; readiness then exercises
+  # that layout. Retained projects keep their existing ordering.
   if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
     phases="converged ready"
   fi
