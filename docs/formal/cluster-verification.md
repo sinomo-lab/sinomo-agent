@@ -61,7 +61,8 @@ The model inventory is split by subsystem:
     `operation_authority_snapshot_reuse`, `authority_routing`,
     `read_freshness`, `routed_namespace_freshness`,
     `metadata_primary_failover` (local failover-target selection),
-    `no_conflict`, and the target `metadata_write_set_takeover`;
+    `no_conflict`, and the targets `metadata_write_set_takeover` and
+    `single_round_write_commit`;
   - metadata journal and storage: `metadata_journal_source`,
     `metadata_journal_tail_recovery`, `metadata_stale_head_reopen`,
     `metadata_ack_floor_log`, `authored_journal_batch`,
@@ -976,6 +977,34 @@ QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_REQUIRE_WITNESSES=1 \
   QUINT_RUN_SEED=0x51a0f04d20260927 bash scripts/formal/check-quint.sh coverage
 _JAVA_OPTIONS='-Xmx2g -XX:ActiveProcessorCount=2' \
   QUINT_CASE_FILTER=dfs-initial-prepare-batch QUINT_CASE_TIMEOUT_SECONDS=300 \
+  bash scripts/formal/check-quint.sh verify-fast
+```
+
+The `dfs_single_round_write_commit_safety.safety` invariant is a target
+refinement for the [single-round write commit](../plans/dfs-single-round-write-commit.md).
+It models one `W=2` write on a write set of the primary and one member. The
+primary stores the content, prepares a change that names both holders before
+the second has answered, and sends content and frames in one exchange; the
+second holder is either the member or a node outside the write set. The model
+includes success before the commit record is durable, a primary crash between
+any two steps, restart, and takeover by the member. Its invariants require both
+holders' content and the member's frames at every commit, a member
+acknowledgement that implies its content, an acknowledged change that every
+later primary can still commit from durable state, and a local abort only
+before anything was sent. Three broken modes are negative controls: committing
+without holder confirmation, acknowledging without content and aborting after
+sending each reach the state their rule excludes. Storage damage, holder
+substitution, content larger than one message and larger write sets are outside
+the model.
+
+The registered case is `dfs-single-round-write-commit`, with default
+verification depth 13 and unrestricted `step`; every witness is reached under
+`coverageStep`.
+
+```bash
+QUINT_CASE_FILTER=dfs-single-round-write-commit QUINT_REQUIRE_WITNESSES=1 \
+  bash scripts/formal/check-quint.sh coverage
+QUINT_CASE_FILTER=dfs-single-round-write-commit \
   bash scripts/formal/check-quint.sh verify-fast
 ```
 
