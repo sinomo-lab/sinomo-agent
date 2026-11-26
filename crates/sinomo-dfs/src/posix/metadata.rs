@@ -1752,12 +1752,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.touch_directory_modified(&path)
     }
 
+    /// Advance the directory's modification time from its current row. A
+    /// writer of the row cut short after preparing, such as a job step whose
+    /// driver yielded, leaves its body for the next writer: the touch
+    /// finishes that body first and touches the row it leaves.
     pub(super) fn touch_directory_modified(&mut self, path: &str) -> Result<()> {
         let _namespace_plan = self.namespace_execution.begin_independent_planning();
-        self.clear_metadata_lookup_cache();
-        let object = self.directory_modified_metadata(path)?;
-        self.add_object_metadata(object)?;
-        Ok(())
+        loop {
+            self.clear_metadata_lookup_cache();
+            let object = self.directory_modified_metadata(path)?;
+            if !self.finish_prepared_writes_of_object(&object)? {
+                self.add_object_metadata(object)?;
+                return Ok(());
+            }
+        }
     }
 
     pub(super) fn directory_modified_metadata(&mut self, path: &str) -> Result<DfsObjectMetadata> {

@@ -290,3 +290,109 @@ fn a_job_held_by_another_drivers_step_runs_once_that_step_releases_it() {
     }
     cluster.close();
 }
+
+/// A driver cut short after preparing a step's directory touch, as a jobs
+/// pass that yields to foreground work is, leaves that touch prepared with
+/// its commit's outcome unknown, and the step runs again. The next touch of
+/// the directory finishes the prepared one and touches the row it leaves; it
+/// is not refused for having read the row before the prepared touch.
+#[test]
+fn a_touch_after_a_cut_short_touch_of_its_directory_finishes_that_touch_first() {
+    let mut cluster = sifs_two_primary_cluster("job-resume-cut-short-touch");
+    let users = cluster.users_primary_node.clone();
+    let path = "/users/touched";
+    cluster.replica.posix_mkdir_all(path).unwrap();
+    let runtime = &cluster._runtime;
+    let shard_root = crate::local_dfs_metadata_shard_path(
+        runtime.data_dir(&users),
+        &crate::DfsMetadataShardId::new("users"),
+    );
+    let row = || {
+        copy_of(runtime, &users, "users")
+            .tables
+            .objects
+            .into_iter()
+            .find(|object| object.path == path && object.kind == DfsObjectKind::Directory)
+            .unwrap()
+    };
+    let before = row();
+    // The first touch's commit is held once its body is prepared.
+    type Held = Option<(
+        String,
+        crate::metadata_backend::prepared_operation::PreparedCommitHold,
+    )>;
+    let held: Arc<Mutex<Held>> = Arc::default();
+    let armed = Arc::new(AtomicBool::new(true));
+    let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&users),
+        Arc::new({
+            let held = Arc::clone(&held);
+            let armed = Arc::clone(&armed);
+            let object_id = before.object_id.clone();
+            move |point, _, _| {
+                let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeMetadataEffectPrepare {
+                    payload,
+                } = point
+                else {
+                    return Ok(());
+                };
+                if payload.metadata_effects.iter().any(|effect| {
+                    matches!(effect, crate::DfsPreparedMetadataEffect::PutObject { object }
+                        if object.object_id == object_id)
+                }) && armed.swap(false, Ordering::SeqCst)
+                {
+                    *held.lock().unwrap() = Some((
+                        payload.operation_id.clone(),
+                        crate::metadata_backend::prepared_operation::hold_prepared_commit(
+                            std::slice::from_ref(&shard_root),
+                            &payload.operation_id,
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        }),
+    );
+    let cut_short = runtime
+        .with_main_maintenance_service(&users, |service| {
+            assert!(
+                service.posix_touch_directory_modified(path).is_err(),
+                "the held touch does not complete"
+            );
+            let (cut_short, hold) = held.lock().unwrap().take().expect("the touch was prepared");
+            let record = |service: &NetworkedDfsService<DfsNodeTransport>| {
+                service
+                    .metadata_backend()
+                    .unwrap()
+                    .prepared_operation_record(&cut_short)
+                    .unwrap()
+                    .expect("the touch's body is durable")
+            };
+            assert_eq!(record(service).status, DfsPreparedOperationStatus::Prepared);
+            drop(hold);
+            service
+                .posix_touch_directory_modified(path)
+                .expect("the next touch finishes the prepared one first");
+            assert_eq!(
+                record(service).status,
+                DfsPreparedOperationStatus::Committed
+            );
+            record(service)
+        })
+        .unwrap();
+    drop(hook);
+    let touched = cut_short
+        .payload
+        .metadata_effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::DfsPreparedMetadataEffect::PutObject { object } => Some(object.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let after = row();
+    assert_ne!(after.version, before.version);
+    assert_ne!(after.version, touched.version);
+    assert!(after.modified_at_unix_nanos > touched.modified_at_unix_nanos);
+    cluster.close();
+}
