@@ -1458,6 +1458,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(true)
     }
 
+    /// Finish every body still prepared over the row of `object`, as
+    /// publishing `object` would before preparing it. A writer cut short
+    /// after preparing leaves its body for the row's next writer, and a
+    /// successor computed from the row before that body is finished is
+    /// refused. Returns whether one was finished: the caller computes its
+    /// successor from the current row again.
+    pub(crate) fn finish_prepared_writes_of_object(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<bool, DfsError> {
+        let scope = self.metadata_effect_scope_for_object(
+            object,
+            format!("object-metadata:{}", sinomo_core::Id::generate()),
+        )?;
+        let footprint = DfsPreparedOperationPayload::for_metadata_effects(
+            scope,
+            vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object.object_id.clone(),
+                expected_version: None,
+            }],
+            vec![DfsNamespacePathOccupantExpectation {
+                path: object.path.clone(),
+                expected_object_id: Some(object.object_id.clone()),
+            }],
+            vec![DfsPreparedMetadataEffect::PutObject {
+                object: object.clone(),
+            }],
+            time::OffsetDateTime::now_utc(),
+        )?;
+        Ok(self.finish_prepared_bodies_overlapping(&footprint)?)
+    }
+
     pub(crate) fn put_visible_object_and_version_in_metadata_backend(
         &mut self,
         object: &DfsObjectMetadata,

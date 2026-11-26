@@ -1359,19 +1359,23 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn prepare_payload_for_publication_with_file_system(
+    /// Finish every earlier body still prepared over the rows `payload`
+    /// writes or expects. Returns whether one was finished: a producer that
+    /// computed `payload` from those rows computes it again from the rows the
+    /// finished bodies leave.
+    pub(crate) fn finish_prepared_bodies_overlapping(
         &mut self,
-        mut payload: crate::DfsPreparedOperationPayload,
-        configured_file_system: Option<&crate::DfsFileSystem>,
-    ) -> Result<DfsPreparedOperationDigest> {
+        payload: &crate::DfsPreparedOperationPayload,
+    ) -> Result<bool> {
         let mut reservations = self
             .metadata_backend
             .as_ref()
             .ok_or_else(|| {
                 MetadataBackendError::Serde("prepare requires a current durable backend".into())
             })?
-            .prepared_operation_reservations(&payload)?;
+            .prepared_operation_reservations(payload)?;
         reservations.sort_by_key(|record| record.digest.prepare_sequence);
+        let mut finished = false;
         for record in reservations {
             if record.owner_epoch > payload.owner_epoch || payload.metadata_effects.iter().any(|effect|
                 matches!(effect, crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {digest,..} if digest == &record.digest)) {
@@ -1384,7 +1388,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             // recovery path validates the current primary, original readset and
             // full shard proof; it never rebases either operation's payload.
             let original_operation_id = record.operation_id.clone();
-            self.recover_one_prepared_operation(record)
+            finished |= self.recover_one_prepared_operation(record)
                 .map_err(|error| {
                     MetadataBackendError::Serde(format!(
                         "namespace prepare {} overlaps active prepare {}: original recovery failed: {error}",
@@ -1392,6 +1396,15 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                     ))
                 })?;
         }
+        Ok(finished)
+    }
+
+    pub(crate) fn prepare_payload_for_publication_with_file_system(
+        &mut self,
+        mut payload: crate::DfsPreparedOperationPayload,
+        configured_file_system: Option<&crate::DfsFileSystem>,
+    ) -> Result<DfsPreparedOperationDigest> {
+        self.finish_prepared_bodies_overlapping(&payload)?;
         self.rebind_prepared_publication_instance_if_frozen(&payload)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
         let (stored_file_system, existing_prepare) = self
