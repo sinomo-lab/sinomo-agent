@@ -1404,6 +1404,102 @@ fn routed_write_response_tracks_remote_intent_alias() {
     runtime.close().unwrap();
 }
 
+/// Another path of a write can prepare the write's final commit after a path
+/// that resumes the write has looked for that commit and before it checks the
+/// write's opening. The opening check then meets the write's own prepared
+/// commit: it finishes that commit and reopens nothing, rather than taking
+/// the commit for an opening that differs from the write.
+#[test]
+fn opening_recovery_finishes_the_writes_own_prepared_commit() {
+    let (runtime, client, request, _base, bytes, _nodes, operation, pending_response) =
+        native_pending_routed_write("native-opening-meets-prepared-commit");
+    let DfsDistributedWriteResult::Outcome {
+        outcome: NetworkedDfsWriteOutcome::Pending { intent_id, .. },
+    } = &pending_response.result
+    else {
+        unreachable!()
+    };
+    let intent_id = intent_id.clone();
+    let primary = client.writes.pending_routed_writes[&operation]
+        .primary_node_id
+        .clone();
+    let config = client.writes.pending_routed_writes[&operation]
+        .authority_shard
+        .clone();
+    drop(client);
+    let final_body = format!("write:{intent_id}");
+    // The write's final commit is held once it is prepared.
+    let hold = crate::metadata_backend::prepared_operation::hold_prepared_commit(
+        &[crate::local_dfs_metadata_shard_path(
+            runtime.data_dir(&primary),
+            &crate::DfsMetadataShardId::new(&config.shard_id),
+        )],
+        &final_body,
+    );
+    runtime.clear_faults();
+    let path = runtime
+        .node_metadata(&primary)
+        .unwrap()
+        .get_object(&request.object_id)
+        .unwrap()
+        .expect("authority row for the routed write")
+        .path;
+    let mut owner = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(owner.node_id(), &primary);
+    owner.hydrate_from_metadata_backend().unwrap();
+    let prepared = |owner: &NetworkedDfsService<DfsNodeTransport>| {
+        owner
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&final_body)
+            .unwrap()
+            .map(|record| record.status)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while prepared(&owner) != Some(DfsPreparedOperationStatus::Prepared) {
+        assert!(
+            Instant::now() < deadline,
+            "the write's final commit is prepared: {:?}",
+            prepared(&owner)
+        );
+        // Its commit is held, so the replies that complete the write fail.
+        let _ = owner.retry_pending_stages(crate::DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK);
+        let _ = owner.process_incoming_until_quiescent();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let intent = owner
+        .coordinator
+        .intent(&intent_id)
+        .expect("the owner holds the open write")
+        .clone();
+    assert_eq!(intent.state, DfsWriteIntentState::AwaitingReceipts);
+    drop(hold);
+    owner
+        .recover_prepared_intent_opening_for_retry(
+            &intent,
+            &content_hash(&bytes),
+            bytes.len() as u64,
+        )
+        .expect("the opening check finishes the write's own prepared commit");
+    assert_eq!(
+        prepared(&owner),
+        Some(DfsPreparedOperationStatus::Committed)
+    );
+    let committed = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&request.object_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.version, intent.target_version);
+    assert_eq!(
+        committed.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    drop(owner);
+    runtime.close().unwrap();
+}
+
 #[test]
 fn late_authoritative_completion_settles_an_already_returned_unknown_write() {
     let (runtime, mut client, request, base, bytes, nodes, operation, mut observation) =

@@ -2330,6 +2330,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent: &DistributedWriteIntent,
         content_hash: &str,
+        content_size_bytes: u64,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
         if self.metadata_backend.is_none()
             || self.transport.delegates_local_namespace_authority()
@@ -2358,6 +2359,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &intent.object_id,
                 &intent.intent_id,
             )?;
+        let final_operation_id = format!("write:{}", intent.intent_id);
         let mut opening = None;
         for record in observed.prepared {
             let Some(original) = crate::service_routed_write::prepared_intent_for_write(
@@ -2367,6 +2369,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ) else {
                 continue;
             };
+            if record.digest.operation_id == final_operation_id
+                && record.payload.prepared_intent.is_some()
+            {
+                // The write's own final body, which another path of the
+                // write prepared after this path looked for it: it is the
+                // write's commit, not an opening. It is finished as a retry
+                // finishes it, and nothing is reopened.
+                Self::validate_recorded_write_retry(
+                    &record.payload,
+                    intent,
+                    content_hash,
+                    content_size_bytes,
+                )?;
+                if !self.recover_one_prepared_operation(record)? {
+                    return Err(DfsError::Metadata {
+                        message:
+                            "the write's prepared commit still requires its native recovery owner"
+                                .into(),
+                    });
+                }
+                self.refresh_committed_write_projection(&intent.intent_id)?;
+                return Ok(None);
+            }
             crate::service_routed_write::validate_retained_write_opening(
                 &record,
                 original,
@@ -2504,7 +2529,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let size = pending.size_bytes;
         self.refresh_committed_write_projection(intent_id)?;
         self.recover_prepared_write_for_retry(&intent, content_hash, size)?;
-        self.recover_prepared_intent_opening_publication(&intent, content_hash)?;
+        self.recover_prepared_intent_opening_publication(&intent, content_hash, size)?;
         Ok(())
     }
 
@@ -2514,8 +2539,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         content_size_bytes: u64,
     ) -> Result<(), DfsError> {
-        let Some(object) =
-            self.recover_prepared_intent_opening_publication(intent, content_hash)?
+        let Some(object) = self.recover_prepared_intent_opening_publication(
+            intent,
+            content_hash,
+            content_size_bytes,
+        )?
         else {
             return Ok(());
         };
