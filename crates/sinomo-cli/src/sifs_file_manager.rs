@@ -47,6 +47,9 @@ use std::time::{Duration, Instant};
 
 const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
+/// Bound of one path inspection routed to the metadata primary of a shard
+/// this node holds no copy of.
+const SIFS_ROUTED_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const SIFS_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,9 +209,41 @@ fn sifs_object_by_path_from_current_owner(
                 path: path.to_string(),
             })
             .map_err(|error| format!("cannot build resident DFS path inspection: {error}"))?;
-        let response = client
-            .call_request(&request)
-            .map_err(|error| format!("cannot inspect resident SIFS path {path}: {error}"))?;
+        // A node inspects its own copy of the shard that serves the path. A
+        // node that holds no copy of that shard has nothing local to inspect:
+        // it asks the shard's primary, through the resident daemon.
+        let local_node_id = cluster::read_cluster_state_without_kv(cluster_paths)
+            .map_err(|error| format!("cannot read local cluster state: {error}"))?
+            .local_node_id;
+        let mut kv = SifsControlPlaneKvClient::new(data_dir, cluster_paths);
+        kv.refresh_latest()
+            .map_err(|error| format!("cannot refresh SIFS control plane: {error}"))?;
+        let remote_primary = DfsControlPlaneStore::new(&mut kv)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
+            .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))?
+            .filter(|shard| {
+                shard.primary_node_id != local_node_id
+                    && !shard.replica_node_ids.contains(&local_node_id)
+            })
+            .map(|shard| shard.primary_node_id);
+        let response = match remote_primary {
+            Some(primary) => {
+                use sinomo_runtime::dfs::DaemonDfsApiClientExt;
+                client
+                    .dfs_object_rpc_to_target_with_options(
+                        &primary,
+                        &request,
+                        DfsObjectRpcSendOptions::new(SIFS_ROUTED_INSPECTION_TIMEOUT)
+                            .with_overall_timeout(SIFS_ROUTED_INSPECTION_TIMEOUT),
+                    )
+                    .map_err(|error| {
+                        format!("cannot inspect SIFS path {path} at its metadata primary {primary}: {error}")
+                    })?
+            }
+            None => client
+                .call_request(&request)
+                .map_err(|error| format!("cannot inspect resident SIFS path {path}: {error}"))?,
+        };
         return match sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
             .map_err(|error| format!("cannot decode resident SIFS path {path}: {error}"))?
         {
@@ -1209,6 +1244,7 @@ impl SifsFileManagerBackend {
         &self,
         base_config: &DfsFileSystemConfig,
         config: &DfsFileSystemConfig,
+        metadata_shards: &[DfsMetadataShardConfig],
         stat: &DfsStat,
         candidates: Vec<DfsNodeAdvertisement>,
         observer_node_id: NodeId,
@@ -1230,6 +1266,7 @@ impl SifsFileManagerBackend {
         let unavailable_node_ids = connectivity.explicitly_unavailable_node_ids();
         let mut preview = preview_placement_with_unavailable_nodes(
             config,
+            metadata_shards,
             &stat.path,
             stat.object_id.clone(),
             stat.version.clone(),
@@ -1333,6 +1370,9 @@ impl SifsFileManagerBackend {
             .get_file_system_config(&sifs_file_system_id())
             .map_err(|error| format!("cannot read SIFS placement policy: {error}"))?
             .ok_or_else(|| "SIFS cluster policy is unavailable".to_string())?;
+        let metadata_shards = DfsControlPlaneStore::new(&mut kv)
+            .list_metadata_shards(&sifs_file_system_id())
+            .map_err(|error| format!("cannot read SIFS metadata shards: {error}"))?;
         let mut config = base_config.clone();
         match policy {
             Some(policy) => {
@@ -1363,6 +1403,7 @@ impl SifsFileManagerBackend {
         let (preview, _, _) = self.preview_materialized_placement_with_paged_impact(
             &base_config,
             &config,
+            &metadata_shards,
             &stat,
             candidates,
             observer_node_id,
@@ -1406,6 +1447,9 @@ impl SifsFileManagerBackend {
             .get_file_system_config(&sifs_file_system_id())
             .map_err(|error| format!("cannot read SIFS placement policy: {error}"))?
             .ok_or_else(|| "SIFS cluster policy is unavailable".to_string())?;
+        let metadata_shards = store
+            .list_metadata_shards(&sifs_file_system_id())
+            .map_err(|error| format!("cannot read SIFS metadata shards: {error}"))?;
         let mut desired = expected.clone();
         match policy {
             Some(policy) => {
@@ -1426,6 +1470,7 @@ impl SifsFileManagerBackend {
             .preview_materialized_placement_with_paged_impact(
                 &expected,
                 &desired,
+                &metadata_shards,
                 &stat,
                 candidates,
                 observer_node_id,

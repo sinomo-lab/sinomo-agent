@@ -15,8 +15,12 @@
 //!   not this node, then write through that routed mutation path.
 //! - `cluster.dfs.shard-layout` — resolve representative paths for the default
 //!   root, services, and users lanes through live cluster KV and report their
-//!   current shard primaries and namespace-prepare codecs for external
-//!   performance orchestration.
+//!   current shard primaries, members, write sets, the W floor and member
+//!   count their placement rules give them, and namespace-prepare codecs for
+//!   external orchestration.
+//! - `cluster.dfs.placement-rule` — install or clear one subtree placement
+//!   rule on a run-scoped directory, for a scenario that needs its own shard
+//!   membership.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.placement-management` — exercise Files-compatible placement
@@ -116,6 +120,10 @@ const MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS: usize = 1_000_000;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 const MAX_RECORDED_BULK_RETRY_REASONS: usize = 8;
+
+/// Key prefix of the cluster member records, as `cluster_member_key` builds
+/// them.
+const CLUSTER_MEMBER_KEY_PREFIX: &str = "/cluster/members/";
 
 const DFS_TEST_NAMESPACE_ROOTS: [&str; 3] = [
     "/cluster-tests/runs",
@@ -319,7 +327,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
         .register(dfs_shard_layout())
-        .register(dfs_prepare_shard_layout())
+        .register(dfs_placement_rule())
         .register(dfs_service_advertisements())
         .register(dfs_placement_management())
         .register(dfs_placement_activity())
@@ -397,82 +405,112 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 sinomo_runtime::test::sinomo_test_case! {
-    pub fn dfs_prepare_shard_layout(ctx) {
-        id: "cluster.dfs.prepare-shard-layout",
-        summary: "Request six metadata members for each Docker test shard using scoped placement rules",
-        tags: ["cluster-dfs", "docker-setup"],
+    pub fn dfs_placement_rule(ctx) {
+        id: "cluster.dfs.placement-rule",
+        summary: "Install or clear one subtree placement rule on a run-scoped directory",
+        tags: ["cluster-dfs", "probe"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
-        run: { prepare_shard_layout(ctx) }
+        run: { run_placement_rule(ctx) }
     }
 }
 
-fn prepare_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+/// Whether `error` is the refusal of a stat whose shard changed members while
+/// it was served. The rule this probe changes sizes that very shard.
+fn placement_rule_stat_can_repeat(error: &str) -> bool {
+    error.contains("namespace authority shard stamp does not match")
+}
+
+fn run_placement_rule(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    scoped_sifs_test_run_root(&path)?;
+    let action = ctx.required_parameter("action")?.to_string();
+    let policy = match action.as_str() {
+        "install" => {
+            let w = optional_usize_parameter(ctx, "min-commit-replicas", 0)?;
+            let n = optional_usize_parameter(ctx, "desired-replicas", 0)?;
+            require_positive("min-commit-replicas", w)?;
+            require_positive("desired-replicas", n)?;
+            Some(
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, w, n)
+                    .map_err(|error| SinomoTestError::failed(error.to_string()))?,
+            )
+        }
+        "clear" => None,
+        _ => {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "action".to_string(),
+                detail: "must be install or clear".to_string(),
+            });
+        }
+    };
+    let deadline = Instant::now() + expect_timeout(ctx)?;
     let browser = open_local_daemon_sifs_browser(ctx)?;
-    let policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 6)
-        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    // These empty directories are siblings of the workloads. Their rules set
-    // each shard's desired metadata membership without changing file policy.
-    for path in [
-        "/cluster-tests/metadata-layout",
-        "/services/cluster-tests/metadata-layout",
-        "/users/cluster-tests/metadata-layout",
-    ] {
-        browser
-            .create_dir_all(path)
-            .map_err(SinomoTestError::failed)?;
-        let installed = || -> Result<bool, String> {
-            // Changing this rule expands the shard that serves this very stat.
-            // A receiver may reject an older membership stamp during handoff.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let stat = loop {
-                match browser.stat(path) {
-                    Err(error)
-                        if error.contains("namespace authority shard stamp does not match")
-                            && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    result => break result?,
+    ctx.record("path", &path);
+    ctx.record("action", &action);
+    ctx.record("requested_placement_policy", &policy);
+    browser
+        .create_dir_all(&path)
+        .map_err(SinomoTestError::failed)?;
+    // The rule on this exact path, or none when the path inherits its policy.
+    let own_rule = || -> Result<Option<DfsPlacementPolicy>, String> {
+        let stat = loop {
+            match browser.stat(&path) {
+                Err(error)
+                    if placement_rule_stat_can_repeat(&error) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(EXPECT_POLL_INTERVAL);
                 }
-            };
-            Ok(stat.placement.is_some_and(|placement| {
-                verify_write_latency_placement(&placement, path, &policy).is_ok()
-            }))
-        };
-        if !installed().map_err(SinomoTestError::failed)? {
-            for attempt in 1..=5 {
-                let preview = browser
-                    .preview_placement(path, Some(policy.clone()), DfsPlacementScope::Subtree)
-                    .map_err(SinomoTestError::failed)?;
-                match browser.update_placement(
-                    path,
-                    Some(policy.clone()),
-                    DfsPlacementScope::Subtree,
-                    preview.preview_token,
-                ) {
-                    Ok(update) => {
-                        update
-                            .require_published()
-                            .map_err(SinomoTestError::failed)?;
-                        break;
-                    }
-                    Err(error) if attempt < 5 && write_latency_preview_can_refresh(&error) => {
-                        continue;
-                    }
-                    Err(error) => return Err(SinomoTestError::failed(error)),
-                }
+                result => break result?,
             }
-            if !installed().map_err(SinomoTestError::failed)? {
-                return Err(SinomoTestError::failed(format!(
-                    "metadata layout policy is not visible at {path}"
-                )));
+        };
+        let placement = stat
+            .placement
+            .ok_or_else(|| "rule directory omitted its resolved placement".to_string())?;
+        Ok((placement.source_path.as_deref() == Some(path.as_str())
+            && placement.source_scope == Some(DfsPlacementScope::Subtree))
+        .then_some(placement.policy))
+    };
+    if own_rule().map_err(SinomoTestError::failed)? != policy {
+        for attempt in 1..=5 {
+            let preview = browser
+                .preview_placement(&path, policy.clone(), DfsPlacementScope::Subtree)
+                .map_err(SinomoTestError::failed)?;
+            match browser.update_placement(
+                &path,
+                policy.clone(),
+                DfsPlacementScope::Subtree,
+                preview.preview_token,
+            ) {
+                Ok(update) => {
+                    ctx.record("placement_job", &update.reconciliation);
+                    ctx.record("placement_committed_revision", update.committed_revision);
+                    ctx.record("placement_preview_attempts", attempt);
+                    update
+                        .require_published()
+                        .map_err(SinomoTestError::failed)?;
+                    break;
+                }
+                // Only an explicitly rejected preview or apply is refreshed;
+                // an ambiguous update is never submitted again.
+                Err(error) if attempt < 5 && write_latency_preview_can_refresh(&error) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(error) => return Err(SinomoTestError::failed(error)),
             }
         }
-        ctx.record(path, &policy);
+        if own_rule().map_err(SinomoTestError::failed)? != policy {
+            return Err(SinomoTestError::failed(format!(
+                "placement rule at {path} is not the requested one"
+            )));
+        }
     }
-    Ok(SinomoTestOutcome::passed(
-        "requested six metadata members on each shard",
-    ))
+    Ok(SinomoTestOutcome::passed(match &policy {
+        Some(policy) => format!(
+            "subtree rule W={}/N={} is installed at {path}",
+            policy.min_commit_replicas, policy.desired_replicas
+        ),
+        None => format!("{path} has no placement rule of its own"),
+    }))
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -1617,6 +1655,110 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
+/// The placement rules, shard list and write-set capable members of one
+/// admitted cluster snapshot: what sizes every shard's metadata membership.
+struct DfsShardRulesView {
+    file_system: dfs::DfsFileSystemConfig,
+    shards: Vec<dfs::DfsMetadataShardConfig>,
+    /// Authorized members that advertise the write-set protocol.
+    write_set_members: usize,
+}
+
+/// One shard's write set beside what its rules give it.
+struct DfsShardRuleMembership {
+    /// `None` while the shard has not switched to the write-set protocol.
+    write_set: Option<Vec<NodeId>>,
+    w_floor: usize,
+    policy_member_count: usize,
+}
+
+impl DfsShardRulesView {
+    fn read(snapshot: &sinomo_runtime::kv::KvSnapshot) -> Result<Self, SinomoTestError> {
+        let failed =
+            |error: sinomo_runtime::kv::KvError| SinomoTestError::failed(error.to_string());
+        let file_system_id = dfs::sifs_file_system_id();
+        let file_system = snapshot
+            .get(&dfs::file_system_config_key(&file_system_id))
+            .ok_or_else(|| SinomoTestError::failed("the SIFS placement configuration is absent"))?
+            .decode::<dfs::DfsFileSystemConfig>()
+            .map_err(failed)?;
+        let shards_prefix = format!("{}/", dfs::metadata_shards_prefix(&file_system_id));
+        let shards = snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.key.starts_with(&shards_prefix))
+            .map(|entry| entry.decode::<dfs::DfsMetadataShardConfig>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failed)?;
+        let write_set_members = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .key
+                    .strip_prefix(CLUSTER_MEMBER_KEY_PREFIX)
+                    .is_some_and(|rest| !rest.contains('/'))
+            })
+            .filter_map(|entry| {
+                entry
+                    .decode::<sinomo_runtime::core::ClusterMemberRecord>()
+                    .ok()
+            })
+            .filter(|member| {
+                member.state.is_authorized()
+                    && member.capabilities.iter().any(|capability| {
+                        capability.as_str()
+                            == sinomo_runtime::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY
+                    })
+            })
+            .count();
+        Ok(Self {
+            file_system,
+            shards,
+            write_set_members,
+        })
+    }
+
+    /// The write set of `shard` and the membership its rules give it: its N,
+    /// raised to the content W it accepted, and no more than the members
+    /// that can hold a copy.
+    fn membership(
+        &self,
+        snapshot: &sinomo_runtime::kv::KvSnapshot,
+        shard: &dfs::DfsMetadataShardConfig,
+    ) -> Result<DfsShardRuleMembership, SinomoTestError> {
+        let key = dfs::metadata_shard_write_set_key(&shard.file_system_id, &shard.shard_id);
+        let record = match dfs::metadata_shard_write_set_state(
+            shard,
+            snapshot.get(&key).map(|entry| entry.value.as_slice()),
+        ) {
+            dfs::DfsMetadataShardWriteSetState::Unswitched => None,
+            dfs::DfsMetadataShardWriteSetState::Switched(record) => Some(record),
+            dfs::DfsMetadataShardWriteSetState::Stale { reason }
+            | dfs::DfsMetadataShardWriteSetState::Unreadable { reason } => {
+                return Err(SinomoTestError::failed(format!(
+                    "shard {} write set: {reason}",
+                    shard.shard_id
+                )));
+            }
+        };
+        let bounds = dfs::metadata_shard_replication_bounds(
+            &self.file_system,
+            shard,
+            &self.shards,
+            self.write_set_members,
+        )
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        Ok(DfsShardRuleMembership {
+            policy_member_count: dfs::metadata_shard_effective_n(&bounds, record.as_ref())
+                .min(self.write_set_members)
+                .max(1),
+            w_floor: bounds.w_floor,
+            write_set: record.map(|record| record.write_set),
+        })
+    }
+}
+
 #[derive(serde::Serialize)]
 struct DfsShardLayoutProbe {
     lane: &'static str,
@@ -1626,6 +1768,12 @@ struct DfsShardLayoutProbe {
     primary_node_id: String,
     replica_node_ids: Vec<String>,
     write_set: Option<Vec<NodeId>>,
+    /// The highest content W among the placement rules that can apply to the
+    /// shard's paths.
+    w_floor: usize,
+    /// The members those rules give the shard: its N, raised to the content W
+    /// it accepted, and no more than the members that can hold a copy.
+    policy_member_count: usize,
     epoch: u64,
     metadata_protocol_version: u8,
 }
@@ -1649,9 +1797,6 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ),
     ];
 
-    let expected_replica_count = optional_usize_parameter(ctx, "expected-replica-count", 0)?;
-    let expected_distinct_primary_count =
-        optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
     let authority = ctx.authoritative_cluster_snapshot().ok_or_else(|| {
         SinomoTestError::failed(
             "live SIFS shard layout requires one invocation-scoped authoritative cluster snapshot",
@@ -1659,6 +1804,11 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let backend = open_observation(ctx)?;
     let node = backend.node_label();
+    // The rules, the shard list and the members that can hold a copy come
+    // from the same admitted snapshot as each shard and its write set.
+    let snapshot = authority.snapshot();
+    let rules = DfsShardRulesView::read(&snapshot)?;
+    ctx.record("write_set_member_count", rules.write_set_members);
     let mut layouts = Vec::with_capacity(PROBES.len());
     for (lane, base_prefix, candidate_path) in PROBES {
         let shard = backend
@@ -1687,20 +1837,11 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
         }
-        let key = dfs::metadata_shard_write_set_key(&shard.file_system_id, &shard.shard_id);
-        let state = dfs::metadata_shard_write_set_state(
-            &shard, authority.snapshot().get(&key).map(|entry| entry.value.as_slice()),
-        );
-        let write_set = match state {
-            dfs::DfsMetadataShardWriteSetState::Unswitched => None,
-            dfs::DfsMetadataShardWriteSetState::Switched(record) => Some(record.write_set),
-            dfs::DfsMetadataShardWriteSetState::Stale { reason }
-            | dfs::DfsMetadataShardWriteSetState::Unreadable { reason } => {
-                return Err(SinomoTestError::failed(format!("shard {} write set: {reason}", shard.shard_id)));
-            }
-        };
+        let membership = rules.membership(&snapshot, &shard)?;
         layouts.push(DfsShardLayoutProbe {
-            write_set,
+            write_set: membership.write_set,
+            w_floor: membership.w_floor,
+            policy_member_count: membership.policy_member_count,
             lane,
             base_prefix,
             shard_id: shard.shard_id.to_string(),
@@ -1722,7 +1863,6 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "/dfs/filesystems/{}/metadata-membership-handoffs/",
         dfs::sifs_file_system_id(),
     );
-    let snapshot = authority.snapshot();
     let pending_handoff_keys = snapshot
         .entries
         .iter()
@@ -1752,28 +1892,6 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             "live SIFS routing resolved {} performance lanes to only {} distinct metadata shards",
             layouts.len(),
             distinct_shard_ids.len()
-        )));
-    }
-    if expected_replica_count > 0
-        && layouts
-            .iter()
-            .any(|layout| layout.replica_node_ids.len() != expected_replica_count)
-    {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "live SIFS metadata-shard layout has not converged to {expected_replica_count} replicas per shard: {}",
-            layouts
-                .iter()
-                .map(|layout| format!("{}={}", layout.shard_id, layout.replica_node_ids.len()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    if expected_distinct_primary_count > 0
-        && distinct_primary_node_ids.len() != expected_distinct_primary_count
-    {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "live SIFS metadata-shard layout has {} distinct primaries; expected {expected_distinct_primary_count}",
-            distinct_primary_node_ids.len()
         )));
     }
     Ok(SinomoTestOutcome::passed(format!(

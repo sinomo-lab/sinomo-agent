@@ -11,6 +11,12 @@ use crate::service_content::object_content_identity;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
+/// Two writes conflict on a replica only when they name one version with
+/// different bytes. A version id carries no order: a write's version is
+/// derived from its operation identity. Which version is current is decided by
+/// the shard's metadata authority, and a command planned on a version that is
+/// no longer current is refused by the base check, so a stage left from
+/// another version never refuses a later stage or repair of the object.
 fn active_replica_stage_conflicts(
     active_intent_id: &str,
     active_version: &DfsVersion,
@@ -20,8 +26,8 @@ fn active_replica_stage_conflicts(
     incoming_content_hash: &str,
 ) -> bool {
     active_intent_id != incoming_intent_id
-        && active_version >= incoming_version
-        && (active_version != incoming_version || active_content_hash != incoming_content_hash)
+        && active_version == incoming_version
+        && active_content_hash != incoming_content_hash
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -231,28 +237,43 @@ mod active_stage_tests {
     }
 
     #[test]
-    fn newer_replica_stage_supersedes_older_active_stage() {
-        assert!(!active_replica_stage_conflicts(
-            "intent-old",
-            &version("version-1"),
-            "hash-old",
-            "intent-new",
-            &version("version-2"),
-            "hash-new",
-        ));
-        assert!(active_replica_stage_conflicts(
-            "intent-new",
-            &version("version-2"),
-            "hash-new",
-            "intent-old",
-            &version("version-1"),
-            "hash-old",
-        ));
+    fn a_stage_of_another_version_never_refuses_a_later_command() {
+        // Neither direction is refused: version ids are not ordered.
+        for (active, incoming) in [("version-1", "version-2"), ("version-2", "version-1")] {
+            assert!(!active_replica_stage_conflicts(
+                "intent-active",
+                &version(active),
+                "hash-active",
+                "intent-incoming",
+                &version(incoming),
+                "hash-incoming",
+            ));
+        }
+    }
+
+    #[test]
+    fn one_version_with_different_bytes_conflicts() {
         assert!(active_replica_stage_conflicts(
             "intent-a",
             &version("version-2"),
             "hash-a",
             "intent-b",
+            &version("version-2"),
+            "hash-b",
+        ));
+        assert!(!active_replica_stage_conflicts(
+            "intent-a",
+            &version("version-2"),
+            "hash-a",
+            "intent-b",
+            &version("version-2"),
+            "hash-a",
+        ));
+        assert!(!active_replica_stage_conflicts(
+            "intent-a",
+            &version("version-2"),
+            "hash-a",
+            "intent-a",
             &version("version-2"),
             "hash-b",
         ));

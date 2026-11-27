@@ -345,8 +345,14 @@ class Consumers(history.Acceptance):
         layouts = self.layouts("before-" + lane + "-handoff")
         before = next(item for item in layouts if item["lane"] == lane)
         if target is None:
+            # A primary moves only among the shard's own members, which its
+            # write-set keeper owns. A member that is primary of no shard is
+            # preferred; a shard whose other members all are primaries
+            # elsewhere promotes one of those.
             primaries = {item["primary_node_id"] for item in layouts}
-            target = next(node for node in before["replica_node_ids"] if node not in primaries)
+            require(before["replica_node_ids"], "the shard has no other member to promote")
+            target = next((node for node in before["replica_node_ids"] if node not in primaries),
+                          before["replica_node_ids"][0])
         require(target in before["replica_node_ids"], "promoted primary must be an actual assigned replica")
         self.topology_unknown = True
         requested = json.loads(self.cli("node1", "transfer-" + lane + "-consumer-primary", "dfs", "metadata",
@@ -388,23 +394,21 @@ class Consumers(history.Acceptance):
             self.memory_query(node, "restart", self.new_token, expected=True)
             self.memory_query(node, "restart-stale-rejected", self.old_token, expected=False)
 
-    def set_replicas(self, lane, replicas, label):
-        before = self.assignment(lane, label + "-before")
-        require(before["primary_node_id"] not in replicas, "replica set must not duplicate its primary")
-        argv = ["dfs", "metadata", "shard", "set-replicas", before["shard_id"], "--filesystem",
-                before["file_system_id"], "--expected-epoch", str(before["epoch"])]
-        for node in replicas:
-            argv += ["--replica", node]
-        self.topology_unknown = True
-        requested = json.loads(self.cli("node1", label, *argv, "--json"))
-        desired = requested["pending_handoff"]["desired_shard"]
-        require(set(desired["replica_node_ids"]) == set(replicas)
-                and desired["primary_node_id"] == before["primary_node_id"]
-                and desired["epoch"] == before["epoch"] + 1,
-                "membership request changed expected primary, epoch or exact replicas")
-        self.wait_assignment(lane, desired, label + "-active")
-        self.topology_unknown = False
-        return before, requested
+    def copy_free_provider(self, saved):
+        """The node whose DFS provider is withdrawn holds no metadata shard copy.
+
+        A shard's write-set keeper owns its members, so this driver removes
+        none. node6 is used when it holds no copy; otherwise the first other
+        node that holds none. node1 stays the observer of the withdrawal.
+        """
+        holders = {node for item in saved.values()
+                   for node in (item["primary_node_id"], *item["replica_node_ids"])}
+        for alias in ("node6", "node5", "node4", "node3", "node2"):
+            identity = json.loads(self.probe(alias, "shard-layout"))["diagnostics"]["node"]
+            if identity not in holders:
+                return alias, identity
+        raise RuntimeError("provider withdrawal needs a node that holds no metadata shard copy; "
+                           "node2..node6 are all members of some shard")
 
     def main_identity(self, node, label):
         script = r'''selected=""
@@ -569,45 +573,33 @@ kill -TERM "$pid"
         return expected
 
     @contextlib.contextmanager
-    def withdrawn_dfs_provider(self, node6, saved, before_disable, before_restore, *,
-                               require_nonprimary=False, full_readiness=True):
-        """One owner for metadata duties, module lifecycle and known restoration."""
+    def withdrawn_dfs_provider(self, alias, provider, saved, before_disable, before_restore, *,
+                               full_readiness=True):
+        """One owner for the module lifecycle and known restoration.
+
+        The provider holds no metadata shard copy, so withdrawing it changes no
+        shard's members, primary or epoch; the saved assignments are required
+        unchanged afterwards.
+        """
         require(callable(before_disable) and callable(before_restore),
                 "provider transition requires its real observer lifecycle callbacks")
         save(self.artifacts / "provider-original-assignments.json", saved)
-        if require_nonprimary:
-            require(set(saved) == {"root", "services", "users"}, "diagnostic requires exactly three saved assignments")
-            require(all(item["primary_node_id"] != node6 for item in saved.values()),
-                    "diagnostic requires node6 to be nonprimary on every metadata shard before any effect")
-        changed, disabled, module_unknown = [], False, False
-        restoration = {"passed": False, "saved": saved, "changed": changed,
+        require(set(saved) == {"root", "services", "users"}, "withdrawal requires exactly three saved assignments")
+        require(all(provider not in (item["primary_node_id"], *item["replica_node_ids"])
+                    for item in saved.values()),
+                "the withdrawn provider must hold no metadata shard copy before any effect")
+        disabled, module_unknown = False, False
+        restoration = {"passed": False, "saved": saved, "provider": {"alias": alias, "node_id": provider},
                        "full_readiness_checked": full_readiness}
         try:
-            for lane in saved:
-                current = self.assignment(lane, "provider-prepare-" + lane)
-                if require_nonprimary:
-                    require(current["primary_node_id"] == saved[lane]["primary_node_id"]
-                            and current["epoch"] == saved[lane]["epoch"]
-                            and set(current["replica_node_ids"]) == set(saved[lane]["replica_node_ids"]),
-                            "diagnostic assignment changed after its exact saved cut")
-                if current["primary_node_id"] == node6:
-                    primaries = {item["primary_node_id"] for item in self.layouts("provider-move-primary")}
-                    target = next(item for item in current["replica_node_ids"] if item not in primaries and item != node6)
-                    self.transfer_primary(lane, target)
-                    self.wait_ready("provider-primary-moved-" + lane)
-                    current = self.assignment(lane, "provider-moved-" + lane)
-                if node6 in current["replica_node_ids"]:
-                    self.set_replicas(lane, [item for item in current["replica_node_ids"] if item != node6],
-                                      "provider-remove-duty-" + lane)
-                    changed.append(lane)
             before_disable()
             module_unknown = True
-            raw = self.cli("node6", "disable-local-dfs-provider", "module", "native-rust", "disable", "module.dfs",
+            raw = self.cli(alias, "disable-local-dfs-provider", "module", "native-rust", "disable", "module.dfs",
                            "--reason", "isolated provider withdrawal consumer acceptance")
             require(b"enabled: false" in raw, "DFS disable did not return a committed configuration result")
             disabled = True
             module_unknown = False
-            self.restart_main("node6", "restart-withdrawn-provider")
+            self.restart_main(alias, "restart-withdrawn-provider")
             yield
         finally:
             original_error = sys.exc_info()[1]
@@ -620,48 +612,28 @@ kill -TERM "$pid"
                 errors.append("observer drain: " + str(error))
             if module_unknown:
                 errors.append("module disable has no verified receipt; no replacement configuration mutation attempted")
-            provider_restored = not module_unknown and not disabled
             if disabled:
                 try:
-                    raw = self.cli("node6", "restore-local-dfs-provider", "module", "native-rust", "enable", "module.dfs",
+                    raw = self.cli(alias, "restore-local-dfs-provider", "module", "native-rust", "enable", "module.dfs",
                                    "--reason", "restore isolated consumer fixture")
                     require(b"enabled: true" in raw, "DFS enable did not return committed configuration")
-                    self.restart_main("node6", "restart-restored-provider")
-                    provider_restored = True
+                    self.restart_main(alias, "restart-restored-provider")
                 except BaseException as error:
                     errors.append(str(error))
-            if self.topology_unknown:
-                errors.append("an original topology transition is unresolved; no replacement mutation attempted")
-            elif provider_restored:
-                for lane in reversed(changed):
-                    try:
-                        current = self.assignment(lane, "provider-restore-" + lane)
-                        if require_nonprimary:
-                            require(current["primary_node_id"] == saved[lane]["primary_node_id"]
-                                    and current["epoch"] == saved[lane]["epoch"] + 1
-                                    and set(current["replica_node_ids"]) == set(saved[lane]["replica_node_ids"]) - {node6},
-                                    "diagnostic no longer owns the exact removal assignment; no replacement mutation attempted")
-                        members = [saved[lane]["primary_node_id"], *saved[lane]["replica_node_ids"]]
-                        self.set_replicas(lane, [member for member in members if member != current["primary_node_id"]],
-                                          "provider-restore-membership-" + lane)
-                    except BaseException as error:
-                        errors.append(str(error))
-                        break
             if not errors:
                 try:
                     actual = {item["lane"]: item for item in self.layouts("provider-restored-exact-layout")}
                     restoration["restored_assignments"] = actual
-                    if require_nonprimary:
-                        require(set(actual) == set(saved) and all(
-                            actual[lane]["primary_node_id"] == saved[lane]["primary_node_id"]
-                            and set(actual[lane]["replica_node_ids"]) == set(saved[lane]["replica_node_ids"])
-                            and actual[lane]["epoch"] == saved[lane]["epoch"] + (2 if lane in changed else 0)
-                            for lane in saved), "diagnostic did not restore the exact saved assignments at expected successor epochs")
+                    require(set(actual) == set(saved) and all(
+                        actual[lane]["primary_node_id"] == saved[lane]["primary_node_id"]
+                        and set(actual[lane]["replica_node_ids"]) == set(saved[lane]["replica_node_ids"])
+                        and actual[lane]["epoch"] == saved[lane]["epoch"]
+                        for lane in saved), "a metadata shard changed while a node that holds no copy of it withdrew its provider")
                     if full_readiness:
                         self.wait_ready("provider-restored")
                     else:
                         self.verify_online_cluster("diagnostic-provider-restored")
-                        restoration["qualification"] = "known module/membership/identity restoration only; full DFS readiness remains unqualified"
+                        restoration["qualification"] = "known module/identity restoration and unchanged assignments only; full DFS readiness remains unqualified"
                     self.verify_processes("provider-restored")
                     restoration["passed"] = True
                 except BaseException as error:
@@ -670,26 +642,27 @@ kill -TERM "$pid"
             save(self.artifacts / "provider-restoration.json", restoration)
             require(not errors, "provider fixture restoration is incomplete: " + "; ".join(errors))
 
-    def remote_root_alias(self, saved):
+    def remote_root_alias(self, saved, provider_alias="node6"):
+        """The root owner's alias, which must not be the node whose HOME is checked."""
         owner = saved["root"]["primary_node_id"]
         aliases = {json.loads(self.probe(alias, "shard-layout"))["diagnostics"]["node"]: alias
-                   for alias in NODES if alias != "node6"}
+                   for alias in NODES if alias != provider_alias}
         require(owner in aliases, "saved root metadata owner is not a remote owned provider")
         return aliases[owner]
 
-    def verify_fresh_remote_home_absent(self, saved, agent):
+    def verify_fresh_remote_home_absent(self, saved, agent, provider_alias="node6"):
         # This isolated short safe identity is unchanged by the public product
         # agent_home_sifs_path_for_id mapping. No directory is seeded here.
         path = f"/sinomo/agents/{agent}/home"
         root = saved["root"]
-        self.cli(self.remote_root_alias(saved), "remote-root-owner-fresh-home-absent",
+        self.cli(self.remote_root_alias(saved, provider_alias), "remote-root-owner-fresh-home-absent",
                  "dfs", "path", path, "--filesystem", root["file_system_id"], "--json", timeout=30,
                  expected_success=False,
                  expected_error=f"DFS path {path} in filesystem {root['file_system_id']} has not been written".lower())
         self.receipts["remote-home-absent-before-initializer"] = {"agent": agent, "path": path,
             "observer": root["primary_node_id"], "typed_cli_outcome": "MissingArtifact"}
 
-    def verify_remote_home_attributes(self, saved, home, agent):
+    def verify_remote_home_attributes(self, saved, home, agent, provider_alias="node6"):
         """Observe the created root through its actual remote metadata owner."""
         root = saved["root"]
         require(home["agent"] == agent and home["initializer"] == "prepare_simple_sandbox_agent_home"
@@ -697,7 +670,7 @@ kill -TERM "$pid"
                 "HOME diagnostic did not use exactly the normal metadata initializer")
         expected = home["home"]
         owner = root["primary_node_id"]
-        alias = self.remote_root_alias(saved)
+        alias = self.remote_root_alias(saved, provider_alias)
         require(self.receipts["remote-home-absent-before-initializer"]["path"] == expected,
                 "initializer path differs from the exact previously absent fixture")
         raw = self.cli(alias, "remote-root-owner-home-attributes", "dfs", "path", expected,
@@ -713,8 +686,8 @@ kill -TERM "$pid"
             "qualification": "read-only actual root-primary observation after one fresh initializer; no mounted/native second store"}
 
     def provider_withdrawal(self, *, metadata_home_only=False):
-        node6 = json.loads(self.probe("node6", "shard-layout"))["diagnostics"]["node"]
         saved = {item["lane"]: item for item in self.layouts("provider-original-layout")}
+        alias, provider = self.copy_free_provider(saved)
         process, began, stdout, stderr = None, None, None, None
         control_id = "provider-" + self.identity
         control_root = f"/shared/consumer-tests/{control_id}"
@@ -722,9 +695,9 @@ kill -TERM "$pid"
         def before_disable():
             nonlocal process, began, stdout, stderr
             args = ["test", "run", "cluster.agent.channel-provider-reopen", "--require-cluster", "--json",
-                    "--param", f"control-id={control_id}", "--param", f"original-provider={node6}",
+                    "--param", f"control-id={control_id}", "--param", f"original-provider={provider}",
                     "--param", "timeout-seconds=240"]
-            command = [*self.compose, "exec", "-T", "node6", "timeout", "--foreground", "-k", "5s",
+            command = [*self.compose, "exec", "-T", alias, "timeout", "--foreground", "-k", "5s",
                        "250s", "/usr/local/bin/sinomo", *args]
             save(self.artifacts / "provider-reopen.command.json", command)
             stdout = (self.artifacts / "provider-reopen.stdout").open("wb")
@@ -735,11 +708,11 @@ kill -TERM "$pid"
             index = 0
             while True:
                 require(process.poll() is None, "provider probe ended before its initial read-only open")
-                raw = self.run(f"provider-ready-{index}", [*self.compose, "exec", "-T", "node6", "sh", "-c",
+                raw = self.run(f"provider-ready-{index}", [*self.compose, "exec", "-T", alias, "sh", "-c",
                     'if test -f "$1"; then cat "$1"; fi', "sh", control_root + "/ready.json"], timeout=10)
                 if raw:
                     ready = json.loads(raw)
-                    require(ready["control_id"] == control_id and ready["original_provider"] == node6,
+                    require(ready["control_id"] == control_id and ready["original_provider"] == provider,
                             "provider handshake names another fixture or owner")
                     break
                 require(time.monotonic() < deadline, "provider probe did not publish its ready barrier")
@@ -761,10 +734,10 @@ kill -TERM "$pid"
                 if stream is not None and not stream.closed:
                     stream.close()
 
-        with self.withdrawn_dfs_provider(node6, saved, before_disable, before_restore,
-                require_nonprimary=metadata_home_only, full_readiness=not metadata_home_only):
-            release = json.dumps({"control_id": control_id, "original_provider": node6, "phase": "provider-withdrawn"})
-            self.run("release-provider-probe", [*self.compose, "exec", "-T", "node6", "sh", "-c",
+        with self.withdrawn_dfs_provider(alias, provider, saved, before_disable, before_restore,
+                full_readiness=not metadata_home_only):
+            release = json.dumps({"control_id": control_id, "original_provider": provider, "phase": "provider-withdrawn"})
+            self.run("release-provider-probe", [*self.compose, "exec", "-T", alias, "sh", "-c",
                 'printf "%s" "$2" > "$1.pending" && mv "$1.pending" "$1"',
                 "sh", control_root + "/release.json", release], timeout=15)
             process.wait(timeout=max(1, began + 265 - time.monotonic()))
@@ -777,17 +750,18 @@ kill -TERM "$pid"
             save(self.artifacts / "probe-provider-reopen.json", report)
             require(report.get("status") == "passed", "provider reopen case did not establish actual withdrawal")
             if metadata_home_only:
-                self.verify_fresh_remote_home_absent(saved, self.agent + "-remote-home")
-            self.receipts["remote-home-prepare"] = self.native("node6", "cluster.sifs.agent-home-prepare",
+                self.verify_fresh_remote_home_absent(saved, self.agent + "-remote-home", alias)
+            self.receipts["remote-home-prepare"] = self.native(alias, "cluster.sifs.agent-home-prepare",
                 "remote-provider-strict-home-prepare", agent=self.agent + "-remote-home")
             if metadata_home_only:
-                self.verify_remote_home_attributes(saved, self.receipts["remote-home-prepare"], self.agent + "-remote-home")
+                self.verify_remote_home_attributes(saved, self.receipts["remote-home-prepare"],
+                                                   self.agent + "-remote-home", alias)
             else:
-                self.native("node6", "cluster.sifs.home-expect", "remote-provider-home-read", agent=self.agent,
+                self.native(alias, "cluster.sifs.home-expect", "remote-provider-home-read", agent=self.agent,
                     path="roaming.txt", payload=self.home_payload, version=self.receipts["home"]["version"], timeout_seconds=60)
-                self.native("node6", "cluster.sifs.home-write", "remote-provider-home-write", agent=self.agent,
+                self.native(alias, "cluster.sifs.home-write", "remote-provider-home-write", agent=self.agent,
                     path="provider/remote.txt", payload="remote home provider " + self.identity)
-                remote = self.native("node6", "cluster.sifs.memory-write", "remote-provider-memory-write", agent=self.agent,
+                remote = self.native(alias, "cluster.sifs.memory-write", "remote-provider-memory-write", agent=self.agent,
                     path="provider/remote.md", markdown="remote memory provider " + self.identity)
                 self.native("node1", "cluster.sifs.memory-expect", "remote-provider-memory-visible", agent=self.agent,
                     path="provider/remote.md", markdown="remote memory provider " + self.identity,
@@ -801,9 +775,9 @@ def main():
     parser.add_argument("--profile", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--provider-withdrawal", action="store_true",
-                        help="also remove node6 metadata duties, withdraw its DFS provider, then restore it")
+                        help="also withdraw, then restore, the DFS provider of a node that holds no metadata shard copy (node6 when it holds none)")
     parser.add_argument("--metadata-home-only", action="store_true",
-                        help="diagnostic: withdraw nonprimary node6 DFS and invoke one fresh strict HOME initializer; no full readiness claim")
+                        help="diagnostic: withdraw the DFS provider of a node that holds no metadata shard copy and invoke one fresh strict HOME initializer; no full readiness claim")
     parser.add_argument("--notes-home-only", action="store_true",
                         help="diagnostic: canonical notes first, strict private HOME, then real FUSE/sandbox HOME; no full readiness claim")
     args = parser.parse_args()
@@ -829,8 +803,8 @@ def main():
     if args.metadata_home_only:
         report.update(case="DIAGNOSTIC: strict HOME initializer with local DFS module disabled",
                       diagnostic_only=True, full_consumer_acceptance=False, readiness_acceptance=False,
-                      outage_coverage="controlled nonprimary DFS provider withdrawal and exact known restoration",
-                      qualification="One fresh metadata-only product HOME initializer on node6, actual provider-catalog withdrawal, and remote root-owner attributes; no FUSE, sandbox command, channel message persistence, full readiness or quietness claim")
+                      outage_coverage="controlled DFS provider withdrawal on a node that holds no metadata shard copy, and exact known restoration",
+                      qualification="One fresh metadata-only product HOME initializer on the withdrawn provider node, actual provider-catalog withdrawal, and remote root-owner attributes; no FUSE, sandbox command, channel message persistence, full readiness or quietness claim")
     if args.notes_home_only:
         report.update(case="DIAGNOSTIC: notes-first canonical HOME and real sandbox interoperability",
                       diagnostic_only=True, full_consumer_acceptance=False, readiness_acceptance=False,

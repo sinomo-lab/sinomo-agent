@@ -31,7 +31,7 @@ use crate::{
     explain_replicas, validate_replication_plan,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_core::kv::KvCompare;
+use sinomo_core::kv::{KvCompare, KvError};
 use sinomo_core::node::{
     DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY, NodeId, cluster_member_is_legacy_shadow_daemon,
 };
@@ -870,11 +870,43 @@ fn placement_config_with_override(
     Ok(preview_config)
 }
 
-/// Preview managed placement using the filesystem owner as the deterministic
-/// planning seed. `observer_node_id` is used only to mark the local table row.
+/// The node a replica plan ranks first and measures candidate paths from.
+///
+/// An object's writes are planned at the primary of the metadata shard that
+/// owns its path. Reconciliation, its preview and the primary's validation
+/// plan from that same node, so they keep the copies a write placed instead
+/// of moving them toward another node. A placement this job already committed
+/// for the object's version keeps the coordinator recorded with it, the
+/// primary that committed it: a replay after that shard's primary changed
+/// recomputes the same obligation. A path no shard owns has no primary to
+/// change, and is planned from the filesystem owner whether recorded or not.
+pub(crate) fn placement_coordinator_node_id(
+    config: &DfsFileSystemConfig,
+    metadata_shards: &[DfsMetadataShardConfig],
+    path: &str,
+    committed: Option<&crate::DfsWriteIntentRecord>,
+) -> Result<NodeId, KvError> {
+    let Some(shard) =
+        crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &config.file_system_id,
+            metadata_shards,
+            path,
+        )?
+    else {
+        return Ok(config.owner_node_id.clone());
+    };
+    Ok(committed.map_or(shard.primary_node_id, |record| {
+        record.coordinator_node_id.clone()
+    }))
+}
+
+/// Preview managed placement planned from the primary of the metadata shard
+/// that owns `path`, as its writes and reconciliation are. `observer_node_id`
+/// is used only to mark the local table row.
 #[allow(clippy::too_many_arguments)]
 pub fn preview_placement(
     config: &DfsFileSystemConfig,
+    metadata_shards: &[DfsMetadataShardConfig],
     path: &str,
     object_id: DfsObjectId,
     version: DfsVersion,
@@ -887,6 +919,7 @@ pub fn preview_placement(
 ) -> Result<DfsPlacementPreview, DfsDistributedError> {
     preview_placement_with_unavailable_nodes(
         config,
+        metadata_shards,
         path,
         object_id,
         version,
@@ -904,12 +937,14 @@ pub fn preview_placement(
 /// identified as unavailable. Excluded advertisements remain in `nodes` for
 /// operator context, but cannot satisfy N, W, required-node, or zone checks.
 ///
-/// Managed placement is seeded by the filesystem owner, making the desired set
-/// stable regardless of which daemon serves the preview. The explicit node id
+/// Managed placement is planned from the primary of the metadata shard that
+/// owns `path`, taken from `metadata_shards`, making the desired set stable
+/// regardless of which daemon serves the preview. The explicit node id
 /// identifies only the observer used for the table's `Local` reachability.
 #[allow(clippy::too_many_arguments)]
 pub fn preview_placement_with_unavailable_nodes(
     config: &DfsFileSystemConfig,
+    metadata_shards: &[DfsMetadataShardConfig],
     path: &str,
     object_id: DfsObjectId,
     version: DfsVersion,
@@ -923,6 +958,7 @@ pub fn preview_placement_with_unavailable_nodes(
 ) -> Result<DfsPlacementPreview, DfsDistributedError> {
     preview_placement_with_snapshot_and_unavailable_nodes(
         config,
+        metadata_shards,
         path,
         object_id,
         version,
@@ -945,6 +981,7 @@ pub fn preview_placement_with_unavailable_nodes(
 #[allow(clippy::too_many_arguments)]
 pub fn preview_placement_with_snapshot_and_unavailable_nodes(
     config: &DfsFileSystemConfig,
+    metadata_shards: &[DfsMetadataShardConfig],
     path: &str,
     object_id: DfsObjectId,
     version: DfsVersion,
@@ -1010,7 +1047,15 @@ pub fn preview_placement_with_snapshot_and_unavailable_nodes(
         file_system_id: config.file_system_id.clone(),
         object_id,
         target_version: version,
-        coordinator_node_id: config.owner_node_id.clone(),
+        coordinator_node_id: placement_coordinator_node_id(
+            config,
+            metadata_shards,
+            &normalized_path,
+            None,
+        )
+        .map_err(|error| DfsDistributedError::InvalidReplicaSet {
+            reason: error.to_string(),
+        })?,
         policy: replication,
         candidates: replica_candidates,
     };
@@ -1374,6 +1419,7 @@ struct ObjectPlacementAnalysis {
 fn analyze_object_placement(
     config: &DfsFileSystemConfig,
     object: &DfsObjectMetadata,
+    coordinator_node_id: NodeId,
     candidates: &[DfsNodeAdvertisement],
     unavailable_node_ids: &BTreeSet<NodeId>,
     snapshot: Option<&crate::DfsPlacementSnapshot>,
@@ -1391,7 +1437,7 @@ fn analyze_object_placement(
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         target_version: object.version.clone(),
-        coordinator_node_id: config.owner_node_id.clone(),
+        coordinator_node_id,
         policy: replication,
         candidates: replica_candidates,
     };
@@ -1774,9 +1820,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(resolved)
     }
 
+    /// The plan this job gives `object`. `metadata_shards` is the shard list
+    /// its caller already holds; it names the coordinator the plan is ranked
+    /// from (see [`placement_coordinator_node_id`]).
     fn reconciliation_placement_for_object_with_pins(
         &self,
         config: &DfsFileSystemConfig,
+        metadata_shards: &[DfsMetadataShardConfig],
         job: &DfsPlacementReconciliationJob,
         object: &DfsObjectMetadata,
         pinned_node_ids: &[NodeId],
@@ -1828,12 +1878,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?,
             None => object.clone(),
         };
-        reconciliation_placement_for_object_with_resolved_policy(
+        let coordinator_node_id = placement_coordinator_node_id(
             config,
+            metadata_shards,
+            &object.path,
+            original.as_ref(),
+        )?;
+        reconciliation_placement_for_object_with_resolved_policy(
             job,
             &ranking_object,
             pinned_node_ids,
             resolved,
+            &coordinator_node_id,
         )
     }
 
@@ -1936,8 +1992,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             current_locations: fence_locations,
         };
         let candidates = self.placement_content_candidates()?;
+        let metadata_shards = self
+            .metadata_shard_config_snapshot(&config.file_system_id)?
+            .unwrap_or_default();
         let mut preview = preview_placement_with_unavailable_nodes(
             config,
+            &metadata_shards,
             path,
             object_id,
             version,
@@ -2123,8 +2183,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })?;
         let mut impact = DfsPlacementImpact::default();
         let mut blocking_diagnostics = Vec::new();
-        let page =
-            self.placement_scope_page(&config.file_system_id, &path, scope, cursor, max_objects)?;
+        // One shard list both pages the scope and names each object's
+        // coordinator, as the reconciliation page's own list does.
+        let metadata_shards = self
+            .metadata_shard_config_snapshot(&config.file_system_id)?
+            .unwrap_or_default();
+        let page = self.placement_scope_page(
+            &metadata_shards,
+            &config.file_system_id,
+            &path,
+            scope,
+            cursor,
+            max_objects,
+        )?;
         let mut next_cursor = page.next_cursor;
         let mut metadata_snapshot_xor = [0_u8; 32];
         let mut metadata_snapshot_has_objects = false;
@@ -2141,6 +2212,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let analysis = analyze_object_placement(
                 config,
                 &object,
+                placement_coordinator_node_id(config, &metadata_shards, &object.path, None)?,
                 candidates,
                 unavailable_node_ids,
                 snapshot,
@@ -2509,9 +2581,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let pinned_node_ids = self.content_pin_nodes(object_id);
+        // The planning cut's shard, or the routed assignment without one,
+        // names both the plan's coordinator and this node's authority.
+        let routed_shard = match planning_shard {
+            Some(_) => None,
+            None => self.select_metadata_shard_for_object(&object)?,
+        };
         let (expected_resolved, expected_replication, expected_placement) = self
             .reconciliation_placement_for_object_with_pins(
                 accepted_config,
+                planning_shard
+                    .or(routed_shard.as_ref())
+                    .map_or(&[][..], std::slice::from_ref),
                 job,
                 &object,
                 &pinned_node_ids,
@@ -2532,7 +2613,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 shard.file_system_id == object.file_system_id
                     && shard.primary_node_id == self.node_id
             }
-            None => self.is_local_metadata_primary_for_object(&object)?,
+            None => routed_shard
+                .as_ref()
+                .is_none_or(|shard| shard.primary_node_id == self.node_id),
         };
         if !local_primary {
             return Err(DfsError::Distributed {
@@ -3179,6 +3262,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let (resolved, replication, placement) = self
                     .reconciliation_placement_for_object_with_pins(
                         config,
+                        page_authority.map_or(&[][..], |proof| &proof.shards),
                         job,
                         object,
                         &pinned_node_ids,
@@ -3440,21 +3524,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// One page of the objects `scope` selects at `path`, read from every
-    /// shard at its primary when shards are configured; otherwise from this
+    /// shard at its primary when `shards` are configured; otherwise from this
     /// service's own metadata.
     fn placement_scope_page(
         &mut self,
+        shards: &[DfsMetadataShardConfig],
         file_system_id: &DfsFileSystemId,
         path: &str,
         scope: DfsPlacementScope,
         cursor: Option<&DfsObjectPageCursor>,
         max_objects: usize,
     ) -> Result<DfsObjectPage, DfsError> {
-        if let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)?
-            && !shards.is_empty()
-        {
+        if !shards.is_empty() {
             let pager = PlacementShardPager::for_scope(
-                shards,
+                shards.to_vec(),
                 file_system_id,
                 path,
                 scope,
@@ -3724,12 +3807,13 @@ fn reconciliation_placement_for_object_with_pins(
         job.candidate_snapshot.len(),
     )
     .map_err(placement_reconciliation_policy_error)?;
+    // This service-free form holds no shard list: the filesystem owner plans.
     reconciliation_placement_for_object_with_resolved_policy(
-        config,
         job,
         object,
         pinned_node_ids,
         resolved,
+        &placement_coordinator_node_id(config, &[], &object.path, None)?,
     )
 }
 
@@ -3783,11 +3867,11 @@ fn recorded_placement_ranking_object(
 }
 
 fn reconciliation_placement_for_object_with_resolved_policy(
-    config: &DfsFileSystemConfig,
     job: &DfsPlacementReconciliationJob,
     object: &DfsObjectMetadata,
     pinned_node_ids: &[NodeId],
     resolved: DfsResolvedPlacementPolicy,
+    coordinator_node_id: &NodeId,
 ) -> Result<
     (
         DfsResolvedPlacementPolicy,
@@ -3826,7 +3910,7 @@ fn reconciliation_placement_for_object_with_resolved_policy(
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         target_version: object.version.clone(),
-        coordinator_node_id: config.owner_node_id.clone(),
+        coordinator_node_id: coordinator_node_id.clone(),
         policy: replication.clone(),
         candidates: replica_candidates,
     };
@@ -4418,6 +4502,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             PlacementPermitScope::Job(Some(&path))
         };
+        // The routed shard names the coordinator of a plan this job has not
+        // committed for the object's version. Resolve it before the permit.
+        let object_shard = self.select_metadata_shard_for_object(&object)?;
         let mut authority = self.acquire_placement_permit_for_scope(
             &intent.file_system_id, job_id, scope,
         )?;
@@ -4436,7 +4523,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Ok(false);
                     }
                 }
-                self.managed_placement_intent_matches_job(&intent, &object, job, config)
+                self.managed_placement_intent_matches_job(
+                    &intent,
+                    &object,
+                    job,
+                    config,
+                    object_shard.as_slice(),
+                )
             })
             .transpose();
         let authoritative = match authoritative_result {
@@ -4514,6 +4607,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         job: &DfsPlacementReconciliationJob,
         config: &DfsFileSystemConfig,
+        metadata_shards: &[DfsMetadataShardConfig],
     ) -> Result<bool, DfsError> {
         if placement_reconciliation_job_id_from_intent_id(&intent.intent_id)
             != Some(job.job_id.as_str())
@@ -4528,7 +4622,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let pinned_node_ids = self.content_pin_nodes(&object.object_id);
         let (resolved, expected_replication, expected_placement) = self
-            .reconciliation_placement_for_object_with_pins(config, job, object, &pinned_node_ids)
+            .reconciliation_placement_for_object_with_pins(
+                config,
+                metadata_shards,
+                job,
+                object,
+                &pinned_node_ids,
+            )
             .inspect_err(|_| {
                 tracing::Span::current().record("outcome", "error");
             })?;
@@ -4952,6 +5052,12 @@ where
         let cursor_shards = self
             .metadata_shard_config_snapshot(&job.file_system_id)?
             .filter(|shards| !shards.is_empty());
+        // The page's proven shard list names each object's coordinator; a
+        // page planned without a proof uses the list its cursors resume in.
+        let coordinator_shards = authority
+            .map(|proof| proof.shards.as_slice())
+            .or(cursor_shards.as_deref())
+            .unwrap_or_default();
         let count = page.objects.len();
         let mut prepared = Vec::with_capacity(count);
         let mut transfer_bytes = 0u64;
@@ -4974,7 +5080,13 @@ where
             } else {
                 let pins = self.content_pin_nodes(&object.object_id);
                 let (resolved, replication, placement) = self
-                    .reconciliation_placement_for_object_with_pins(config, job, &object, &pins)?;
+                    .reconciliation_placement_for_object_with_pins(
+                        config,
+                        coordinator_shards,
+                        job,
+                        &object,
+                        &pins,
+                    )?;
                 let desired_nodes = placement.plan.desired_replica_nodes;
                 let content_bearing = matches!(
                     object.kind,
@@ -5998,6 +6110,7 @@ mod tests {
         // copy when both old path observations have expired.
         let preview = preview_placement_with_snapshot_and_unavailable_nodes(
             &config,
+            &[],
             &object.path,
             object.object_id.clone(),
             object.version.clone(),
@@ -6047,6 +6160,7 @@ mod tests {
     ) -> Result<DfsPlacementPreview, DfsDistributedError> {
         preview_placement(
             config,
+            &[],
             "/users/team/report.md",
             DfsObjectId::from_legacy_named("preview-object").expect("object"),
             DfsVersion::from_legacy_named("preview-version").expect("version"),
@@ -6424,6 +6538,7 @@ mod tests {
         .collect();
         let preview = preview_placement(
             &config,
+            &[],
             "/users/team/report.md",
             DfsObjectId::from_legacy_named("object").expect("object"),
             DfsVersion::from_legacy_named("version").expect("version"),
@@ -6521,6 +6636,7 @@ mod tests {
         let unavailable = BTreeSet::from([node("node-b")]);
         let preview = preview_placement_with_unavailable_nodes(
             &config,
+            &[],
             "/users/team/report.md",
             DfsObjectId::from_legacy_named("unavailable-object").expect("object"),
             DfsVersion::from_legacy_named("unavailable-version").expect("version"),
@@ -6581,6 +6697,7 @@ mod tests {
 
         let baseline = preview_placement_with_unavailable_nodes(
             &config,
+            &[],
             path,
             object.object_id.clone(),
             object.version.clone(),
@@ -6604,6 +6721,7 @@ mod tests {
         let unavailable_node_ids = BTreeSet::from([unavailable_node_id.clone()]);
         let preview = preview_placement_with_unavailable_nodes(
             &config,
+            &[],
             path,
             object.object_id.clone(),
             object.version.clone(),
@@ -6779,8 +6897,18 @@ mod tests {
     }
 
     #[test]
-    fn managed_preview_uses_file_system_owner_as_stable_seed() {
+    fn managed_preview_uses_the_path_shard_primary_as_stable_seed() {
         let config = placement_config(node("node-b"));
+        // The path's shard is led by another node than the filesystem owner.
+        let shards = [crate::DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node-c"),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }];
         let policy =
             DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).expect("policy");
         let candidates = vec![
@@ -6788,9 +6916,10 @@ mod tests {
             advertisement("node-b", "west"),
             advertisement("node-c", "north"),
         ];
-        let preview_from = |observer: &str| {
+        let preview_from = |shards: &[crate::DfsMetadataShardConfig], observer: &str| {
             preview_placement(
                 &config,
+                shards,
                 "/stable.bin",
                 DfsObjectId::from_legacy_named("stable-object").expect("object"),
                 DfsVersion::from_legacy_named("stable-version").expect("version"),
@@ -6804,18 +6933,25 @@ mod tests {
             .expect("stable preview")
         };
 
-        let from_a = preview_from("node-a");
-        let from_c = preview_from("node-c");
+        let from_a = preview_from(&shards, "node-a");
+        let from_c = preview_from(&shards, "node-c");
         assert_eq!(
             from_a.placement.plan.desired_replica_nodes,
             from_c.placement.plan.desired_replica_nodes
         );
-        assert!(
-            from_a
+        assert_eq!(
+            from_a.placement.plan.desired_replica_nodes.first(),
+            Some(&shards[0].primary_node_id),
+            "the primary that plans the path's writes also plans its preview"
+        );
+        assert_eq!(
+            preview_from(&[], "node-a")
                 .placement
                 .plan
                 .desired_replica_nodes
-                .contains(&config.owner_node_id)
+                .first(),
+            Some(&config.owner_node_id),
+            "a path no shard owns is planned from the filesystem owner"
         );
         assert_eq!(
             from_a
@@ -6834,6 +6970,77 @@ mod tests {
                 .expect("observer c")
                 .reachability,
             DfsPlacementNodeReachability::Local
+        );
+    }
+
+    #[test]
+    fn placement_coordinator_is_the_path_shard_primary_unless_already_committed() {
+        let config = placement_config(node("node-owner"));
+        let shard = |id: &str, assignment, primary: &str| crate::DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: id.to_string(),
+            primary_node_id: node(primary),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let shards = [
+            shard("root", crate::DfsMetadataShardAssignment::Root, "node-root"),
+            shard(
+                "services",
+                crate::DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".into(),
+                },
+                "node-services",
+            ),
+        ];
+        let coordinator = |shards: &[crate::DfsMetadataShardConfig], path: &str, committed| {
+            placement_coordinator_node_id(&config, shards, path, committed).unwrap()
+        };
+        assert_eq!(
+            coordinator(&shards, "/services/a.bin", None),
+            node("node-services")
+        );
+        assert_eq!(coordinator(&shards, "/a.bin", None), node("node-root"));
+        assert_eq!(
+            coordinator(&[], "/services/a.bin", None),
+            config.owner_node_id
+        );
+
+        // The primary that committed a placement is recorded as its
+        // coordinator; the shard has since moved to another primary.
+        let committed = crate::intent::write_intent_record(
+            &DistributedWriteIntent {
+                publication: Default::default(),
+                intent_id: "placement:job:object:version".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id: DfsObjectId::from_legacy_named("coordinator-object").expect("object"),
+                base_version: None,
+                target_version: DfsVersion::from_legacy_named("coordinator-version")
+                    .expect("version"),
+                requesting_node_id: node("node-earlier-primary"),
+                operation_id: None,
+                operation_order_token: None,
+                owner_epoch: 1,
+                desired_replica_nodes: vec![node("node-earlier-primary")],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                state: DfsWriteIntentState::Committed,
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            coordinator(&shards, "/services/a.bin", Some(&committed)),
+            node("node-earlier-primary"),
+            "a replay after the handoff plans from the committing primary"
+        );
+        assert_eq!(
+            coordinator(&[], "/services/a.bin", Some(&committed)),
+            config.owner_node_id,
+            "without a shard the first plan was the owner's, so its replay is too"
         );
     }
 
@@ -6859,6 +7066,7 @@ mod tests {
         // CLI/daemon pass an already-materialized desired config and None here.
         let preview = preview_placement(
             &config,
+            &[],
             "/team",
             DfsObjectId::from_legacy_named("team-object").expect("object"),
             DfsVersion::from_legacy_named("team-version").expect("version"),
@@ -7315,9 +7523,11 @@ mod tests {
             policy: directory.policy.clone(),
             current_locations: directory.current_locations.clone(),
         };
+        let metadata_shards = runtime.metadata_shards().unwrap();
         let mut preview = |snapshot: &crate::DfsPlacementSnapshot| {
             let mut preview = preview_placement_with_snapshot_and_unavailable_nodes(
                 &config,
+                &metadata_shards,
                 &directory.path,
                 directory.object_id.clone(),
                 directory.version.clone(),

@@ -2333,7 +2333,14 @@ impl DfsBrowserBackend {
         ),
         ServiceError,
     > {
-        let (stat, observer_node_id, candidates, placement_snapshot, pinned_replica_node_ids) = {
+        let (
+            stat,
+            observer_node_id,
+            candidates,
+            placement_snapshot,
+            pinned_replica_node_ids,
+            metadata_shards,
+        ) = {
             let mut service = self.lock_service_for_read()?;
             self.refresh_peer_targets(&mut service);
             let stat = service
@@ -2348,12 +2355,18 @@ impl DfsBrowserBackend {
                 .snapshot()
                 .map(|snapshot| (*snapshot).clone());
             let pinned_replica_node_ids = service.content_pin_nodes(&stat.object_id);
+            // The shard list the impact pages below plan each object from.
+            let metadata_shards = service
+                .metadata_shard_config_snapshot(&config.file_system_id)
+                .map_err(dfs_browser_service_error)?
+                .unwrap_or_default();
             (
                 stat,
                 observer_node_id,
                 candidates,
                 placement_snapshot,
                 pinned_replica_node_ids,
+                metadata_shards,
             )
         };
         if candidates.is_empty() {
@@ -2367,6 +2380,7 @@ impl DfsBrowserBackend {
         let unavailable_node_ids = initial_connectivity.explicitly_unavailable_node_ids();
         let mut preview = crate::preview_placement_with_snapshot_and_unavailable_nodes(
             config,
+            &metadata_shards,
             &stat.path,
             stat.object_id.clone(),
             stat.version.clone(),

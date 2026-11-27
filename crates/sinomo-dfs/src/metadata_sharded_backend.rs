@@ -562,6 +562,12 @@ pub(crate) fn metadata_shard_topology_status(
     }
 }
 
+/// Whether `node_id` holds a copy of the shard: it is its primary or one of
+/// its replicas.
+fn metadata_shard_config_holds(config: &DfsMetadataShardConfig, node_id: &NodeId) -> bool {
+    config.primary_node_id == *node_id || config.replica_node_ids.contains(node_id)
+}
+
 fn non_primary_unhydrated_status_omission(
     local_node_id: Option<&NodeId>,
     config: &DfsMetadataShardConfig,
@@ -1697,8 +1703,20 @@ impl ResidentLocalShardedMetadataBackend {
     /// prove cluster-wide lock and job invariants even when a quiet non-primary
     /// shard receives no new replication after restart. Inspection leaves the
     /// replica deferred, preserving lazy repair and idle-runtime behavior.
+    ///
+    /// A shard this node holds no copy of has no local unit to inspect, and
+    /// bounded status reports only its topology.
     pub fn initialize_bounded_status_snapshots(&self) -> Result<()> {
-        for slot in self.inner.shards.values() {
+        let (local_node_id, shard_configs) = self.with_router(|router| {
+            (router.local_node_id.clone(), router.shard_configs.clone())
+        })?;
+        for (shard_id, slot) in &self.inner.shards {
+            if let (Some(local_node_id), Some(config)) =
+                (local_node_id.as_ref(), shard_configs.get(&shard_id.0))
+                && !metadata_shard_config_holds(config, local_node_id)
+            {
+                continue;
+            }
             slot.initialize_deferred_bounded_status_snapshot()?;
         }
         Ok(())
@@ -1864,6 +1882,17 @@ impl ResidentLocalShardedMetadataBackend {
             file_system_ids.insert(config.file_system_id.clone());
             if local_primary {
                 primary_file_system_ids.insert(config.file_system_id.clone());
+            }
+            // A node that is neither the shard's primary nor one of its
+            // replicas holds no copy of it: there are no counters, locks or
+            // cursors of its own to report, and none are omitted. The shard's
+            // members report them; this node reports the topology only.
+            if local_node_id
+                .as_ref()
+                .is_some_and(|local_node_id| !metadata_shard_config_holds(config, local_node_id))
+            {
+                metadata_shards.push(metadata_shard_topology_status(config));
+                continue;
             }
             let Some(slot) = self.inner.shards.get(&shard_id) else {
                 every_configured_shard_summary_available = false;
@@ -4364,6 +4393,79 @@ mod lazy_replica_slot_tests {
             "startup initialization must preserve the exact zero-lock proof"
         );
         assert_eq!(snapshot.summary.cross_shard_namespace_lock_count, 0);
+    }
+
+    /// A node that holds no copy of a shard has nothing of that shard to
+    /// report or to omit: its status names the shard's topology only, and the
+    /// lock count of the shards it does hold stays observed.
+    #[test]
+    fn bounded_status_reports_only_topology_for_a_shard_this_node_does_not_hold() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-unheld-shard");
+        let metadata_root = native_metadata_data(root.path());
+        let local_node_id = node("bounded-status-unheld-local");
+        let mut shards = configs(&local_node_id);
+        // Another node holds the services shard's only replica.
+        shards[1].replica_node_ids = vec![node("bounded-status-unheld-replica")];
+        let services_id = DfsMetadataShardId::new("services");
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            shards.clone(),
+            &local_node_id,
+        )
+        .expect("open a topology with a shard held elsewhere")
+        .into_resident();
+        let unheld = resident
+            .inner
+            .shards
+            .get(&services_id)
+            .expect("resident slot of the shard held elsewhere");
+        unheld
+            .operator_status
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot = None;
+
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        resident
+            .initialize_bounded_status_snapshots()
+            .expect("initialize the held status projections");
+        assert!(
+            unheld
+                .operator_status
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .snapshot
+                .is_none(),
+            "a shard held elsewhere has no local unit to inspect"
+        );
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("bounded status with a shard held elsewhere");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "neither initialization nor status opens a shard held elsewhere"
+        );
+
+        assert!(
+            snapshot.bounded_omissions.is_empty(),
+            "nothing of a shard held elsewhere is omitted: {:?}",
+            snapshot.bounded_omissions
+        );
+        assert!(
+            snapshot.incomplete_reasons.is_empty(),
+            "{:?}",
+            snapshot.incomplete_reasons
+        );
+        let services = snapshot
+            .metadata_shards
+            .iter()
+            .find(|shard| shard.shard_id == services_id)
+            .expect("topology row of the shard held elsewhere");
+        assert_eq!(services, &metadata_shard_topology_status(&shards[1]));
+        let status =
+            crate::project_dfs_status_from_resident_snapshot(Some(&local_node_id), snapshot);
+        assert_eq!(status.cross_shard_namespace_lock_count, Some(0));
     }
 
     #[test]

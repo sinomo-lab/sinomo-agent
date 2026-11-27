@@ -124,6 +124,12 @@ stalls, busy intervals or process-generation changes invalidate the interval.
 Read current gate validation in [test-cluster.sh](../../../../docker/test-cluster.sh)
 before interpreting a result. Do not replace it with a daemon-only CPU sample.
 
+DFS convergence requires no pending handoff and, for every shard, a write set
+equal to its configured members and to the member count its placement rules
+give; `cluster.dfs.shard-layout` reports that count and the W floor. A shard
+that stays below or above it is a membership failure of that shard's primary:
+inspect its `sinomo.dfs.write_set` trace records before changing any wait.
+
 Default artifacts are under `target/cluster-test-artifacts/<run>/`; use
 `SINOMO_TEST_ARTIFACTS` to choose a run directory. Preserve raw probe results and
 the first failing gate. Formation observation includes capture-tagged and

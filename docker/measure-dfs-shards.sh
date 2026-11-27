@@ -141,7 +141,6 @@ SAMPLE_CLASSIFICATIONS=(
   low_cpu_sleeping_cgroup_cpu_pressure
   low_cpu_sleeping_no_observed_external_progress
 )
-EXPECTED_REPLICA_COUNT=5
 COMPOSE_FILES=(-f "$COMPOSE_FILE")
 if [[ -n "$COMPOSE_OVERRIDE_FILE" ]]; then
   COMPOSE_FILES+=(-f "$COMPOSE_OVERRIDE_FILE")
@@ -759,6 +758,7 @@ jq -e --argjson expected_protocol "$EXPECTED_METADATA_PROTOCOL_VERSION" '
     and (.shard_id | type) == "string"
     and (.primary_node_id | type) == "string"
     and (.replica_node_ids | type) == "array"
+    and (.policy_member_count | type) == "number"
     and (.epoch | type) == "number"
     and .metadata_protocol_version == $expected_protocol)
 ' "$ARTIFACTS/shard-layout.before.json" >/dev/null \
@@ -770,17 +770,22 @@ declare -A lane_primary_id=()
 declare -A lane_primary_service=()
 declare -A lane_epoch=()
 declare -A lane_replica_count=()
+declare -A lane_write_set_count=()
+declare -A lane_policy_member_count=()
 declare -A lane_metadata_protocol_version=()
-while IFS=$'\t' read -r lane base shard primary epoch replica_count metadata_protocol_version; do
+while IFS=$'\t' read -r lane base shard primary epoch replica_count write_set_count policy_member_count metadata_protocol_version; do
   lane_base[$lane]="$base"
   lane_shard[$lane]="$shard"
   lane_primary_id[$lane]="$primary"
   lane_epoch[$lane]="$epoch"
   lane_replica_count[$lane]="$replica_count"
+  lane_write_set_count[$lane]="$write_set_count"
+  lane_policy_member_count[$lane]="$policy_member_count"
   lane_metadata_protocol_version[$lane]="$metadata_protocol_version"
 done < <(jq -r '.diagnostics.shards[] |
   [.lane, .base_prefix, .shard_id, .primary_node_id,
    (.epoch | tostring), (.replica_node_ids | length | tostring),
+   ((.write_set // []) | length | tostring), (.policy_member_count | tostring),
    .metadata_protocol_version] | @tsv' \
   "$ARTIFACTS/shard-layout.before.json")
 
@@ -790,8 +795,12 @@ for lane in "${LANES[@]}"; do
   primary_service="${service_by_node_id[${lane_primary_id[$lane]}]:-}"
   [[ -n "$primary_service" ]] \
     || die "$lane primary ${lane_primary_id[$lane]} is not one of the six compose nodes"
-  (( lane_replica_count[$lane] == EXPECTED_REPLICA_COUNT )) \
-    || die "$lane shard has ${lane_replica_count[$lane]} replicas, expected $EXPECTED_REPLICA_COUNT"
+  # A shard's members are what its placement rules give it; the write-set
+  # keeper holds every one of them in the write set of a settled shard.
+  (( lane_replica_count[$lane] + 1 == lane_policy_member_count[$lane] )) \
+    || die "$lane shard has $((lane_replica_count[$lane] + 1)) members, its placement rules give ${lane_policy_member_count[$lane]}"
+  (( lane_write_set_count[$lane] == lane_policy_member_count[$lane] )) \
+    || die "$lane shard has ${lane_write_set_count[$lane]} write-set members, its placement rules give ${lane_policy_member_count[$lane]}"
   lane_primary_service[$lane]="$primary_service"
   primary_services[$primary_service]="$lane"
 done
@@ -806,7 +815,7 @@ validate_primary_shard() {
   jq -e \
     --arg shard "${lane_shard[$lane]}" \
     --arg primary "${lane_primary_id[$lane]}" \
-    --argjson replicas "$EXPECTED_REPLICA_COUNT" '
+    --argjson replicas "${lane_replica_count[$lane]}" '
       .pending_write_count == 0
       and .open_conflict_count == 0
       and .pending_repair_count == 0

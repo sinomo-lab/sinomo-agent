@@ -3429,9 +3429,12 @@ fn daemon_dfs_metadata_authority_host(
     let data_root = cluster_paths.root.parent()?;
     let data_dir = SinomoDataDir::new(data_root);
     let host = dfs_runtime_host(&data_dir).ok()?;
-    let local_node_id = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
-        .ok()
-        .map(|state| state.local_node_id);
+    // Every message attaches this host, so read the identity through the
+    // shared resident snapshot instead of decoding the state file each time.
+    let local_node_id =
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)
+            .ok()
+            .map(|state| state.local_node_id.clone());
     Some(Arc::new(DaemonDfsMetadataAuthorityHost {
         data_dir,
         local_node_id,

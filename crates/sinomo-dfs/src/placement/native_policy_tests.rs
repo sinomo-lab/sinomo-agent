@@ -131,6 +131,7 @@ fn native_no_override_reconciliation_preserves_current_w2_n3() {
         native_current_policy_fixture("native-no-override-current-w2-n3");
     let planned = service.reconciliation_placement_for_object_with_pins(
         &job.accepted_config,
+        &runtime.metadata_shards().unwrap(),
         &job,
         &object,
         &[],
@@ -167,6 +168,7 @@ fn native_adaptive_candidate_shortage_cannot_lower_current_w2_n3() {
         .unwrap();
     let planned = service.reconciliation_placement_for_object_with_pins(
         &job.accepted_config,
+        &runtime.metadata_shards().unwrap(),
         &job,
         &object,
         &[],
@@ -215,6 +217,7 @@ fn native_explicit_policy_still_overrides_current_durability() {
     .unwrap();
     let planned = service.reconciliation_placement_for_object_with_pins(
         &adaptive.accepted_config,
+        &runtime.metadata_shards().unwrap(),
         &adaptive,
         &object,
         &[],
@@ -275,8 +278,10 @@ fn native_manual_clear_keeps_its_reviewed_default_plan() {
         None,
     )
     .unwrap();
+    let metadata_shards = runtime.metadata_shards().unwrap();
     let preview = preview_placement_with_snapshot_and_unavailable_nodes(
         &cleared,
+        &metadata_shards,
         &object.path,
         object.object_id.clone(),
         object.version.clone(),
@@ -311,6 +316,7 @@ fn native_manual_clear_keeps_its_reviewed_default_plan() {
     }));
     let planned = service.reconciliation_placement_for_object_with_pins(
         &manual.accepted_config,
+        &metadata_shards,
         &manual,
         &object,
         &[],
@@ -804,7 +810,13 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         DfsPlacementScope::Subtree,
     );
     let (_, policy, placement) = service
-        .reconciliation_placement_for_object_with_pins(&job.accepted_config, &job, &current, &[])
+        .reconciliation_placement_for_object_with_pins(
+            &job.accepted_config,
+            &runtime.metadata_shards().unwrap(),
+            &job,
+            &current,
+            &[],
+        )
         .unwrap();
     assert_eq!(
         (policy.min_commit_replicas, policy.desired_replicas),
@@ -913,6 +925,7 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
                 &cut.object,
                 &job,
                 &wrong_config,
+                &runtime.metadata_shards().unwrap(),
             )
             .unwrap(),
         "an uninstalled conflicting config cannot validate this job payload"
@@ -1472,6 +1485,483 @@ fn native_same_service_local_receipt_control(check_negatives: bool) {
     assert!(
         filtered.current_locations.contains(&primary),
         "fresh admitted local verification/publication must supersede the same reader's negative"
+    );
+    runtime.close().unwrap();
+}
+
+/// A native cluster whose services shard is led by another node than the
+/// filesystem owner. The root primary, which coordinates placement jobs, is
+/// one of the shard's members: it reads a written version's W/N from its own
+/// copy. Returns the filesystem configuration, the job coordinator, the
+/// services assignment and the complete content roster.
+fn native_services_shard_led_by_another_node_than_the_owner(
+    label: &str,
+    node_count: usize,
+) -> (
+    crate::test_support::DfsTestRuntime,
+    DfsFileSystemConfig,
+    NodeId,
+    crate::DfsMetadataShardConfig,
+    Vec<DfsNodeAdvertisement>,
+) {
+    let (runtime, mut initial, assigned) =
+        crate::test_support::current_native_metadata_service(label, node_count, "/services")
+            .unwrap();
+    let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(label, node_count);
+    let config = initial.current_placement_file_system_config().unwrap();
+    drop(initial);
+    let coordinator = runtime.root_shard().unwrap().primary_node_id;
+    let members = std::iter::once(assigned.primary_node_id.clone())
+        .chain(assigned.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let primary = if assigned.primary_node_id != config.owner_node_id {
+        assigned.primary_node_id.clone()
+    } else {
+        members
+            .iter()
+            .chain(&nodes)
+            .find(|node| **node != config.owner_node_id)
+            .unwrap()
+            .clone()
+    };
+    let services = runtime
+        .reassign_metadata_shard(
+            &assigned.file_system_id,
+            &assigned.shard_id,
+            primary.clone(),
+            members
+                .into_iter()
+                .chain([coordinator.clone()])
+                .filter(|node| *node != primary)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(services.primary_node_id, primary);
+    assert_ne!(
+        primary, config.owner_node_id,
+        "the shard is led by another node than the filesystem owner"
+    );
+    let mut observer = runtime.client(&primary).unwrap();
+    let expected_nodes = nodes.into_iter().collect::<BTreeSet<_>>();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let candidates = loop {
+        let candidates = observer.placement_content_candidates().unwrap();
+        if candidates
+            .iter()
+            .map(|candidate| candidate.node_id.clone())
+            .collect::<BTreeSet<_>>()
+            == expected_nodes
+        {
+            break candidates;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual native content roster incomplete"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(observer);
+    (runtime, config, coordinator, services, candidates)
+}
+
+/// A file's writes are planned at the primary of its metadata shard. On a
+/// shard led by another node than the filesystem owner, a reconciliation job
+/// must plan from that same primary: it then keeps freshly written files
+/// where their writes placed them, and its coordinator computes the plan the
+/// receiving primary validates.
+#[test]
+fn native_reconciliation_plans_freshly_written_files_from_their_shard_primary() {
+    const NODES: usize = 4;
+    let label = "native-placement-shard-primary-coordinator";
+    let directory = "/services/native-shard-primary-coordinator";
+    let (runtime, config, coordinator, services, candidates) =
+        native_services_shard_led_by_another_node_than_the_owner(label, NODES);
+    let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(label, NODES);
+    let owner = config.owner_node_id.clone();
+    let primary = services.primary_node_id.clone();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+
+    let mut writer = runtime.client(&primary).unwrap();
+    writer.posix_mkdir_all(directory).unwrap();
+    // One copy can only be placed at the node that plans it; three of four
+    // leave the planner a choice among the others.
+    let written = [("one-copy.bin", 1, 1), ("a.bin", 2, 3), ("b.bin", 2, 3)]
+        .into_iter()
+        .map(|(name, minimum, desired)| {
+            writer
+                .posix_write_file(
+                    &format!("{directory}/{name}"),
+                    format!("freshly written {name} stays where its write placed it").as_bytes(),
+                    crate::DfsWriteOptions {
+                        policy: DfsReplicationPolicy::new(minimum, desired).unwrap(),
+                        replica_candidates: nodes.clone(),
+                        wait_for_commit: true,
+                        foreground_replica_repair: true,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    drop(writer);
+    // Each write's own plan, once every planned copy is a current location.
+    let placed = |object: &DfsObjectMetadata| {
+        runtime
+            .node_metadata(&primary)
+            .unwrap()
+            .get_version(&object.object_id, &object.version)
+            .unwrap()
+            .unwrap()
+            .content_durability
+            .unwrap()
+            .desired_replica_node_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    };
+    let current = |stat: &DfsStat| {
+        runtime
+            .node_metadata(&primary)
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap()
+    };
+    let objects = loop {
+        let objects = written.iter().map(&current).collect::<Vec<_>>();
+        if objects.iter().all(|object| {
+            object
+                .current_locations
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == placed(object)
+        }) {
+            break objects;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "written copies did not settle");
+        let tick = runtime.maintenance_tick(&primary, remaining).unwrap();
+        assert!(tick.outcome.is_ok(), "write settle: {:?}", tick.outcome);
+    };
+    for (object, stat) in objects.iter().zip(&written) {
+        assert_eq!(object.version, stat.version);
+        assert!(
+            placed(object).contains(&primary),
+            "a write is planned from its shard's primary"
+        );
+    }
+    assert_eq!(placed(&objects[0]), BTreeSet::from([primary.clone()]));
+
+    let observer = runtime.client(&coordinator).unwrap();
+    let snapshot = loop {
+        if let Some(snapshot) = observer.placement_snapshot_cache.snapshot()
+            && snapshot.primary_node_id == coordinator
+            && !snapshot.nodes.is_empty()
+            && time::OffsetDateTime::now_utc() <= snapshot.expires_at
+        {
+            break (*snapshot).clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual native root placement observation was unavailable"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(observer);
+    let job = crate::control_plane::build_adaptive_placement_reconciliation_job(
+        sinomo_core::Id::generate().to_string(),
+        &config,
+        directory.to_string(),
+        DfsPlacementScope::Subtree,
+        BTreeSet::new(),
+        candidates,
+        snapshot,
+        crate::DfsAdaptivePlacementBudget::default(),
+        0,
+        dfs_now_unix_nanos(),
+    )
+    .unwrap();
+
+    // The job coordinator plans each object from its page's proven shards.
+    let planned = runtime
+        .with_main_maintenance_service(&coordinator, |service| {
+            let page = service
+                .prepare_placement_page_authority(&config)
+                .unwrap()
+                .unwrap();
+            objects
+                .iter()
+                .map(|object| {
+                    let (_, replication, placement) = service
+                        .reconciliation_placement_for_object_with_pins(
+                            &job.accepted_config,
+                            &page.shards,
+                            &job,
+                            object,
+                            &[],
+                        )
+                        .unwrap();
+                    (replication, placement.plan.desired_replica_nodes)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    let receiver = runtime.metadata_primary_service(directory).unwrap();
+    assert_eq!(receiver.node_id(), &primary);
+    for (object, (replication, desired)) in objects.iter().zip(&planned) {
+        assert_eq!(
+            desired.iter().cloned().collect::<BTreeSet<_>>(),
+            placed(object),
+            "reconciliation must not relocate {}",
+            object.path
+        );
+        // The receiving primary validates a payload against its own plan,
+        // ranked from the shard it was admitted on.
+        let (_, validated, validation) = receiver
+            .reconciliation_placement_for_object_with_pins(
+                &job.accepted_config,
+                std::slice::from_ref(&services),
+                &job,
+                object,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            (&validated, &validation.plan.desired_replica_nodes),
+            (replication, desired),
+            "the job coordinator and the receiving primary plan {} alike",
+            object.path
+        );
+    }
+    // Ranked from the filesystem owner instead, the one-copy file would move.
+    let (_, _, from_owner) = receiver
+        .reconciliation_placement_for_object_with_pins(
+            &job.accepted_config,
+            &[],
+            &job,
+            &objects[0],
+            &[],
+        )
+        .unwrap();
+    drop(receiver);
+    assert_eq!(from_owner.plan.desired_replica_nodes, vec![owner.clone()]);
+    assert_eq!(planned[0].1, vec![primary.clone()]);
+
+    // The served job reaches the same result: nothing to update or repair.
+    let control = runtime.shared_control_plane().unwrap();
+    assert!(control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .compare_and_put_placement_update(&config, &config, &job)
+            .unwrap()
+            .is_some()
+    }));
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let completed = loop {
+        let current = control.with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .placement_reconciliation(&config.file_system_id, &job.job_id)
+                .unwrap()
+                .unwrap()
+        });
+        if current.state == DfsPlacementReconciliationState::Completed {
+            break current;
+        }
+        assert_ne!(
+            current.state,
+            DfsPlacementReconciliationState::Failed,
+            "{current:?}"
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "job missed its budget: {current:?}");
+        let tick = runtime.maintenance_tick(&coordinator, remaining).unwrap();
+        assert!(tick.outcome.is_ok(), "job page: {:?}", tick.outcome);
+    };
+    assert!(completed.last_error.is_none(), "{completed:?}");
+    assert_eq!(
+        completed.matched_object_count,
+        objects.len() + 1,
+        "the directory and its files: {completed:?}"
+    );
+    assert_eq!(
+        (
+            completed.updated_object_count,
+            completed.scheduled_repair_count
+        ),
+        (0, 0),
+        "reconciliation relocated freshly written files: {completed:?}"
+    );
+    assert_eq!(written.iter().map(&current).collect::<Vec<_>>(), objects);
+
+    // The receiving primary accepts the coordinator's payload and rejects
+    // one ranked from the filesystem owner.
+    let mut caller = runtime.client(&coordinator).unwrap();
+    caller.refresh_control_plane_latest().unwrap();
+    let mut reconcile = |desired: &[NodeId]| {
+        caller.route_namespace_operation(
+            primary.clone(),
+            DfsNamespaceOperation::ReconcilePlacement {
+                job_id: job.job_id.clone(),
+                path: objects[0].path.clone(),
+                object_id: objects[0].object_id.clone(),
+                expected_version: objects[0].version.clone(),
+                object_policy: objects[0].policy.clone(),
+                replication_policy: planned[0].0.clone(),
+                desired_replica_node_ids: desired.to_vec(),
+            },
+        )
+    };
+    reconcile(&planned[0].1).unwrap();
+    let rejected = reconcile(&from_owner.plan.desired_replica_nodes).unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("no longer matches authoritative job"),
+        "{rejected}"
+    );
+    drop(caller);
+    drop(control);
+    assert_eq!(written.iter().map(&current).collect::<Vec<_>>(), objects);
+    runtime.close().unwrap();
+}
+
+/// A placement a job committed keeps the coordinator recorded with it, the
+/// primary that committed it. After the shard's primary changes, the new
+/// primary replays the plan that primary ranked, not one ranked from itself.
+#[test]
+fn native_placement_replay_after_handoff_plans_from_the_committing_primary() {
+    const NODES: usize = 4;
+    let label = "native-placement-replay-coordinator";
+    let path = "/services/native-replay-coordinator.bin";
+    let (runtime, _, coordinator, services, _) =
+        native_services_shard_led_by_another_node_than_the_owner(label, NODES);
+    let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids(label, NODES);
+    let primary = services.primary_node_id.clone();
+    let mut writer = runtime.client(&primary).unwrap();
+    let stat = writer
+        .posix_write_file(
+            path,
+            b"one copy at the primary that planned it",
+            crate::DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+                replica_candidates: nodes,
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .unwrap();
+    drop(writer);
+    // A second copy leaves the planner a choice its coordinator decides.
+    let job = runtime
+        .apply_placement_policy(
+            &primary,
+            path,
+            DfsPlacementScope::SelfOnly,
+            DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap(),
+        )
+        .unwrap();
+    let intent_id = format!(
+        "placement:{}:{}:{}",
+        job.job_id, stat.object_id, stat.version
+    );
+    let committer = runtime.metadata_primary_service(path).unwrap();
+    assert_eq!(committer.node_id(), &primary);
+    let object = committer
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    assert_eq!(object.version, stat.version);
+    let (resolved, replication, placement) = committer
+        .reconciliation_placement_for_object_with_pins(
+            &job.accepted_config,
+            std::slice::from_ref(&services),
+            &job,
+            &object,
+            &[],
+        )
+        .unwrap();
+    drop(committer);
+    let desired = placement.plan.desired_replica_nodes;
+    assert_eq!(desired.len(), 2);
+    assert_eq!(desired[0], primary, "the committing primary ranks first");
+    let operation = DfsNamespaceOperation::ReconcilePlacement {
+        job_id: job.job_id.clone(),
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        expected_version: object.version.clone(),
+        object_policy: resolved.policy.consistency,
+        replication_policy: replication,
+        desired_replica_node_ids: desired.clone(),
+    };
+    let mut caller = runtime.client(&coordinator).unwrap();
+    caller.refresh_control_plane_latest().unwrap();
+    caller
+        .route_namespace_operation(primary.clone(), operation.clone())
+        .unwrap();
+    let recorded = runtime
+        .node_metadata(&primary)
+        .unwrap()
+        .get_intent(&object.object_id, &intent_id)
+        .unwrap()
+        .expect("the primary committed this job's placement");
+    assert_eq!(recorded.status, crate::DfsWriteIntentStatus::Committed);
+    assert_eq!(recorded.coordinator_node_id, primary);
+    assert_eq!(recorded.desired_replica_node_ids, desired);
+
+    let members = std::iter::once(&services.primary_node_id)
+        .chain(&services.replica_node_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let successor = members
+        .iter()
+        .find(|node| **node != primary && **node != coordinator)
+        .or_else(|| members.iter().find(|node| **node != primary))
+        .unwrap()
+        .clone();
+    let moved = runtime
+        .reassign_metadata_shard(
+            &services.file_system_id,
+            &services.shard_id,
+            successor.clone(),
+            members
+                .into_iter()
+                .filter(|node| *node != successor)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(moved.primary_node_id, successor);
+    assert_ne!(successor, primary);
+
+    // The ordinary route lets the serving new primary own admission.
+    caller.refresh_control_plane_latest().unwrap();
+    caller
+        .route_namespace_operation(successor.clone(), operation)
+        .expect("the new primary replays the placement its predecessor committed");
+    drop(caller);
+    let replayer = runtime.metadata_primary_service(path).unwrap();
+    assert_eq!(replayer.node_id(), &successor);
+    assert_eq!(
+        replayer
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap(),
+        Some(recorded)
+    );
+    let current = replayer
+        .current_read_object_metadata(&object.object_id)
+        .unwrap();
+    assert_eq!(current.version, object.version);
+    let (_, _, replayed) = replayer
+        .reconciliation_placement_for_object_with_pins(
+            &job.accepted_config,
+            std::slice::from_ref(&moved),
+            &job,
+            &current,
+            &[],
+        )
+        .unwrap();
+    drop(replayer);
+    assert_eq!(
+        replayed.plan.desired_replica_nodes, desired,
+        "the new primary recomputes the committed obligation"
     );
     runtime.close().unwrap();
 }

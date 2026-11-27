@@ -130,17 +130,37 @@ class HarnessTests(unittest.TestCase):
         function = "dfs_converged_epoch_signature() {" + function + "\n}\n"
         probe = {"status": "passed", "diagnostics": {"shards": [
             {"lane": lane, "shard_id": lane, "file_system_id": "fs", "epoch": 3,
-             "primary_node_id": lane, "replica_node_ids": list("abcde")}
+             "primary_node_id": lane, "replica_node_ids": ["b"],
+             "write_set": ["b", lane], "w_floor": 1, "policy_member_count": 2}
             for lane in ["root", "services", "users"]]}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "probe.json"
+            def signature(document):
+                path.write_text(json.dumps(document))
+                return subprocess.run(["bash", "-c", function +
+                    'dfs_converged_epoch_signature "$1"', "test", str(path)], capture_output=True, text=True)
             for pending, expected in [(None, False), (["pending"], False), ([], True)]:
                 if pending is not None:
                     probe["diagnostics"]["pending_handoff_keys"] = pending
-                path.write_text(json.dumps(probe))
-                result = subprocess.run(["bash", "-c", function +
-                    'dfs_converged_epoch_signature "$1"', "test", str(path)], capture_output=True)
-                self.assertEqual(result.returncode == 0, expected, result.stderr.decode())
+                result = signature(probe)
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+            # The signature names each shard's epoch and members, so a member
+            # change between two observations is a different signature.
+            self.assertEqual(result.stdout.strip(),
+                             "fs/root=3:b+root,fs/services=3:b+services,fs/users=3:b+users")
+            # A shard's members are what its placement rules give it, all of
+            # them in its write set; no fixed count is accepted in their place.
+            for change, reason in [
+                    ({"write_set": None}, "not yet on the write-set protocol: services"),
+                    ({"write_set": ["services"]}, "configured member outside the write set: services"),
+                    ({"policy_member_count": 3}, "members differ from what the placement rules give: services=2/3"),
+                    ({"replica_node_ids": ["b", "c"], "write_set": ["b", "c", "services"]},
+                     "members differ from what the placement rules give: services=3/2")]:
+                changed = json.loads(json.dumps(probe))
+                changed["diagnostics"]["shards"][1].update(change)
+                result = signature(changed)
+                self.assertNotEqual(result.returncode, 0, change)
+                self.assertIn(reason, result.stderr)
 
     def test_bulk_requester_rejects_a_promoted_primary(self):
         script = Path(__file__).with_name("test-cluster.sh").read_text()
@@ -414,6 +434,13 @@ NODES=node1
                     for sample in samples:
                         sample["placement_source_path"] = base
                 return subprocess.CompletedProcess(args, 0, json.dumps(report).encode(), b"")
+            # Each shard ends with the three members its W=2/N=3 fixture rule gives it.
+            layout = {"status": "passed", "diagnostics": {"shards": [
+                {"lane": lane, "shard_id": lane, "epoch": 2, "primary_node_id": "a",
+                 "replica_node_ids": ["b", "c"], "write_set": ["a", "b", "c"],
+                 "w_floor": 2, "policy_member_count": 3} for lane in latency_driver.BASES]}}
+            def probe(node, case, **params):
+                return json.dumps(layout) if case == "shard-layout" else b""
             with patch("sys.argv", argv), \
                  patch.object(latency_driver.subprocess, "check_output",
                               side_effect=lambda args, **kwargs: "source\n" if kwargs.get("text") else b""), \
@@ -421,10 +448,21 @@ NODES=node1
                  patch.object(latency_driver.acceptance.Acceptance, "verify_processes"), \
                  patch.object(latency_driver.acceptance.Acceptance, "verify_observe"), \
                  patch.object(latency_driver.acceptance.Acceptance, "wait_ready"), \
-                 patch.object(latency_driver.acceptance.Acceptance, "probe"):
+                 patch.object(latency_driver.acceptance.Acceptance, "probe", side_effect=probe):
                 latency_driver.main()
             result = json.loads((artifacts / "write-latency.json").read_text())
             self.assertTrue(result["passed"])
+            self.assertEqual([row["write_set"] for row in result["final_metadata_membership"]],
+                             [["a", "b", "c"]] * 3)
+            # A shard that never reached its policy's members fails the run.
+            short = json.loads(json.dumps(layout))
+            short["diagnostics"]["shards"][2].update(replica_node_ids=["b"], write_set=["a", "b"])
+            self.assertEqual(latency_driver.metadata_membership(short)[1],
+                             ["users shard has 2 write-set members of 2 configured; its placement rules give 3"])
+            outside = json.loads(json.dumps(layout))
+            outside["diagnostics"]["shards"][0]["write_set"] = ["a", "b"]
+            self.assertEqual(latency_driver.metadata_membership(outside)[1],
+                             ["root shard has 2 write-set members of 3 configured; its placement rules give 3"])
             self.assertTrue(result["acceptance_scope"])
             self.assertTrue(result["stage_profile_passed"])
             if reuse:
@@ -1110,16 +1148,23 @@ scenario() {
 class AssignedParticipantInterruptionTests(unittest.TestCase):
     @staticmethod
     def partition_layout(primary="native-node4"):
+        # The Services write set is every node, exactly at its W floor; the
+        # other shards keep the two members their default rules give them.
         nodes = [f"native-node{i}" for i in range(1, 7)]
+        def shard(lane, owner, members, w_floor):
+            return {"lane": lane, "file_system_id": "native-fs", "shard_id": lane, "epoch": 7,
+                    "primary_node_id": owner, "replica_node_ids": [node for node in members if node != owner],
+                    "write_set": sorted(members), "w_floor": w_floor, "policy_member_count": len(members)}
         return {"status": "passed", "diagnostics": {"pending_handoff_keys": [], "shards": [
-            {"lane": lane, "file_system_id": "native-fs", "shard_id": lane, "epoch": 7,
-             "primary_node_id": owner, "replica_node_ids": [node for node in nodes if node != owner]}
-            for lane, owner in [("root", "native-node1"), ("services", primary), ("users", "native-node3")]]}}
+            shard("root", "native-node1", ["native-node1", "native-node2"], 1),
+            shard("services", primary, nodes, len(nodes)),
+            shard("users", "native-node3", ["native-node3", "native-node1"], 1)]}}
 
     def test_partition_roles_follow_actual_primary_and_prefer_nonprimary_leaf6_else_leaf5(self):
         # Pure harness DATA control; no supplied observation grants authority.
-        functions = (DfsBaselineLaneTests.shell_function('dfs_converged_epoch_signature') +
-                     DfsBaselineLaneTests.shell_function('dfs_partition_participants_from_layout'))
+        functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
+                            ['dfs_converged_epoch_signature', 'dfs_partition_roles_from_layout',
+                             'dfs_partition_participants_from_layout'])
         roster = [{"container": f"node{i}", "node_id": f"native-node{i}"} for i in range(1, 7)]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1148,6 +1193,19 @@ class AssignedParticipantInterruptionTests(unittest.TestCase):
             wrong = self.partition_layout()
             wrong['diagnostics']['shards'][1]['replica_node_ids'][-1] = 'foreign-node'
             negatives.append((wrong, roster))
+            # The cut must hit a write set that can neither shrink nor be
+            # replaced: every node, exactly at the shard's W floor.
+            above_floor = self.partition_layout()
+            above_floor['diagnostics']['shards'][1]['w_floor'] = 2
+            negatives.append((above_floor, roster))
+            policy_sized = self.partition_layout()
+            policy_sized['diagnostics']['shards'][1].update(
+                replica_node_ids=['native-node1'], write_set=['native-node1', 'native-node4'],
+                w_floor=2, policy_member_count=2)
+            negatives.append((policy_sized, roster))
+            shrunk = self.partition_layout()
+            shrunk['diagnostics']['shards'][1]['write_set'].remove('native-node6')
+            negatives.append((shrunk, roster))
             pending = self.partition_layout()
             pending['diagnostics']['pending_handoff_keys'] = ['actual-pending-transition']
             negatives.append((pending, roster))
@@ -1165,9 +1223,11 @@ class AssignedParticipantInterruptionTests(unittest.TestCase):
         # Side-effect-free transport stubs cover harness custody and sequencing;
         # these are explicitly not native partition or availability proofs.
         functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
-                            ['dfs_converged_epoch_signature', 'dfs_partition_participants_from_layout',
+                            ['dfs_converged_epoch_signature', 'dfs_partition_roles_from_layout',
+                             'dfs_partition_participants_from_layout',
                              'dfs_network_endpoint_restore_arguments',
                              'dfs_network_endpoint_matches_snapshot',
+                             'temporary_network_recovery_at_write_set_floor',
                              'temporary_network_recovery'])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1217,7 +1277,7 @@ docker() {
 sleep() { :; }
 wait_for_cluster_ready() { printf 'ready\t%s\n' "$*" >>"$ARTIFACTS/calls.tsv"; }
 wait_for_dfs_ready() { :; }
-wait_for_dfs_converged() { :; }
+wait_for_dfs_converged() { printf 'converged\n' >>"$ARTIFACTS/calls.tsv"; }
 NODES='node1 node2 node3 node4 node5 node6'
 PROJECT=owned-retained
 EXPECT_TIMEOUT=60
@@ -1230,11 +1290,32 @@ DOCKER_INSPECT_COUNT=0
                                      writer, 'yes' if extra_network else 'no', endpoint_drift],
                                     capture_output=True, text=True, timeout=5)
             calls = [line.split('\t') for line in (root/'calls.tsv').read_text().splitlines()]
+            floor_rule = f'path=/services/cluster-tests/runs/retained-current-{writer}/network-heal/write-set-floor'
+            rules = [(index, row) for index, row in enumerate(calls)
+                     if len(row) > 1 and row[1] == 'cluster.dfs.placement-rule']
             if extra_network or invalid_endpoint:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(any(len(row) > 1 and row[1] == 'cluster.dfs.write' for row in calls))
                 self.assertFalse(any(row[0] == 'docker' and row[1].startswith('network disconnect') for row in calls))
+                # Refused before any effect: the scenario's rule was never requested.
+                self.assertEqual(rules, [])
                 return
+            # The scenario owns one run-scoped rule whose W and N are every
+            # node. It is installed before the seed and cleared afterwards,
+            # also when the interruption itself fails.
+            self.assertEqual([next(arg for arg in row if arg.startswith('action=')) for _, row in rules],
+                             ['action=install', 'action=clear'])
+            for _, row in rules:
+                self.assertEqual(row[0], 'node1')
+                self.assertIn(floor_rule, row)
+            self.assertIn('min-commit-replicas=6', rules[0][1])
+            self.assertIn('desired-replicas=6', rules[0][1])
+            first_write = next(index for index, row in enumerate(calls)
+                               if len(row) > 1 and row[1] == 'cluster.dfs.write')
+            self.assertLess(rules[0][0], calls.index(['converged']))
+            self.assertLess(calls.index(['converged']), first_write)
+            self.assertEqual(calls[-1], ['converged'])
+            self.assertEqual(calls[-2], rules[1][1])
             if endpoint_drift:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertTrue(any(row[0] == 'docker' and row[1].startswith('network connect') for row in calls))
@@ -1251,7 +1332,8 @@ DOCKER_INSPECT_COUNT=0
             self.assertEqual([next(arg for arg in row if arg.startswith('phase=')) for row in partition],
                              ['phase=baseline', 'phase=blocked', 'phase=recover'])
             for row in partition:
-                self.assertIn('required-participants=6', row)
+                # The probe reads the real write set; no member count is passed.
+                self.assertFalse(any(arg.startswith('required-participants') for arg in row))
                 self.assertIn(f'operation-id=network-heal-retained-current-{writer}', row)
                 self.assertIn('unavailable-node-id=native-' + leaf, row)
             for row in partition[1:]:
@@ -1286,6 +1368,9 @@ DOCKER_INSPECT_COUNT=0
             self.assertEqual(receipt['unavailable_node_id'], 'native-' + leaf)
             self.assertEqual(receipt['unavailable_container_id'], 'actual-container-' + leaf)
             self.assertEqual(receipt['interrupted_network'], 'owned-retained_seg_b')
+            self.assertEqual('path=' + receipt['write_set_floor_rule'], floor_rule)
+            self.assertEqual(sorted(receipt['native_layout']['diagnostics']['shards'][1]['write_set']),
+                             sorted(row['node_id'] for row in receipt['native_roster']))
 
     def test_interruption_primary4_keeps_leaf6_and_original_through_heal_and_reopen(self):
         self.exercise_selected_interruption('node4', 'node6')
@@ -1309,20 +1394,33 @@ DOCKER_INSPECT_COUNT=0
         self.exercise_selected_interruption('node4', 'node6', endpoint_drift='after-reopen')
 
     def test_cut_requires_exact_durable_witness_and_heal_reuses_original_inputs(self):
-        body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')
+        body = DfsBaselineLaneTests.shell_function('temporary_network_recovery_at_write_set_floor')
         self.assertLess(body.index('--param phase=baseline'), body.index('docker network disconnect'))
         self.assertLess(body.index('--param phase=blocked'), body.index('docker network connect'))
         self.assertLess(body.index('docker network connect'), body.index('--param phase=recover'))
         self.assertEqual(body.count('--param "operation-id=$operation_id"'), 3)
-        self.assertEqual(body.count('--param required-participants=6'), 3)
+        self.assertNotIn('required-participants', body)
         self.assertEqual(body.count('--param "original-options-json=$options_json"'), 2)
         self.assertIn('compose restart "$unavailable"', body)
-        self.assertIn('new write after network heal', body)
+        self.assertIn('--param "path=$new_path" --param "payload=$new_payload"', body)
+        self.assertIn('new write after network heal',
+                      DfsBaselineLaneTests.shell_function('temporary_network_recovery'))
         self.assertNotIn('expect-error', body)
         self.assertNotIn('grep', body)
 
-    def test_failed_cut_is_retained_while_actual_heal_and_original_recovery_are_attempted(self):
+    def test_scenario_rule_is_cleared_and_membership_restored_after_any_outcome(self):
         body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')
+        install, interruption, clear = (body.index('--param action=install'),
+            body.index('temporary_network_recovery_at_write_set_floor || rc=1'), body.index('--param action=clear'))
+        self.assertLess(install, interruption)
+        self.assertLess(interruption, clear)
+        # Nothing between the install and the clear can leave the function.
+        self.assertNotIn('return', body[install:clear])
+        self.assertLess(clear, body.rindex('wait_for_dfs_converged || rc=1'))
+        self.assertIn('"min-commit-replicas=$member_count" --param "desired-replicas=$member_count"', body)
+
+    def test_failed_cut_is_retained_while_actual_heal_and_original_recovery_are_attempted(self):
+        body = DfsBaselineLaneTests.shell_function('temporary_network_recovery_at_write_set_floor')
         # The blocked probe must not return before the real link is healed.
         blocked = body.split('--param phase=blocked', 1)[1].split('--param phase=recover', 1)[0]
         self.assertIn('|| rc=1', blocked)

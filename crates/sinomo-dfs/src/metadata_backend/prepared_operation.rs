@@ -1464,6 +1464,60 @@ pub(crate) fn apply_metadata_effect_with_rollback(
     }
     Ok(())
 }
+/// Nodes whose receipts are this data generation's durable copies: its
+/// recorded write plan and the plan of each current managed placement owner of
+/// the same content. Managed placement moves the copies to its own replica
+/// plan and withdraws the ones it replaces, while the generation's recorded
+/// plan stays as written.
+fn recorded_content_holder_nodes<'a>(
+    tables: &'a DfsMetadataTables,
+    version: &'a DfsObjectVersionRecord,
+    plan: &'a crate::DfsContentDurability,
+    source: Option<&'a crate::DfsCrossShardSourceFamily>,
+) -> BTreeSet<&'a NodeId> {
+    let owns_content = |owner: &DfsWriteIntentRecord| {
+        owner.file_system_id == version.file_system_id
+            && owner.object_id == version.object_id
+            && owner.content_hash == version.content_hash
+            && crate::placement::current_placement_repair_owner_matches_identity(owner)
+            && crate::validate_replication_plan(&owner.desired_replica_node_ids, &owner.policy)
+                .is_ok()
+            && (owner.target_version == version.version
+                || owner.target_version == plan.source_version
+                || owner.object_metadata.as_ref().is_some_and(|captured| {
+                    crate::content_durability::same_content_lineage(
+                        version,
+                        &crate::metadata_records::object_version_record(
+                            captured,
+                            captured.content_size_bytes,
+                        ),
+                    )
+                }))
+    };
+    let mut holders = plan.desired_replica_node_ids.iter().collect::<BTreeSet<_>>();
+    if let Some(source) = source {
+        for owner in &source.intents {
+            if owns_content(owner)
+                && !source.intent_receipts.iter().any(|finished| {
+                    finished.object_id == owner.object_id && finished.intent_id == owner.intent_id
+                })
+            {
+                holders.extend(&owner.desired_replica_node_ids);
+            }
+        }
+    } else {
+        for (key, owner) in tables
+            .intents
+            .range((version.object_id.clone(), String::new())..)
+            .take_while(|((object_id, _), _)| *object_id == version.object_id)
+        {
+            if owns_content(owner) && !tables.intent_receipts.contains_key(key) {
+                holders.extend(&owner.desired_replica_node_ids);
+            }
+        }
+    }
+    holders
+}
 fn require_recorded_content_w(
     tables: &DfsMetadataTables,
     version: &DfsObjectVersionRecord,
@@ -1481,9 +1535,9 @@ fn require_recorded_content_w(
             "carried content has no complete byte identity".into(),
         ));
     }
-    let acknowledged = plan
-        .desired_replica_node_ids
-        .iter()
+    let holders = recorded_content_holder_nodes(tables, version, plan, source);
+    let acknowledged = holders
+        .into_iter()
         .filter(|node| {
             let receipt = if let Some(source) = source {
                 source.receipts.iter().find(|receipt| {
@@ -2825,5 +2879,131 @@ mod committed_capture_race_tests {
         missing.committed_entry = None;
         assert!(!committed_capture_request_race_matches(&missing, &incoming));
         assert_ne!(incoming, *actual.payload);
+    }
+}
+
+#[cfg(test)]
+mod relocated_content_tests {
+    use super::*;
+
+    fn node(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).unwrap()
+    }
+
+    fn receipt(version: &DfsObjectVersionRecord, replica: &NodeId) -> DfsReplicaReceiptRecord {
+        DfsReplicaReceiptRecord {
+            receipt: sinomo_core::DfsWriteReceipt {
+                file_system_id: version.file_system_id.clone(),
+                object_id: version.object_id.clone(),
+                committed_version: version.version.clone(),
+                owner_node_id: node("relocated-primary"),
+                event_id: sinomo_core::events::EventId::generate(),
+            },
+            replica_node_id: replica.clone(),
+            content_hash: version.content_hash.clone(),
+            received_at: time::OffsetDateTime::now_utc(),
+            generation: 0,
+        }
+    }
+
+    /// A W=2/N=3 write planned on `written`, whose copies managed placement
+    /// then moved to `relocated`: only the node both plans share kept its
+    /// original receipt.
+    fn relocated() -> (DfsMetadataTables, DfsObjectVersionRecord, DfsWriteIntentRecord) {
+        let written = [node("written-a"), node("written-b"), node("shared")];
+        let relocated = [node("shared"), node("moved-a"), node("moved-b")];
+        let mut object = crate::posix_object::new_posix_metadata_object(
+            &written[0],
+            "/services/relocated",
+            crate::DfsObjectKind::File,
+        );
+        object.policy = sinomo_core::DfsObjectPolicy::ReplicatedEventual;
+        object.content_hash = Some("blake3:relocated".into());
+        object.content_size_bytes = Some(9);
+        object.last_modified_by_event_id = Some(sinomo_core::events::EventId::generate());
+        let policy = crate::DfsReplicationPolicy::new(2, 3).unwrap();
+        let mut version = crate::metadata_records::object_version_record(&object, Some(9));
+        version.content_durability = Some(Box::new(crate::DfsContentDurability {
+            source_version: object.version.clone(),
+            coordinator_node_id: written[0].clone(),
+            owner_epoch: 3,
+            desired_replica_node_ids: written.to_vec(),
+            policy: policy.clone(),
+        }));
+        let owner = crate::intent::write_intent_record(
+            &crate::DistributedWriteIntent {
+                publication: Default::default(),
+                intent_id: format!("placement:job:{}:{}", object.object_id, object.version),
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                base_version: Some(object.version.clone()),
+                target_version: object.version.clone(),
+                requesting_node_id: written[0].clone(),
+                operation_id: None,
+                operation_order_token: None,
+                owner_epoch: 3,
+                desired_replica_nodes: relocated.to_vec(),
+                policy,
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                state: crate::DfsWriteIntentState::Committed,
+            },
+            object.content_hash.as_deref(),
+            Some(object.clone()),
+        );
+        let mut tables = DfsMetadataTables::default();
+        for replica in &relocated {
+            tables.receipts.insert(
+                (version.object_id.clone(), version.version.clone(), replica.clone()),
+                receipt(&version, replica),
+            );
+        }
+        (tables, version, owner)
+    }
+
+    fn record_owner(tables: &mut DfsMetadataTables, owner: &DfsWriteIntentRecord) {
+        tables.intents.insert(
+            (owner.object_id.clone(), owner.intent_id.clone()),
+            owner.clone(),
+        );
+    }
+
+    #[test]
+    fn relocated_copies_are_the_carried_contents_w_receipts() {
+        let (mut tables, version, owner) = relocated();
+        assert!(
+            require_recorded_content_w(&tables, &version, None).is_err(),
+            "without a placement owner only the written plan's nodes hold the content"
+        );
+        record_owner(&mut tables, &owner);
+        require_recorded_content_w(&tables, &version, None).unwrap();
+    }
+
+    #[test]
+    fn relocated_copies_below_w_do_not_carry_the_content() {
+        let (mut tables, version, owner) = relocated();
+        record_owner(&mut tables, &owner);
+        for moved in ["moved-a", "moved-b"] {
+            tables
+                .receipts
+                .remove(&(version.object_id.clone(), version.version.clone(), node(moved)));
+        }
+        assert!(require_recorded_content_w(&tables, &version, None).is_err());
+    }
+
+    #[test]
+    fn a_placement_owner_of_other_bytes_adds_no_holders() {
+        let (mut tables, version, mut owner) = relocated();
+        owner.content_hash = Some("blake3:other".into());
+        record_owner(&mut tables, &owner);
+        assert!(require_recorded_content_w(&tables, &version, None).is_err());
+
+        let (mut tables, version, mut owner) = relocated();
+        owner.status = crate::DfsWriteIntentStatus::ReceiptsPending;
+        record_owner(&mut tables, &owner);
+        assert!(
+            require_recorded_content_w(&tables, &version, None).is_err(),
+            "an owner that is not committed moved nothing"
+        );
     }
 }

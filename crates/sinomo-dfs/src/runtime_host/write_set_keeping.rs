@@ -111,6 +111,8 @@ enum Completion {
         /// The event cause when the step's own evidence decides it rather
         /// than the planned step: a switch that keeps every member.
         cause: Option<&'static str>,
+        /// The inputs the step was planned from.
+        planned: PlannedAt,
     },
     Probe {
         key: ShardKey,
@@ -143,6 +145,21 @@ struct Attempt {
     view: Option<crate::DfsMetadataMemberAckView>,
 }
 
+/// The inputs one step was planned from. A step is planned from this node's
+/// published configuration, which can trail the record its transaction is
+/// then guarded by, and from this node's network verdicts; a refused step is
+/// planned again once any of these moved, including when it had already
+/// moved by the time the refusal arrived. An unswitched shard holds no
+/// reachability subscription and has no record generation, so the
+/// publication is the only input of its switch that can move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedAt {
+    /// The publication's generation: any configuration or record change.
+    publication_generation: u64,
+    record_generation: u64,
+    verdict_generation: u64,
+}
+
 #[derive(Default)]
 struct ShardKeeping {
     txn_running: bool,
@@ -151,9 +168,12 @@ struct ShardKeeping {
     unknown: Option<(DfsWriteSetKeepingTxn, DfsMetadataWriteSetChangeRequest)>,
     /// The evidence-decided event cause of the unknown change, if any.
     unknown_cause: Option<&'static str>,
-    /// Record, reachability, and the content W the rejected step tried to
-    /// raise. A higher content demand is a new input at an otherwise equal cut.
-    blocked: Option<(u64, u64, usize)>,
+    /// The inputs the rejected step was planned from, and the content W it
+    /// tried to raise. A higher content demand is a new input at otherwise
+    /// equal inputs.
+    blocked: Option<(PlannedAt, usize)>,
+    /// What the keeper last reported it sees and plans for the shard.
+    reported: Option<String>,
     probing: BTreeSet<NodeId>,
     joining: Option<NodeId>,
     failed: BTreeMap<NodeId, Attempt>,
@@ -479,6 +499,11 @@ impl Keeper {
             return;
         };
         let record_generation = state.switched().map_or(0, |write_set| write_set.generation);
+        let planned = PlannedAt {
+            publication_generation: snapshot.generation(),
+            record_generation,
+            verdict_generation: verdicts.generation,
+        };
         let switched = state.switched().cloned();
         let keeping = self.shards.entry(key.clone()).or_default();
         // Settle an unknown change from the record before anything else.
@@ -501,7 +526,7 @@ impl Keeper {
                 keeping.unknown_cause = None;
             } else {
                 keeping.txn_running = true;
-                self.spawn_resubmit(key.clone(), txn, change);
+                self.spawn_resubmit(key.clone(), txn, change, planned);
                 return;
             }
         }
@@ -566,7 +591,6 @@ impl Keeper {
         {
             keeping.demanded_w = 0;
         }
-        let verdict_generation = verdicts.generation;
         // Members being brought back: views wake the keeper for them.
         let wanted = plan
             .catch_ups
@@ -636,23 +660,49 @@ impl Keeper {
             self.spawn_probe(key.clone(), shard.clone(), member, record_generation, prefix);
         }
         let keeping = self.shards.entry(key.clone()).or_default();
+        // One record per change of what the keeper sees and plans while the
+        // shard is not every configured member in a write set of its N.
+        let settled = plan.txn.is_none()
+            && plan.joins.is_empty()
+            && plan.catch_ups.is_empty()
+            && switched.as_ref().is_some_and(|write_set| {
+                write_set.write_set.len() == configured.len()
+                    && configured.len() == crate::metadata_shard_effective_n(&bounds, Some(write_set))
+            });
+        if settled {
+            keeping.reported = None;
+        } else if tracing::enabled!(target: "sinomo.dfs.write_set", tracing::Level::DEBUG) {
+            let reach = configured
+                .iter()
+                .map(|node| (node, facts.get(node).map(|facts| (facts.reach, facts.eligible))))
+                .collect::<Vec<_>>();
+            let report = format!(
+                "txn={:?} joins={:?} catch_ups={:?} joining={:?} probing={:?} failed={:?} observed={:?} pending_adds={:?} blocked={:?} unknown={} txn_running={} bounds={:?} write_set={:?} members={:?}",
+                plan.txn, plan.joins, plan.catch_ups, keeping.joining, keeping.probing,
+                keeping.failed.keys().collect::<Vec<_>>(), keeping.observed, pending_adds,
+                keeping.blocked, keeping.unknown.is_some(), keeping.txn_running, bounds,
+                switched.as_ref().map(|write_set| &write_set.write_set), reach,
+            );
+            if keeping.reported.as_deref() != Some(report.as_str()) {
+                tracing::debug!(target: "sinomo.dfs.write_set", shard = %key.1.0, ?planned,
+                    %report, "write-set keeping plan");
+                keeping.reported = Some(report);
+            }
+        }
         if let Some(txn) = plan.txn
             && !keeping.txn_running
             && keeping.unknown.is_none()
-            && keeping
-                .blocked
-                .is_none_or(|(record, verdict, attempted_w)| {
-                    record != record_generation
-                        || verdict != verdict_generation
-                        || matches!(&txn, DfsWriteSetKeepingTxn::RaiseN { w } if *w > attempted_w)
-                })
+            && keeping.blocked.is_none_or(|(refused_at, attempted_w)| {
+                refused_at != planned
+                    || matches!(&txn, DfsWriteSetKeepingTxn::RaiseN { w } if *w > attempted_w)
+            })
         {
             keeping.txn_running = true;
             let mut cut_members = configured.iter().cloned().collect::<Vec<_>>();
             if let DfsWriteSetKeepingTxn::Recruit { member, .. } = &txn {
                 cut_members.push(member.clone());
             }
-            self.spawn_txn(key.clone(), txn, cut_members, bounds);
+            self.spawn_txn(key.clone(), txn, cut_members, bounds, planned);
         }
     }
 
@@ -664,9 +714,8 @@ impl Keeper {
                 change,
                 outcome,
                 cause,
+                planned,
             } => {
-                let verdict_generation = self.verdicts.current().generation;
-                let record_generation = self.record_generation(&key);
                 let keeping = self.shards.entry(key.clone()).or_default();
                 keeping.txn_running = false;
                 match (outcome, change) {
@@ -704,16 +753,16 @@ impl Keeper {
                     }
                     (outcome, _) => {
                         tracing::debug!(target: "sinomo.dfs.write_set", shard = %key.1.0,
-                            ?txn, ?outcome, record_generation, verdict_generation,
+                            ?txn, ?outcome, ?planned,
                             "write-set change refused at this cut");
                         // Refused before submission or rejected by the record:
-                        // nothing is submitted again until an input moves.
+                        // nothing is submitted again until an input the step
+                        // was planned from moves.
                         let attempted_w = match txn {
                             DfsWriteSetKeepingTxn::RaiseN { w } => w,
                             _ => 0,
                         };
-                        keeping.blocked =
-                            Some((record_generation, verdict_generation, attempted_w));
+                        keeping.blocked = Some((planned, attempted_w));
                         keeping.unknown_cause = None;
                     }
                 }
@@ -819,15 +868,6 @@ impl Keeper {
         });
     }
 
-    fn record_generation(&self, key: &ShardKey) -> u64 {
-        let snapshot = self.authority.configuration_snapshot();
-        snapshot
-            .entry(&crate::metadata_shard_write_set_key(&key.0, &key.1.0))
-            .flatten()
-            .and_then(|entry| entry.decode::<crate::DfsMetadataShardWriteSet>().ok())
-            .map_or(0, |write_set| write_set.generation)
-    }
-
     fn attempt(&self, key: &ShardKey, member: &NodeId) -> Attempt {
         let _ = key;
         Attempt {
@@ -847,6 +887,7 @@ impl Keeper {
         txn: DfsWriteSetKeepingTxn,
         members: Vec<NodeId>,
         bounds: crate::DfsMetadataShardBounds,
+        planned: PlannedAt,
     ) {
         let cluster_paths = self.cluster_paths.clone();
         let data_dir = self.data_dir.clone();
@@ -937,6 +978,7 @@ impl Keeper {
                 change,
                 outcome,
                 cause,
+                planned,
             });
         });
     }
@@ -946,6 +988,7 @@ impl Keeper {
         key: ShardKey,
         txn: DfsWriteSetKeepingTxn,
         change: DfsMetadataWriteSetChangeRequest,
+        planned: PlannedAt,
     ) {
         let cluster_paths = self.cluster_paths.clone();
         let runtime = self.runtime.clone();
@@ -962,6 +1005,7 @@ impl Keeper {
                 change: Some(change),
                 outcome,
                 cause: None,
+                planned,
             });
         });
     }

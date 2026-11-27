@@ -1733,17 +1733,74 @@ pub(super) fn read_native_dfs_peer_configuration(
     read.value.map_err(Into::into)
 }
 
-fn peer_snapshot_from_configuration_entries(
+/// The peer set last derived for one node identity, with the exact entries it
+/// was derived from.
+struct DerivedPeerSnapshot {
+    members: Vec<sinomo_core::kv::KvEntry>,
+    services: Vec<sinomo_core::kv::KvEntry>,
+    snapshot: DaemonDfsMessagePeerSnapshot,
+}
+
+/// Node identities whose derived peer set is kept. A daemon has one; a test
+/// process hosts several nodes.
+const DERIVED_PEER_SNAPSHOT_IDENTITIES: usize = 16;
+
+fn derived_peer_snapshots() -> &'static std::sync::Mutex<std::collections::VecDeque<DerivedPeerSnapshot>> {
+    static DERIVED: OnceLock<std::sync::Mutex<std::collections::VecDeque<DerivedPeerSnapshot>>> = OnceLock::new();
+    DERIVED.get_or_init(Default::default)
+}
+
+/// The peer set is a pure function of the node identity and these entries, so
+/// every message that reads unchanged membership and discovery entries reuses
+/// the set derived from them instead of decoding each record again. The
+/// entries are compared in full: a changed, added or removed record derives a
+/// new set.
+pub(super) fn peer_snapshot_from_configuration_entries(
     state: &sinomo_core::ClusterBootstrapState,
     members: Vec<sinomo_core::kv::KvEntry>,
     services: Vec<sinomo_core::kv::KvEntry>,
 ) -> Result<DaemonDfsMessagePeerSnapshot, sinomo_dfs::DfsError> {
+    let same_identity = |derived: &DerivedPeerSnapshot| {
+        derived.snapshot.cluster_id == state.cluster_id
+            && derived.snapshot.local_node_id == state.local_node_id
+    };
+    {
+        let derived = derived_peer_snapshots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(derived) = derived.iter().find(|derived| {
+            same_identity(derived) && derived.members == members && derived.services == services
+        }) {
+            return Ok(derived.snapshot.clone());
+        }
+    }
+    let snapshot = derive_peer_snapshot_from_configuration_entries(state, &members, &services)?;
+    let mut derived = derived_peer_snapshots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    derived.retain(|derived| !same_identity(derived));
+    if derived.len() >= DERIVED_PEER_SNAPSHOT_IDENTITIES {
+        derived.pop_front();
+    }
+    derived.push_back(DerivedPeerSnapshot {
+        members,
+        services,
+        snapshot: snapshot.clone(),
+    });
+    Ok(snapshot)
+}
+
+fn derive_peer_snapshot_from_configuration_entries(
+    state: &sinomo_core::ClusterBootstrapState,
+    members: &[sinomo_core::kv::KvEntry],
+    services: &[sinomo_core::kv::KvEntry],
+) -> Result<DaemonDfsMessagePeerSnapshot, sinomo_dfs::DfsError> {
     let members = members
-        .into_iter()
+        .iter()
         .map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>())
         .collect::<Result<Vec<_>, _>>()?;
     let mut peers = crate::cluster_service::dfs_provider_node_ids_from_current_entries(
-        state, &members, &services,
+        state, &members, services,
     )?;
     if !peers.contains(&state.local_node_id) {
         peers.push(state.local_node_id.clone());

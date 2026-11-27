@@ -110,12 +110,13 @@ fn plan(
         job.candidate_snapshot.len(),
     )
     .unwrap();
+    // PATH is a root-shard object, whose primary is the filesystem owner.
     reconciliation_placement_for_object_with_resolved_policy(
-        &job.accepted_config,
         job,
         object,
         &[],
         resolved,
+        &job.accepted_config.owner_node_id,
     )
     .unwrap()
 }
@@ -258,7 +259,13 @@ fn planning_a_page_read_before_the_same_jobs_policy_update_reuses_its_committed_
 
     let owner = native.metadata_primary_service(PATH).unwrap();
     let (_, _, replay) = owner
-        .reconciliation_placement_for_object_with_pins(&job.accepted_config, &job, &before, &[])
+        .reconciliation_placement_for_object_with_pins(
+            &job.accepted_config,
+            &native.metadata_shards().unwrap(),
+            &job,
+            &before,
+            &[],
+        )
         .unwrap();
     assert_eq!(
         replay.plan.desired_replica_nodes,
@@ -319,6 +326,7 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
     let (_, _, pinned) = service
         .reconciliation_placement_for_object_with_pins(
             &job.accepted_config,
+            &native.metadata_shards().unwrap(),
             &job,
             &object,
             std::slice::from_ref(pin),
