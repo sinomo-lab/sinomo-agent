@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 lint_toolchain=nightly-2026-08-20
-lint_version=6.1.0
+lint_version=6.4.0
 lint_mode="${1:-all}"
 case "$lint_mode" in all|ui|workspace) ;; *) echo "usage: $0 [all|ui|workspace]" >&2; exit 2 ;; esac
 if [[ -d "$repo_root/target/dylint-tools/bin" ]]; then

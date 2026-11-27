@@ -42,8 +42,9 @@ The lint library is a separate workspace because it uses compiler-private APIs.
 Application builds continue to use the normal stable toolchain.
 
 ```sh
+rustup toolchain install 1.99.0 --profile minimal
 rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
-cargo install cargo-dylint dylint-link --version 6.1.0 --locked
+cargo +1.99.0 install cargo-dylint dylint-link --version 6.4.0 --locked
 bash scripts/ci/check-dfs-kv-boundary.sh
 ```
 
