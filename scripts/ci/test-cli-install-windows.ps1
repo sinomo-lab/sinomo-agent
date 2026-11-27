@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$SandboxRoot
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'windows-installer-fixture.ps1')
 $env:SINOMO_DATA_DIR = $null
 $env:SINOMO_INSTALL_DIR = $null
 $SandboxRoot = [IO.Path]::GetFullPath($SandboxRoot)
@@ -20,14 +21,6 @@ function Invoke-Cli([string]$Executable, [string]$Arguments, [string]$Log) {
     if (-not $process.WaitForExit(120000)) { throw "CLI timed out: $Arguments" }
     $process.Refresh()
     return $process.ExitCode
-}
-
-function Get-CliDigest([string]$File) {
-    # Use .NET directly so the smoke test does not depend on module autoloading.
-    $stream = [IO.File]::OpenRead($File)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return [BitConverter]::ToString($sha.ComputeHash($stream)) }
-    finally { $stream.Dispose(); $sha.Dispose() }
 }
 
 function Test-ApplicationRemovalPending {
@@ -107,8 +100,8 @@ foreach ($role in @('daemon shadow', 'daemon')) {
 }
 $sentinel=Join-Path $data 'repair-retained-data'
 [IO.File]::WriteAllText($sentinel,'application data survives repair')
-[IO.File]::WriteAllBytes($installedCli,[Text.Encoding]::UTF8.GetBytes('damaged CLI'))
-[IO.File]::WriteAllBytes((Join-Path $data 'bin/sinomo-shadow.exe'),[Text.Encoding]::UTF8.GetBytes('damaged shadow'))
+Write-DamagedFixtureBinary $installedCli 'damaged CLI'
+Write-DamagedFixtureBinary (Join-Path $data 'bin/sinomo-shadow.exe') 'damaged shadow'
 if ((Invoke-Cli $Cli ($installArguments+' --repair --no-start') 'repair-damaged-runtime') -ne 0) { throw 'Offline CLI repair failed.' }
 if ((Get-CliDigest $installedCli) -ne $before -or [IO.File]::ReadAllText($sentinel) -cne 'application data survives repair') { throw 'Repair did not restore packaged binaries and preserve data.' }
 if ((Invoke-Cli $Cli $installArguments 'start-repaired-runtime') -ne 0) { throw 'Repaired runtime failed to start.' }

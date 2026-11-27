@@ -987,7 +987,7 @@ fn uninstall_inner(root: &Path, delete_data: bool, _nsis_managed: bool) -> Resul
         services::remove(services)?;
     }
     #[cfg(windows)]
-    windows_integration(root, "uninstall", &[])?;
+    windows_integration(&receipt.install_dir, "uninstall", &[])?;
     #[cfg(target_os = "linux")]
     linux_remove_integrations(&receipt)?;
     // Windows cannot unlink an open advisory lock. The durable fence remains

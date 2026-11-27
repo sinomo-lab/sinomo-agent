@@ -4,6 +4,7 @@ param(
     [switch]$NoStart
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'windows-installer-fixture.ps1')
 $env:SINOMO_DATA_DIR = $null
 $env:SINOMO_INSTALL_DIR = $null
 $SandboxRoot = [IO.Path]::GetFullPath($SandboxRoot)
@@ -13,15 +14,6 @@ $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sinomo'
 if (Test-Path $key) { throw 'Use a clean CI account: an existing Sinomo registration must not be changed by this test.' }
 if (Test-Path -LiteralPath $SandboxRoot) { throw 'Use a fresh smoke-test directory.' }
 $originalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-
-function Get-FixtureHash([string]$Path) {
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    try {
-        $stream = [IO.File]::OpenRead($Path)
-        try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)) }
-        finally { $stream.Dispose() }
-    } finally { $algorithm.Dispose() }
-}
 
 function Install-Fixture {
     Write-Output 'Installing graphical fixture.'
@@ -81,12 +73,12 @@ function Uninstall-Fixture([switch]$DeleteData) {
 Install-Fixture
 # Repeating the other frontend verifies the installation and preserves runtime versions.
 $cli=Join-Path $data 'bin/sinomo.exe'
-$before=(Get-FixtureHash $cli)
+$before=(Get-CliDigest $cli)
 $process=Start-Process -FilePath $cli -ArgumentList 'install' -WindowStyle Hidden -PassThru
 $null=$process.Handle
 if (-not $process.WaitForExit(120000)) {throw 'Cross-frontend verification timed out.'}
 $process.Refresh()
-if ($process.ExitCode -ne 0 -or (Get-FixtureHash $cli) -ne $before) {throw 'CLI verification of GUI install changed the runtime or failed.'}
+if ($process.ExitCode -ne 0 -or (Get-CliDigest $cli) -ne $before) {throw 'CLI verification of GUI install changed the runtime or failed.'}
 foreach ($role in @('daemon shadow','daemon')) {
     $process=Start-Process -FilePath $cli -ArgumentList "$role stop" -WindowStyle Hidden -PassThru
     $null=$process.Handle
@@ -94,12 +86,12 @@ foreach ($role in @('daemon shadow','daemon')) {
 }
 $sentinel=Join-Path $data 'repair-retained-data'
 [IO.File]::WriteAllText($sentinel,'application data survives repair')
-[IO.File]::WriteAllBytes($cli,[Text.Encoding]::UTF8.GetBytes('damaged CLI'))
-[IO.File]::WriteAllBytes((Join-Path $data 'bin/sinomo-shadow.exe'),[Text.Encoding]::UTF8.GetBytes('damaged shadow'))
+Write-DamagedFixtureBinary $cli 'damaged CLI'
+Write-DamagedFixtureBinary (Join-Path $data 'bin/sinomo-shadow.exe') 'damaged shadow'
 $process=Start-Process -FilePath $Installer -ArgumentList "/S /REPAIR /NO_START /DATA_DIR=`"$data`" /D=$application" -WindowStyle Hidden -PassThru
 $null=$process.Handle
 if (-not $process.WaitForExit(120000) -or $process.ExitCode -ne 0) {throw 'Packaged graphical repair failed.'}
-if ((Get-FixtureHash $cli) -ne $before -or [IO.File]::ReadAllText($sentinel) -cne 'application data survives repair') {throw 'Graphical repair changed data or failed to restore the runtime.'}
+if ((Get-CliDigest $cli) -ne $before -or [IO.File]::ReadAllText($sentinel) -cne 'application data survives repair') {throw 'Graphical repair changed data or failed to restore the runtime.'}
 Install-Fixture
 Uninstall-Fixture
 if (-not (Test-Path -LiteralPath $data)) { throw 'Default uninstall deleted data.' }
