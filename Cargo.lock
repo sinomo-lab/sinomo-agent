@@ -11125,6 +11125,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fs2",
+ "libc",
  "same-file",
  "serde",
  "serde_bytes",

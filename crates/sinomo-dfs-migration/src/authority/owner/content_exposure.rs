@@ -1,7 +1,7 @@
 //! Replay-safe publication of a clean partial current content root. Original
 //! source bytes remain in the retained tree; the source driver owns its cursor.
 use super::*;
-use crate::content::{OriginalV3SourceIdentity, probe_original_v3};
+use crate::content::{OriginalV3SourceIdentity, probe_publication_source, probe_original_v3};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext};
@@ -19,6 +19,22 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
     if !metadata.is_dir() { return Err(error("content publication requires the actual physical directory")); }
     #[cfg(unix)] use std::os::unix::fs::MetadataExt;
     Ok(DirectoryIdentity { #[cfg(unix)] device: metadata.dev(), #[cfg(unix)] inode: metadata.ino(), created: metadata.created().ok() })
+}
+impl DirectoryIdentity {
+    fn matches(&self, path: &Path, data_root: &Path) -> Result<bool> {
+        let observed = directory_identity(path)?;
+        #[cfg(target_os = "linux")]
+        if self.device != observed.device && self.created.is_some()
+            && self.created == observed.created && self.inode == observed.inode
+        {
+            return crate::content::checkpoint_device::can_rebind(
+                &checkpoint(data_root), self.device, observed.device,
+            ).map_err(error);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = data_root;
+        Ok(*self == observed)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum Phase { Prepared, SourceRetained, TargetPublished, Covered }
@@ -59,13 +75,17 @@ pub(super) fn retained_publication(data_root: &Path) -> Result<Option<Publicatio
 fn source_matches(data_root: &Path, publication: &Publication, relative: &Path) -> Result<bool> {
     let root = data_root.join(relative);
     if !root.exists() { return Ok(false); }
-    Ok(directory_identity(&root)? == publication.source_directory
-        && probe_original_v3(&root, HEADER_BYTES)? == publication.source)
+    #[cfg(unix)]
+    let device = Some(publication.source_directory.device);
+    #[cfg(not(unix))]
+    let device = None;
+    Ok(publication.source_directory.matches(&root, data_root)?
+        && probe_publication_source(&root, HEADER_BYTES, device)? == publication.source)
 }
 fn target_matches(data_root: &Path, publication: &Publication, relative: &Path) -> Result<bool> {
     let root = data_root.join(relative);
     if !root.exists() { return Ok(false); }
-    if directory_identity(&root)? != publication.target_directory { return Ok(false); }
+    if !publication.target_directory.matches(&root, data_root)? { return Ok(false); }
     let store = sinomo_dfs::LocalContentStore::open_for_inspection(&root);
     if store.store_incarnation().map_err(error)? != publication.target_incarnation { return Ok(false); }
     let pending = store.inventory_import_pending().map_err(error)?;
@@ -212,7 +232,7 @@ pub(super) fn frontend_target(data_root: &Path) -> Result<Option<bool>> {
     let live = data_root.join(&publication.live);
     if !live.exists() { return Ok(Some(false)); }
     if target_matches(data_root, &publication, &publication.live)? { return Ok(Some(true)); }
-    if publication.phase == Phase::Prepared && directory_identity(&live)? == publication.source_directory {
+    if publication.phase == Phase::Prepared && publication.source_directory.matches(&live, data_root)? {
         return Ok(Some(false));
     }
     Err(error("current content root replaced the exact retained publication target"))
@@ -293,4 +313,30 @@ pub(super) fn completed_original_job(data_root: &Path, relative: &Path) -> Resul
         return Ok(None);
     }
     Ok(Some(inventory::JobReference { checkpoint: checkpoint_relative(), identity: publication.inventory_id }))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+#[ignore = "requires TMPDIR on Btrfs"]
+fn btrfs_publication_reopens_with_the_recorded_device_namespace() {
+    let data = sinomo_testdir::TestDir::new("publication-device-renumber");
+    let live = data.join("dfs/content");
+    crate::content::write_original_v3_fixture_data(&live, b"retained bytes", false);
+    let mut publication = prepare(&data, |_| Ok(())).unwrap();
+    let retained = data.join(&publication.retained);
+    let recorded = publication.source_directory.device ^ 1;
+    publication.source_directory.device = recorded;
+    publication.target_directory.device = recorded;
+    publication.source = probe_publication_source(&retained, HEADER_BYTES, Some(recorded)).unwrap();
+    assert_ne!(publication.source, probe_original_v3(&retained, HEADER_BYTES).unwrap());
+    assert!(source_matches(&data, &publication, &publication.retained).unwrap());
+    assert!(target_matches(&data, &publication, &publication.live).unwrap());
+
+    publication.source.active_file_identity_digest.clear();
+    assert!(!source_matches(&data, &publication, &publication.retained).unwrap());
+    publication.target_directory.inode ^= 1;
+    assert!(!target_matches(&data, &publication, &publication.live).unwrap());
+    publication.target_directory.inode ^= 1;
+    publication.target_incarnation.clear();
+    assert!(!target_matches(&data, &publication, &publication.live).unwrap());
 }

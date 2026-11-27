@@ -6,9 +6,31 @@ mod legacy_blob;
 pub(crate) use legacy_stage::{LegacyContentJobReference, LegacyPublishedV3};
 mod snapshot_cursor;
 mod original_v3;
+#[cfg(target_os = "linux")]
+pub(crate) mod checkpoint_device {
+    use std::{fs::File, io, mem::MaybeUninit, os::{fd::AsRawFd, unix::fs::MetadataExt}, path::Path};
+
+    /// Btrfs assigns anonymous device numbers at mount time. Only translate a
+    /// legacy number for an object on the checkpoint's current subvolume.
+    pub(crate) fn can_rebind(anchor: &Path, recorded: u64, observed: u64) -> io::Result<bool> {
+        if libc::major(recorded) != 0 || libc::major(observed) != 0 {
+            return Ok(false);
+        }
+        let file = File::open(anchor)?;
+        if file.metadata()?.dev() != observed {
+            return Ok(false);
+        }
+        let mut stat = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the fd is live, and a successful call initializes stat.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() }.f_type == libc::BTRFS_SUPER_MAGIC)
+    }
+}
 #[cfg(test)]
 pub(crate) use original_v3::write_original_v3_fixture_data;
-pub(crate) use original_v3::{OriginalV3Converter, OriginalV3Budget, OriginalV3Selection, OriginalV3Step, OriginalV3UnitResult, OriginalV3SourceIdentity, probe_original_v3};
+pub(crate) use original_v3::{OriginalV3Converter, OriginalV3Budget, OriginalV3Selection, OriginalV3Step, OriginalV3UnitResult, OriginalV3SourceIdentity, probe_original_v3, probe_publication_source};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

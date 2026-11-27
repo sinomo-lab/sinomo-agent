@@ -28,6 +28,14 @@ pub(crate) fn probe_original_v3(
     source: &Path,
     max_header_bytes: u64,
 ) -> Result<OriginalV3SourceIdentity> {
+    probe_publication_source(source, max_header_bytes, None)
+}
+
+pub(crate) fn probe_publication_source(
+    source: &Path,
+    max_header_bytes: u64,
+    recorded_device: Option<u64>,
+) -> Result<OriginalV3SourceIdentity> {
     let marker_path = source.join(MARKER);
     let catalog_path = source.join("inline-bindings/current.sobj");
     let marker_len = fs::metadata(&marker_path)
@@ -43,7 +51,7 @@ pub(crate) fn probe_original_v3(
     }
     let (marker, bytes, catalog) = read_source(source)?;
     let active = segment_path(source, &catalog, catalog.segments.last().unwrap());
-    let identity = file_identity(&active)?;
+    let identity = file_identity(&active)?.in_checkpoint_namespace(source, recorded_device)?;
     Ok(OriginalV3SourceIdentity {
         store_incarnation: catalog.store_incarnation,
         catalog_generation: catalog.generation,
@@ -298,6 +306,29 @@ struct FileIdentity {
     inode: u64,
     #[cfg(unix)]
     changed: (i64, i64),
+}
+impl FileIdentity {
+    fn in_checkpoint_namespace(self, anchor: &Path, recorded_device: Option<u64>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(device) = recorded_device {
+            if device != self.device && self.created.is_some()
+                && checkpoint_device::can_rebind(anchor, device, self.device).map_err(|e| io(anchor, e))?
+            {
+                return Ok(Self { device, ..self });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (anchor, recorded_device);
+        Ok(self)
+    }
+
+    fn matches_checkpoint(&self, path: &Path, checkpoint: &Path) -> Result<bool> {
+        #[cfg(unix)]
+        let device = Some(self.device);
+        #[cfg(not(unix))]
+        let device = None;
+        Ok(*self == file_identity(path)?.in_checkpoint_namespace(checkpoint, device)?)
+    }
 }
 fn file_identity(path: &Path) -> Result<FileIdentity> {
     let meta = fs::symlink_metadata(path).map_err(|e| io(path, e))?;
@@ -1181,13 +1212,12 @@ impl OriginalV3Converter {
         let progress: Progress = checked_read(&checkpoint)?;
         let (marker, bytes, catalog) = read_source(&source)?;
         let active = segment_path(&source, &catalog, catalog.segments.last().unwrap());
-        let identity = file_identity(&active)?;
         let store = LocalContentStore::open_for_inspection(&target);
         if progress.inventory_id != inventory_id || progress.source_root != source || progress.target_root != target
             || progress.target_incarnation != store.store_incarnation().map_err(error)?
             || progress.marker_digest != blake3::hash(&marker).to_hex().as_str()
             || progress.catalog_digest != blake3::hash(&bytes).to_hex().as_str()
-            || progress.active_len != identity.length || progress.active_identity != identity {
+            || progress.active_len != progress.active_identity.length || !progress.active_identity.matches_checkpoint(&active, &checkpoint)? {
             return Err(error("retained original-source completion changed its exact lineage"));
         }
         let complete = progress.complete && progress.index_complete && progress.loose_bucket == 256
@@ -1372,7 +1402,7 @@ impl OriginalV3Converter {
             || progress.marker_digest != marker_digest
             || progress.catalog_digest != catalog_digest
             || progress.active_len != active_len
-            || progress.active_identity != file_identity(&active)?
+            || !progress.active_identity.matches_checkpoint(&active, &checkpoint)?
         {
             return Err(error(
                 "original-v3 immutable source identity changed; retained job cannot restart from another cut",
@@ -2592,6 +2622,33 @@ mod tests {
                 .unit_result,
             OriginalV3UnitResult::Absent
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires TMPDIR on Btrfs"]
+    fn btrfs_cursor_keeps_its_inventory_after_device_renumbering() {
+        let dir = sinomo_testdir::TestDir::new("original-v3-device-renumber");
+        let source = dir.join("source");
+        let dest = dir.join("target");
+        original(&source, b"same immutable source", false);
+        let _store = target(&dest);
+        let cancel = AtomicBool::new(false);
+        let mut driver = OriginalV3Converter::default();
+        let step = |driver: &mut OriginalV3Converter| {
+            driver.step(&source, &dest, "inventory", &OriginalV3Selection::All, &budget(&cancel))
+        };
+        step(&mut driver).unwrap();
+        let path = OriginalV3Converter::checkpoint_path(&source, &dest, "inventory").unwrap();
+        let mut saved: Progress = checked_read(&path).unwrap();
+        saved.active_identity.device ^= 1;
+        checked_write(&path, &saved).unwrap();
+        let mut resumed = OriginalV3Converter::default();
+        assert!((0..200).any(|_| step(&mut resumed).unwrap().coverage_complete));
+        assert!(OriginalV3Converter::completed_original_observation(&source, &dest, "inventory").unwrap());
+        let mut changed: Progress = checked_read(&path).unwrap();
+        changed.active_identity.inode ^= 1;
+        checked_write(&path, &changed).unwrap();
+        assert!(OriginalV3Converter::completed_original_observation(&source, &dest, "inventory").is_err());
     }
     #[test]
     fn original_v3_changed_source_and_replacement_target_refuse_original_checkpoint() {
